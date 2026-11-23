@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Emby Cloud local encrypted snapshot
+
+[Timer]
+OnCalendar=*-*-* 04:20:00 Asia/Shanghai
+RandomizedDelaySec=5min
+Persistent=true
+Unit=emby-cloud-backup.service
+
+[Install]
+WantedBy=timers.target

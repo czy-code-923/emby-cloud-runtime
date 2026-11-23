@@ -1,0 +1,14 @@
+[Unit]
+Description=Emby Cloud encrypted application snapshot
+Requires=docker.service
+After=docker.service network-online.target
+ConditionPathExists=/srv/emby-cloud/runtime/backup-recipient.txt
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/emby-cloud
+ExecStart=/bin/bash /srv/emby-cloud/scripts/backup-full.sh
+TimeoutStartSec=15min
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

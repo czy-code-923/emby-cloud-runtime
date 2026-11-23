@@ -29,7 +29,8 @@ jobs:
           cache-dependency-path: upstream/twilight/go.sum
       - name: Validate deployment files
         run: |
-          bash -n scripts/install.sh scripts/backup.sh
+          bash -n scripts/*.sh
+          python3 -m py_compile scripts/*.py
           cp .env.example .env
           sed -i 's/^POSTGRES_PASSWORD=$/POSTGRES_PASSWORD=ci_disposable_only/;s/^TWILIGHT_TWO_FACTOR_KEY=$/TWILIGHT_TWO_FACTOR_KEY=ci_only/;s/^BOT_INTERNAL_SECRET=$/BOT_INTERNAL_SECRET=ci_only/' .env
           docker compose config --quiet
