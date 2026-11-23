@@ -61,8 +61,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(cat VERSION)
-          gh release create "v$version" --draft --prerelease --title "v$version · 隔离管理基础版" --notes-file docs/release-notes.md
-          gh release upload "v$version" dist/*
+          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --draft --prerelease --target "$GITHUB_SHA" --title "v$version · 隔离管理基础版" --notes-file docs/release-notes.md
+          gh release upload "v$version" dist/* --clobber
   publish:
     needs: [verify, images]
     runs-on: ubuntu-latest

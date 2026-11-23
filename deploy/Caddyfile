@@ -6,7 +6,7 @@
     @foreign_origin {
         method POST PUT PATCH DELETE
         header Origin *
-        not header Origin http://localhost:13000 http://127.0.0.1:13000
+        not header_regexp Origin `^http://(localhost|127\.0\.0\.1):13000$`
     }
     respond @foreign_origin "Untrusted origin" 403
     handle /api/* {
