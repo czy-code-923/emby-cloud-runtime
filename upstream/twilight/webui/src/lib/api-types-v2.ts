@@ -1,0 +1,714 @@
+/**
+ * V2 API 类型定义
+ *
+ * 此文件包含所有 V2 API 的 TypeScript 类型定义。
+ * V2 API 与 V1 保持兼容，但提供了更好的缓存策略、更清晰的响应结构。
+ */
+
+import type { User, ApiResponse } from "./api-types";
+
+// ==================== 认证模块 ====================
+
+/**
+ * V2 登录请求
+ */
+export interface V2LoginRequest {
+  username: string;
+  password: string;
+  device_id?: string;
+  device_name?: string;
+  remember?: boolean;
+}
+
+/**
+ * V2 登录响应
+ */
+export interface V2LoginResponse {
+  two_factor_required?: boolean;
+  request?: string;
+  token?: string;
+  user?: User;
+  expires_at?: number;
+}
+
+/**
+ * V2 当前用户响应（GET /api/v2/auth/me）
+ */
+export interface V2CurrentUserResponse {
+  user: User;
+}
+
+/**
+ * V2 刷新会话响应
+ */
+export interface V2RefreshSessionResponse {
+  token: string;
+  user: User;
+  expires_at?: number;
+}
+
+/**
+ * V2 注册请求
+ */
+export interface V2RegisterRequest {
+  username: string;
+  password: string;
+  email?: string;
+  regcode: string;
+  emby_username?: string;
+  device_id?: string;
+  device_name?: string;
+}
+
+/**
+ * V2 注册响应
+ */
+export interface V2RegisterResponse {
+  token: string;
+  user: User;
+  message?: string;
+}
+
+/**
+ * V2 注册可用性检查请求
+ */
+export interface V2RegistrationAvailabilityRequest {
+  regcode: string;
+}
+
+/**
+ * V2 注册可用性检查响应
+ */
+export interface V2RegistrationAvailabilityResponse {
+  available: boolean;
+  requires_emby_username?: boolean;
+  message?: string;
+}
+
+/**
+ * V2 忘记密码请求（通过 Emby）
+ */
+export interface V2ForgotPasswordByEmbyRequest {
+  emby_username: string;
+}
+
+/**
+ * V2 忘记密码响应
+ */
+export interface V2ForgotPasswordResponse {
+  success: boolean;
+  message: string;
+}
+
+/**
+ * V2 邮箱密码重置请求
+ */
+export interface V2EmailPasswordResetRequest {
+  email: string;
+}
+
+/**
+ * V2 邮箱密码重置响应
+ */
+export interface V2EmailPasswordResetResponse {
+  success: boolean;
+  message: string;
+  verification_id?: string;
+}
+
+/**
+ * V2 邮箱密码重置确认请求
+ */
+export interface V2EmailPasswordResetConfirmRequest {
+  verification_id: string;
+  code: string;
+  new_password: string;
+}
+
+/**
+ * V2 邮箱密码重置确认响应
+ */
+export interface V2EmailPasswordResetConfirmResponse {
+  success: boolean;
+  message: string;
+}
+
+/**
+ * V2 发送邮箱验证码请求
+ */
+export interface V2SendEmailCodeRequest {
+  purpose: "bind" | "change_password" | "change_emby_password";
+  email?: string; // purpose=bind 时必填
+}
+
+/**
+ * V2 发送邮箱验证码响应
+ */
+export interface V2SendEmailCodeResponse {
+  verification_id: string;
+  email: string; // 遮蔽后的邮箱
+  expires_in: number;
+  resend_after: number;
+}
+
+/**
+ * V2 验证邮箱验证码请求
+ */
+export interface V2VerifyEmailCodeRequest {
+  verification_id: string;
+  code: string;
+}
+
+/**
+ * V2 验证邮箱验证码响应
+ */
+export interface V2VerifyEmailCodeResponse {
+  success: boolean;
+  message: string;
+}
+
+/**
+ * V2 修改系统密码请求
+ */
+export interface V2ChangePasswordRequest {
+  old_password: string;
+  new_password: string;
+  verification_id?: string;
+  code?: string;
+}
+
+/**
+ * V2 修改系统密码响应
+ */
+export interface V2ChangePasswordResponse {
+  token: string;
+  message?: string;
+}
+
+/**
+ * V2 修改 Emby 密码请求
+ */
+export interface V2ChangeEmbyPasswordRequest {
+  new_password: string;
+  old_password?: string; // 启用旧密码验证时必填
+  verification_id?: string;
+  code?: string;
+}
+
+/**
+ * V2 修改 Emby 密码响应
+ */
+export interface V2ChangeEmbyPasswordResponse {
+  success: boolean;
+  message?: string;
+}
+
+/**
+ * V2 API Key 登录请求
+ */
+export interface V2LoginByAPIKeyRequest {
+  apikey: string;
+  device_id?: string;
+  device_name?: string;
+}
+
+/**
+ * V2 Telegram 登录请求
+ */
+export interface V2TelegramLoginRequest {
+  telegram_id: number;
+  auth_date: number;
+  hash: string;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  photo_url?: string;
+}
+
+/**
+ * V2 Telegram 登录响应
+ */
+export interface V2TelegramLoginResponse {
+  token: string;
+  user: User;
+  expires_at?: number;
+}
+
+/**
+ * Telegram 绑定链接签发响应（注册与已登录场景共用）。
+ *
+ * - `deep_link`：`https://t.me/<bot>?start=<token>`，Bot 身份暂不可用时为空串；
+ * - `manual_command`：无法打开链接时手动发给 Bot 的 `/bind <token>`；
+ * - `link_secret`：仅注册场景返回，状态查询与注册提交时带回，证明是同一浏览器。
+ */
+export interface TelegramLinkIssue {
+  link_id: string;
+  start_token: string;
+  deep_link: string;
+  bot_username: string;
+  manual_command: string;
+  expires_in: number;
+  poll_interval?: number;
+  link_secret?: string;
+}
+
+/**
+ * Telegram 绑定链接状态。终态由 `terminal` 表示；`invalid` 区分失败终态与确认终态。
+ * 临时的加群 / 上游失败保持 `pending` 并带 `retryable=true`。
+ */
+export interface TelegramLinkStatus {
+  link_id?: string;
+  status?: string;
+  error_code?: string;
+  message?: string;
+  confirmed?: boolean;
+  expires_in?: number;
+  invalid?: boolean;
+  terminal?: boolean;
+  retryable?: boolean;
+  telegram_bound?: boolean;
+  telegram_id?: number;
+  telegram_username?: string;
+  poll_interval?: number;
+}
+
+// ==================== 用户管理模块 ====================
+
+/**
+ * V2 用户列表查询参数
+ */
+export interface V2UserListParams {
+  page?: number;
+  per_page?: number;
+  cursor?: string;
+  search?: string;
+  filter_emby?: boolean;
+  filter_disabled?: boolean;
+  filter_email_status?: "verified" | "unverified" | "no_email";
+  sort?: "uid" | "username" | "created_at" | "expire_at";
+  order?: "asc" | "desc";
+}
+
+/**
+ * V2 用户列表响应
+ *
+ * 集合沿用统一的 items/pagination 信封，与 internal/api/admin_user_v2.go 的
+ * v2AdminUserListResponse 保持一致；api.ts 负责还原成页面使用的 V1 字段。
+ */
+export interface V2UserListResponse {
+  items: User[];
+  pagination: {
+    total: number;
+    page: number;
+    per_page: number;
+    total_pages: number;
+  };
+}
+
+/**
+ * V2 用户详情响应
+ *
+ * 单个资源统一收在 item 里，与 handleV2AdminUser 的响应保持一致。
+ */
+export interface V2UserDetailResponse {
+  item: User;
+}
+
+/**
+ * V2 用户更新请求
+ */
+export interface V2UserUpdateRequest {
+  username?: string;
+  email?: string;
+  expire_at?: number;
+  is_disabled?: boolean;
+  is_permanent?: boolean;
+  note?: string;
+}
+
+/**
+ * V2 用户更新响应
+ */
+export interface V2UserUpdateResponse {
+  user: User;
+  message?: string;
+  emby_sync_failed?: boolean;
+}
+
+/**
+ * V2 创建用户请求
+ */
+export interface V2CreateUserRequest {
+  username: string;
+  password?: string;
+  email?: string;
+  role?: number;
+  expired_at?: number;
+  days?: number;
+}
+
+/**
+ * V2 创建用户响应
+ */
+export interface V2CreateUserResponse {
+  user: User;
+  password: string;
+  auto_generated: boolean;
+}
+
+/**
+ * V2 删除用户选项
+ */
+export interface V2DeleteUserOptions {
+  delete_emby?: boolean;
+}
+
+/**
+ * V2 删除用户响应
+ */
+export interface V2DeleteUserResponse {
+  success: boolean;
+  message?: string;
+}
+
+/**
+ * V2 用户强制解绑请求
+ */
+export interface V2ForceUnbindRequest {
+  scope?: "telegram" | "emby" | "both";
+}
+
+/**
+ * V2 用户强制解绑响应
+ */
+export interface V2ForceUnbindResponse {
+  changed: string[];
+  old: {
+    telegram_id?: number | null;
+    emby_id?: string | null;
+  };
+}
+
+/**
+ * V2 管理员绑定 Telegram 请求
+ */
+export interface V2AdminBindTelegramRequest {
+  telegram_id: number;
+}
+
+/**
+ * V2 管理员绑定 Telegram 响应
+ */
+export interface V2AdminBindTelegramResponse {
+  uid: number;
+  username: string;
+  telegram_id: number;
+  old_telegram_id: number | null;
+}
+
+// ==================== Telegram 模块 ====================
+
+/**
+ * V2 Telegram 命令目录响应
+ */
+export interface V2TelegramCommandCatalogResponse {
+  commands: Array<{
+    command: string;
+    description: string;
+    admin_only: boolean;
+    group_only: boolean;
+  }>;
+  disabled_commands: string[];
+}
+
+/**
+ * V2 Telegram 换绑请求列表参数
+ */
+export interface V2TelegramRebindRequestListParams {
+  status?: "pending" | "approved" | "rejected";
+  page?: number;
+  per_page?: number;
+}
+
+/**
+ * V2 Telegram 换绑请求
+ */
+export interface V2TelegramRebindRequest {
+  id: number;
+  uid: number;
+  username: string;
+  old_telegram_id: number;
+  old_telegram_username?: string;
+  new_telegram_id: number;
+  new_telegram_username?: string;
+  status: "pending" | "approved" | "rejected";
+  reason?: string;
+  admin_note?: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
+ * V2 Telegram 换绑请求列表响应
+ */
+export interface V2TelegramRebindRequestListResponse {
+  requests: V2TelegramRebindRequest[];
+  total: number;
+}
+
+// ==================== 工单系统模块 ====================
+
+/**
+ * V2 用户工单列表查询参数
+ */
+export interface V2UserTicketListParams {
+  page?: number;
+  per_page?: number;
+}
+
+/**
+ * V2 工单回复。字段与后端 ticketReplyDTO 严格一一对应。
+ *
+ * 判断「这条回复是谁发的」只能看 is_admin：role 是服务端内部角色枚举
+ * （RoleAdmin=0 / RoleNormal=1），按数字大小推断会把管理员和普通用户判反。
+ * 这一层此前声明成 { id, ticket_id, is_admin }——后端从不输出 id/ticket_id，
+ * 也不输出 is_admin，前端按 is_admin 取值恒为 undefined，于是所有回复都被
+ * 折算成管理员，工单会话里出现「显示人物错误」。
+ */
+export interface V2TicketReply {
+  id?: number;
+  uid: number;
+  username: string;
+  role: number;
+  is_admin: boolean;
+  author: "admin" | "user";
+  content: string;
+  created_at: number;
+}
+
+/** V2 工单附件。url 已是可直接用于 <img> 的地址。 */
+export interface V2TicketAttachment {
+  filename: string;
+  url: string;
+  content_type: string;
+  size: number;
+  uploaded_uid: number;
+  created_at: number;
+}
+
+/**
+ * V2 用户工单列表响应。列表项是有意裁剪过的摘要：不含 content、
+ * replies 和 attachments，这些按需走详情接口。
+ */
+export interface V2UserTicketListResponse {
+  items: Array<{
+    id: number;
+    title: string;
+    type: string;
+    status: string;
+    priority: string;
+    reply_count: number;
+    attachment_count: number;
+    notify_telegram: boolean;
+    created_at: number;
+    updated_at: number;
+    resolved_at: number;
+    closed_at: number;
+  }>;
+  pagination: {
+    page: number;
+    per_page: number;
+    total: number;
+    total_pages: number;
+  };
+  ticket_types: string[];
+}
+
+/**
+ * V2 用户工单详情响应
+ */
+export interface V2UserTicketDetailResponse {
+  item: {
+    id: number;
+    uid: number;
+    username: string;
+    title: string;
+    content: string;
+    status: string;
+    priority: string;
+    type: string;
+    notify_telegram: boolean;
+    created_at: number;
+    updated_at: number;
+    resolved_at: number;
+    closed_at: number;
+    revision?: number;
+    reply_count?: number;
+    message_page?: { has_more: boolean; next_before: number; total: number };
+    replies: V2TicketReply[];
+    attachments: V2TicketAttachment[];
+  };
+  ticket_types: string[];
+}
+
+/**
+ * V2 管理员工单列表查询参数
+ */
+export interface V2AdminTicketListParams {
+  uid?: number;
+  status?: string;
+  type?: string;
+  priority?: string;
+  all?: boolean;
+  page?: number;
+  per_page?: number;
+}
+
+/**
+ * V2 管理员工单列表响应
+ */
+export interface V2AdminTicketListResponse {
+  items: Array<{
+    id: number;
+    uid: number;
+    username: string;
+    title: string;
+    content: string;
+    type: string;
+    status: string;
+    priority: string;
+    admin_note: string;
+    reply_count: number;
+    attachment_count: number;
+    notify_telegram: boolean;
+    created_at: number;
+    updated_at: number;
+    resolved_at: number;
+    closed_at: number;
+  }>;
+  pagination: {
+    page: number;
+    per_page: number;
+    total: number;
+    total_pages: number;
+  };
+  ticket_types: string[];
+}
+
+/**
+ * V2 管理员工单详情响应
+ */
+export interface V2AdminTicketDetailResponse {
+  item: {
+    id: number;
+    uid: number;
+    username: string;
+    title: string;
+    content: string;
+    status: string;
+    priority: string;
+    type: string;
+    admin_note: string;
+    notify_telegram: boolean;
+    created_at: number;
+    updated_at: number;
+    resolved_at: number;
+    closed_at: number;
+    revision?: number;
+    reply_count?: number;
+    message_page?: { has_more: boolean; next_before: number; total: number };
+    replies: V2TicketReply[];
+    attachments: V2TicketAttachment[];
+  };
+  ticket_types: string[];
+}
+
+/**
+ * V2 工单回复响应。ticket 是主资源键，管理端保留 item 兼容别名。
+ * message_limit 生效时 replies 为一页，reply_count 仍为总数。
+ */
+export interface V2TicketReplyResponse {
+  message?: V2TicketReply;
+  replayed?: boolean;
+  item?: V2AdminTicketDetailResponse["item"];
+  ticket_id: number;
+  ticket: V2AdminTicketDetailResponse["item"] | V2UserTicketDetailResponse["item"];
+  replies: V2TicketReply[];
+}
+
+// ==================== 公告系统模块 ====================
+
+/**
+ * V2 公告列表查询参数
+ */
+export interface V2AnnouncementListParams {
+  page?: number;
+  per_page?: number;
+  published_only?: boolean;
+}
+
+/**
+ * V2 公告列表响应
+ */
+export interface V2AnnouncementListResponse {
+  announcements: Array<{
+    id: number;
+    title: string;
+    content: string;
+    render_mode: "plain" | "markdown" | "bbcode";
+    published: boolean;
+    created_at: number;
+    updated_at: number;
+  }>;
+  pagination: {
+    total: number;
+    page: number;
+    per_page: number;
+  };
+}
+
+/**
+ * V2 创建公告请求
+ */
+export interface V2CreateAnnouncementRequest {
+  title: string;
+  content: string;
+  render_mode?: "plain" | "markdown" | "bbcode";
+  published?: boolean;
+}
+
+/**
+ * V2 创建公告响应
+ */
+export interface V2CreateAnnouncementResponse {
+  announcement_id: number;
+  message?: string;
+}
+
+// ==================== 通用类型 ====================
+
+/**
+ * V2 分页参数（通用）
+ */
+export interface V2PaginationParams {
+  page?: number;
+  per_page?: number;
+  cursor?: string;
+}
+
+/**
+ * V2 分页响应（通用）
+ */
+export interface V2PaginationMeta {
+  total: number;
+  page: number;
+  per_page: number;
+  next_cursor?: string;
+  has_next: boolean;
+}
+
+/**
+ * V2 API 响应包装（通用）
+ * V2 使用与 V1 相同的 ApiResponse 格式
+ */
+export type V2ApiResponse<T> = ApiResponse<T>;

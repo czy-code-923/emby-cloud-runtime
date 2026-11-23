@@ -1,0 +1,273 @@
+package api
+
+import (
+	"context"
+	"go.uber.org/zap"
+	"math"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+func (a *App) searchMedia(ctx context.Context, query, source, mediaType string, limit int, _ bool) ([]map[string]any, string, map[string]string) {
+	if strings.TrimSpace(query) == "" {
+		return []map[string]any{}, "OK", nil
+	}
+	if limit <= 0 {
+		return []map[string]any{}, "OK", nil
+	}
+	if kind, id, mt, ok := detectMediaID(query); ok {
+		if result, found := a.mediaDetail(ctx, kind, id, mt); found {
+			return []map[string]any{result}, "OK", nil
+		}
+	}
+	sourceErrors := map[string]string{}
+	results := make([]map[string]any, 0, limit)
+
+	if source == "all" {
+		// 两个来源彼此独立，并行查询能把聚合搜索时延收敛到较慢的一路。
+		// 每个通道容量为 1，客户端取消请求后子任务也不会因回传结果而阻塞。
+		type sourceResult struct {
+			items []map[string]any
+			err   error
+		}
+		tmdbResult := make(chan sourceResult, 1)
+		bangumiResult := make(chan sourceResult, 1)
+		go func() {
+			items, err := a.searchTMDB(ctx, query, mediaType, limit)
+			tmdbResult <- sourceResult{items: items, err: err}
+		}()
+		go func() {
+			items, err := a.searchBangumi(ctx, query, limit)
+			bangumiResult <- sourceResult{items: items, err: err}
+		}()
+
+		tmdb := <-tmdbResult
+		bangumi := <-bangumiResult
+		if tmdb.err != nil {
+			sourceErrors["tmdb"] = mediaSearchFailure("tmdb", tmdb.err)
+		}
+		if bangumi.err != nil {
+			sourceErrors["bangumi"] = mediaSearchFailure("bangumi", bangumi.err)
+		}
+		results = interleaveMediaResults(tmdb.items, bangumi.items, limit)
+	} else if source == "bangumi" {
+		if items, err := a.searchBangumi(ctx, query, limit); err == nil {
+			results = append(results, items...)
+		} else {
+			sourceErrors["bangumi"] = mediaSearchFailure("bangumi", err)
+		}
+	} else {
+		if items, err := a.searchTMDB(ctx, query, mediaType, limit); err == nil {
+			results = append(results, items...)
+		} else {
+			sourceErrors["tmdb"] = mediaSearchFailure("tmdb", err)
+		}
+	}
+	if len(sourceErrors) == 0 {
+		sourceErrors = nil
+	}
+	return results, "OK", sourceErrors
+}
+
+func interleaveMediaResults(primary, secondary []map[string]any, limit int) []map[string]any {
+	if limit <= 0 {
+		return []map[string]any{}
+	}
+	result := make([]map[string]any, 0, min(limit, len(primary)+len(secondary)))
+	for index := 0; len(result) < limit && (index < len(primary) || index < len(secondary)); index++ {
+		if index < len(primary) {
+			result = append(result, primary[index])
+			if len(result) == limit {
+				break
+			}
+		}
+		if index < len(secondary) {
+			result = append(result, secondary[index])
+		}
+	}
+	return result
+}
+
+func mediaFloat(value any) float64 {
+	var result float64
+	switch typed := value.(type) {
+	case float64:
+		result = typed
+	case float32:
+		result = float64(typed)
+	case int:
+		result = float64(typed)
+	case int64:
+		result = float64(typed)
+	case string:
+		result, _ = strconv.ParseFloat(strings.TrimSpace(typed), 64)
+	default:
+		return 0
+	}
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0
+	}
+	return result
+}
+
+func mediaStringList(value any, fields []string, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	values := make([]string, 0, min(limit, 8))
+	seen := make(map[string]struct{}, min(limit, 8))
+	var appendValue func(any)
+	appendValue = func(candidate any) {
+		if len(values) >= limit || candidate == nil {
+			return
+		}
+		switch typed := candidate.(type) {
+		case string:
+			text := truncateString(strings.TrimSpace(strings.ToValidUTF8(typed, "")), 120)
+			key := strings.ToLower(text)
+			if text == "" {
+				return
+			}
+			if _, exists := seen[key]; exists {
+				return
+			}
+			seen[key] = struct{}{}
+			values = append(values, text)
+		case []any:
+			for _, item := range typed {
+				appendValue(item)
+				if len(values) >= limit {
+					break
+				}
+			}
+		case map[string]any:
+			for _, field := range fields {
+				if nested, ok := typed[field]; ok {
+					before := len(values)
+					appendValue(nested)
+					if len(values) > before {
+						break
+					}
+				}
+			}
+		}
+	}
+	appendValue(value)
+	if len(values) == 0 {
+		return nil
+	}
+	return values
+}
+
+func mergeMediaStringLists(limit int, groups ...[]string) []string {
+	rows := make([]any, 0, len(groups))
+	for _, group := range groups {
+		for _, value := range group {
+			rows = append(rows, value)
+		}
+	}
+	return mediaStringList(rows, nil, limit)
+}
+
+func (a *App) mediaDetail(ctx context.Context, source, id, mediaType string) (map[string]any, bool) {
+	source = normalizeSource(source)
+	if !isPositiveNumericID(id) {
+		return nil, false
+	}
+	if source == "bangumi" {
+		if result, err := a.getBangumi(ctx, id); err == nil {
+			return result, true
+		}
+		return mediaResultFromFields("bangumi", id, "", firstNonEmpty(mediaType, "动画"), ""), true
+	}
+	mediaType = normalizeTMDBMediaType(mediaType)
+	if result, err := a.getTMDB(ctx, id, mediaType); err == nil {
+		return result, true
+	}
+	return mediaResultFromFields("tmdb", id, "", mediaType, ""), true
+}
+
+func isPositiveNumericID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	parsed, err := strconv.ParseInt(id, 10, 64)
+	return err == nil && parsed > 0 && strconv.FormatInt(parsed, 10) == id
+}
+
+func normalizeTMDBMediaType(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "tv":
+		return "tv"
+	default:
+		return "movie"
+	}
+}
+
+// mediaIDPatterns 是 detectMediaID 的静态正则表：请求热路径上不再每次调用
+// 重建 4 个 *regexp.Regexp 与一个匿名结构切片。detectMediaID 只读不改。
+var mediaIDPatterns = []struct {
+	re     *regexp.Regexp
+	source string
+}{
+	{regexp.MustCompile(`(?i)themoviedb\.org/(movie|tv)/(\d+)`), "tmdb"},
+	{regexp.MustCompile(`(?i)^tmdb:(?:(movie|tv):)?(\d+)$`), "tmdb"},
+	{regexp.MustCompile(`(?i)(?:bgm\.tv|bangumi\.tv)/subject/(\d+)`), "bangumi"},
+	{regexp.MustCompile(`(?i)^bgm:(\d+)$`), "bangumi"},
+}
+
+func detectMediaID(query string) (source, id, mediaType string, ok bool) {
+	query = strings.TrimSpace(query)
+	for _, pattern := range mediaIDPatterns {
+		m := pattern.re.FindStringSubmatch(query)
+		if len(m) == 0 {
+			continue
+		}
+		if pattern.source == "tmdb" {
+			if len(m) == 3 {
+				return "tmdb", m[2], firstNonEmpty(m[1], "movie"), true
+			}
+			return "tmdb", m[len(m)-1], "movie", true
+		}
+		return "bangumi", m[len(m)-1], "动画", true
+	}
+	return "", "", "", false
+}
+
+// tmdbSearchMediaType 判断调用方指定的媒体类型是否足够具体，供 searchTMDB 选择
+// /search/movie 还是 /search/multi。mediaType 为空或"未知"时不限定。
+func tmdbSearchMediaType(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "movie", "tv":
+		return strings.ToLower(strings.TrimSpace(mediaType))
+	default:
+		return ""
+	}
+}
+
+func mediaResultFromFields(source, id, title, mediaType, poster string) map[string]any {
+	parsedID, _ := strconv.ParseInt(id, 10, 64)
+	if title == "" {
+		title = source + ":" + id
+	}
+	sourceURL := ""
+	if source == "bangumi" {
+		sourceURL = "https://bgm.tv/subject/" + id
+	} else {
+		sourceURL = "https://www.themoviedb.org/" + firstNonEmpty(mediaType, "movie") + "/" + id
+	}
+	return map[string]any{"id": parsedID, "title": title, "original_title": title, "media_type": mediaType, "overview": "", "release_date": "", "year": nil, "poster": poster, "poster_url": poster, "vote_average": 0, "rating": 0, "source": source, "source_url": sourceURL, "extra": map[string]any{}}
+}
+
+// mediaSearchFailure 只把固定文案交给前端。上游错误（尤其是 net/http 的 *url.Error）
+// 会带着完整请求 URL，而 TMDB 的 api_key 就在 query 里；原样回传等于把站点的
+// TMDB 密钥发给任何登录用户。细节脱敏后只写服务端日志。
+func mediaSearchFailure(source string, err error) string {
+	zap.L().Warn("media search source failed", zap.String("source", source), zap.String("error", redactSensitiveText(err.Error())))
+	if source == "tmdb" {
+		return "TMDB 搜索暂时不可用"
+	}
+	return "Bangumi 搜索暂时不可用"
+}

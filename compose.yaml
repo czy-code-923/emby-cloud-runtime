@@ -1,0 +1,104 @@
+# 上游 Docker 模板未经上游实机验收；此文件是独立的受限部署模板。
+# 实际通过范围只以 docs/verification.md 的部署记录为准。
+name: emby-cloud
+x-common: &common
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: {max-size: "5m", max-file: "2"}
+services:
+  postgres:
+    <<: *common
+    image: postgres:17-alpine
+    mem_limit: 192m
+    pids_limit: 128
+    environment:
+      POSTGRES_USER: twilight
+      POSTGRES_DB: twilight
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate local secrets first}
+    command: ["postgres","-c","shared_buffers=32MB","-c","max_connections=20","-c","work_mem=2MB","-c","maintenance_work_mem=32MB"]
+    volumes: ["./runtime/postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U twilight -d twilight"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  backend:
+    <<: *common
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE}
+    pull_policy: never
+    mem_limit: 256m
+    pids_limit: 128
+    environment:
+      TZ: Asia/Shanghai
+      GOMAXPROCS: "1"
+      GOMEMLIMIT: 160MiB
+      TWILIGHT_DATABASE_DRIVER: postgres
+      TWILIGHT_POSTGRES_HOST: postgres
+      TWILIGHT_POSTGRES_USER: twilight
+      TWILIGHT_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TWILIGHT_POSTGRES_DATABASE: twilight
+      TWILIGHT_POSTGRES_SSLMODE: disable
+      TWILIGHT_TWO_FACTOR_KEY: ${TWILIGHT_TWO_FACTOR_KEY:?Generate local secrets first}
+      TWILIGHT_BOT_INTERNAL_SECRET: ${BOT_INTERNAL_SECRET:?Generate local secrets first}
+    volumes: ["./runtime/twilight:/var/lib/twilight"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://127.0.0.1:5000/api/v1/system/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+  webui:
+    <<: *common
+    image: ${WEBUI_IMAGE:?Set WEBUI_IMAGE}
+    pull_policy: never
+    mem_limit: 192m
+    pids_limit: 96
+    environment:
+      BACKEND_URL: http://backend:5000
+      NODE_OPTIONS: --max-old-space-size=128
+    depends_on:
+      backend: {condition: service_healthy}
+  gateway:
+    <<: *common
+    image: caddy:2-alpine
+    mem_limit: 64m
+    pids_limit: 64
+    ports: ["127.0.0.1:13000:8080"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./docs:/srv/deployment:ro
+    depends_on: [webui]
+  emby:
+    <<: *common
+    image: emby/embyserver:4.10.2.0
+    mem_limit: 512m
+    pids_limit: 192
+    environment: {UID: "10002", GID: "10002", GIDLIST: "10002", TZ: Asia/Shanghai}
+    ports: ["127.0.0.1:18096:8096"]
+    volumes:
+      - ./runtime/emby:/config
+      - ./runtime/media:/media:ro
+    tmpfs: ["/transcode:size=67108864,mode=1777"]
+  openstrm:
+    <<: *common
+    profiles: [cloud]
+    image: indown/openstrm:v2.28.0
+    mem_limit: 384m
+    pids_limit: 128
+    environment: {TZ: Asia/Shanghai, NODE_ENV: production, NODE_OPTIONS: "--max-old-space-size=192"}
+    ports: ["127.0.0.1:13001:3000", "127.0.0.1:18091:8091"]
+    volumes:
+      - ./runtime/media:/app/data
+      - ./runtime/openstrm:/app/config
+  openlist:
+    <<: *common
+    profiles: [source]
+    image: openlistteam/openlist:v4.2.10
+    mem_limit: 128m
+    pids_limit: 96
+    environment: {TZ: Asia/Shanghai, UMASK: "077"}
+    ports: ["127.0.0.1:15244:5244"]
+    volumes: ["./runtime/openlist:/opt/openlist/data"]

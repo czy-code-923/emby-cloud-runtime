@@ -1,0 +1,2069 @@
+package api
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"go.uber.org/zap"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/prejudice-studio/twilight/internal/config"
+	"github.com/prejudice-studio/twilight/internal/migration"
+	"github.com/prejudice-studio/twilight/internal/redis"
+	"github.com/prejudice-studio/twilight/internal/store"
+)
+
+type AuthLevel int
+
+const (
+	AuthPublic AuthLevel = iota
+	AuthUser
+	AuthAdmin
+	AuthAPIKey
+)
+
+type Params map[string]string
+type HandlerFunc func(http.ResponseWriter, *http.Request, Params)
+
+type Route struct {
+	Method  string
+	Pattern string
+	Parts   []string
+	Auth    AuthLevel
+	Handler HandlerFunc
+	// Literals 是路径中字面量（非 `:param`）段的个数。匹配时同桶内优先选
+	// Literals 更大的路由：否则先注册的 `/admin/users/:uid` 会把后注册的
+	// `/admin/users/expiring`、`/admin/users/batch/disable` 之类静态路由整个
+	// 吃掉（请求以 uid="expiring"/"batch" 落到单用户 handler 上）。
+	Literals int
+}
+
+type routeIndexKey struct {
+	method    string
+	partCount int
+	group     string
+}
+
+type routePathIndexKey struct {
+	partCount int
+	group     string
+}
+
+type App struct {
+	// runtime 持有 cfg / store / sessions / limiter / redis 这五个 hot reload
+	// 期间会被整体替换的运行时句柄。读端必须经 a.cfg() / a.store() 等访问器，
+	// 一次性 Load 出 *runtimeState 后再读字段；reload 端构造完整的 next 状态后
+	// 一次 Store 完成原子切换，避免：
+	//   - cfg（multi-word struct）字段半新半旧的撕裂读；
+	//   - store / sessions / limiter / redis 接口/指针的 (type,data) 双 word
+	//     非原子赋值导致 vtable 与 data 撕裂触发 segfault；
+	//   - reload 中途读端拿到 cfg 是 next、store 仍是 prev 的混合视图。
+	runtime                  atomic.Pointer[runtimeState]
+	routes                   []Route
+	routeIndex               map[routeIndexKey][]int
+	routePathIndex           map[routePathIndexKey][]int
+	runtimeMu                sync.Mutex
+	setupMu                  sync.Mutex
+	configSignature          string
+	configSignatureCheckedAt atomic.Int64
+	telegramBotMu            sync.Mutex
+	telegramBotCacheKey      telegramBotConfigKey
+	telegramBotCacheUntil    time.Time
+	telegramBotCache         map[string]any
+	telegramEndpointCache    atomic.Pointer[telegramEndpointCacheEntry]
+	schedulerTZCache         atomic.Pointer[schedulerTZEntry]
+	// 定时任务失败通知的节流状态（jobID → 上次通知时间）。
+	schedulerAlertMu          sync.Mutex
+	schedulerAlertAt          map[string]time.Time
+	telegramCommandIndex      atomic.Pointer[telegramCommandConfigIndex]
+	telegramStatusMu          sync.Mutex
+	telegramLastOKAt          int64
+	telegramLastErrorAt       int64
+	telegramLastError         string
+	telegramPolling           bool
+	telegramEmbyHealthMu      sync.Mutex
+	telegramEmbyHealth        telegramEmbyHealthCache
+	telegramPanelMu           sync.Mutex
+	telegramPanels            map[string]telegramPanelContext
+	telegramPanelThrottle     telegramCooldown
+	developerJSMu             sync.Mutex
+	developerJSCallbacks      map[string]developerJSCallbackContext
+	developerJSWaiters        map[string]developerJSMessageWaiter
+	developerJSInteractionSeq atomic.Uint64
+	telegramJSProgramMu       sync.RWMutex
+	telegramJSPrograms        telegramJSProgramCache
+	delAccountPendingMu       sync.Mutex
+	delAccountPending         map[string]*delAccountPendingState
+	embyAdminMu               sync.Mutex
+	embyAdminCache            map[string]embyAdminCacheEntry
+	embyDeviceAuditMu         sync.Mutex
+	embyDeviceAuditUntil      time.Time
+	embyDeviceAuditCache      map[string]any
+	// playRankCache 按 "range|limit|是否含身份" 分键缓存榜单，脱敏版与管理
+	// 员版互不相通。
+	playRankMu    sync.Mutex
+	playRankCache map[string]playRankSnapshot
+	// playbackReportingReady 缓存 Playback Reporting 插件的探测结果。探测要往
+	// Emby 发一次自定义 SQL，不能每次同步都做；插件没装时必须静默回退，不能
+	// 每轮都往日志里写一条 warn。
+	playbackReportingMu        sync.Mutex
+	playbackReportingUntil     time.Time
+	playbackReportingReady     bool
+	playbackReportingLastError string
+	playbackReportingSyncedAt  int64
+	embySessionsMu             sync.Mutex
+	embySessionsUntil          time.Time
+	embySessionsCache          []map[string]any
+	migrationMu                sync.Mutex
+	// schedulerLocks: jobID -> *schedulerProcessRun。BATCH_07 之前在 package 级
+	// 声明 (`var schedulerProcessLocks sync.Map`)，单进程 prod 不显问题，但
+	// 测试 setup 反复 New() 出多个 App 时这张表共享 → 一个 case cancel 的 job
+	// 让另一 case 的 LoadOrStore 误判为 already running，flake 出现。收回到
+	// instance 字段后每个 App 自带独立锁表。零值即可使用。
+	schedulerLocks   sync.Map
+	schedulerWorkers sync.WaitGroup
+}
+
+// runtimeState 把 reload 期间会一并替换的运行时句柄打包成一个不可变快照，
+// 走 atomic.Pointer 整体切换。任何一个字段都不能在 store 之后被修改——读端
+// 拿到的快照必须自洽（cfg / store / sessions / limiter / redis 来自同一次
+// reload）。
+type runtimeState struct {
+	cfg      config.Config
+	store    *store.Store
+	sessions *sessionStore
+	limiter  *rateLimiter
+	redis    *redis.Client
+	// trustedProxies 是 cfg.TrustedProxyCIDRs 在 reload 期一次性解析好的匹配器：
+	// 把每请求都要跑的 net.ParseCIDR / net.ParseIP 挪到冷路径，热路径只做 Contains。
+	// 随快照一起原子切换，读端拿到的 cfg 与 trustedProxies 永远同源。
+	trustedProxies trustedProxyMatcher
+}
+
+// trustedProxyMatcher 持有预解析的受信代理网段与单 IP 列表。空列表 ⇒ 任何
+// 对端都不受信（fail-closed），与旧 upstreamIsTrustedProxy 语义一致。
+type trustedProxyMatcher struct {
+	nets []*net.IPNet
+	ips  []net.IP
+}
+
+// buildTrustedProxyMatcher 在 reload / New 时把 CIDR 字符串解析成匹配器；
+// 非法条目直接跳过（与旧逐请求解析时的 continue 行为一致）。
+func buildTrustedProxyMatcher(cidrs []string) trustedProxyMatcher {
+	var m trustedProxyMatcher
+	for _, raw := range cidrs {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		// 允许直接写单个 IP（不带 /N）：等价于 /32 或 /128。
+		if !strings.Contains(entry, "/") {
+			if peer := net.ParseIP(entry); peer != nil {
+				m.ips = append(m.ips, peer)
+			}
+			continue
+		}
+		if _, network, err := net.ParseCIDR(entry); err == nil {
+			m.nets = append(m.nets, network)
+		}
+	}
+	return m
+}
+
+// contains 判断 ip 是否落在任一受信网段或等于任一受信单 IP。
+func (m trustedProxyMatcher) contains(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, peer := range m.ips {
+		if peer.Equal(ip) {
+			return true
+		}
+	}
+	for _, network := range m.nets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// cfg 返回当前生效的 config.Config 指针：调用方读字段后即可释放快照；
+// 同一次 handler 内若需要前后一致，先 `cfg := a.cfg()` 一次再多次读字段。
+// 返回指针而非值避免在 hot path 上每次拷贝 ~50 字段的 Config struct。
+func (a *App) cfg() *config.Config {
+	if rt := a.runtime.Load(); rt != nil {
+		return &rt.cfg
+	}
+	// New() 之后 runtime 必然非 nil；这里仅作 nil 防御。
+	var empty config.Config
+	return &empty
+}
+
+func (a *App) store() *store.Store {
+	if rt := a.runtime.Load(); rt != nil {
+		return rt.store
+	}
+	return nil
+}
+
+func (a *App) sessions() *sessionStore {
+	if rt := a.runtime.Load(); rt != nil {
+		return rt.sessions
+	}
+	return nil
+}
+
+func (a *App) limiter() *rateLimiter {
+	if rt := a.runtime.Load(); rt != nil {
+		return rt.limiter
+	}
+	return nil
+}
+
+func (a *App) redis() *redis.Client {
+	if rt := a.runtime.Load(); rt != nil {
+		return rt.redis
+	}
+	return nil
+}
+
+// runtimeSnapshot 返回当前快照本身，便于持锁段或一次性需要多个字段的代码
+// 一次 Load 后多次读取，避免重复走 atomic.Load。
+func (a *App) runtimeSnapshot() *runtimeState {
+	return a.runtime.Load()
+}
+
+type embyAdminCacheEntry struct {
+	admin   bool
+	checked time.Time
+}
+
+type principal struct {
+	User       store.User
+	APIKey     store.APIKey
+	Token      string
+	FromCookie bool
+	Session    sessionRecord
+}
+
+type auditRequestState struct {
+	wrote atomic.Bool
+	// dryRun 记录本次请求是否为预览：0 未知，1 实际执行，2 预览。
+	// decodeMap 发现 payload 显式带 dry_run 时自动写入，handler 也可用
+	// markAuditDryRun 显式标记；fallback 审计据此在 detail 里加 dry_run。
+	dryRun atomic.Int32
+}
+
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+	// errorCode 由 writeJSONWithCode 回填，供失败请求的 fallback 审计记录 error_code。
+	errorCode string
+}
+
+func (w *statusResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(data)
+	w.bytes += n
+	return n, err
+}
+
+func (w *statusResponseWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if w.status == 0 {
+		w.status = http.StatusSwitchingProtocols
+	}
+	h, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return h.Hijack()
+}
+
+type contextKey string
+
+const principalKey contextKey = "principal"
+const auditRequestKey contextKey = "audit_request"
+
+// clientIPKey 缓存单个请求解析出的客户端 IP。ServeHTTP 入口算一次写进
+// context，后续黑名单 / 限速 / 访问日志以及各 handler 里的 a.clientIP(r)
+// 都直接命中缓存，避免每请求重复走 XFF 右向左剥离 + CIDR 匹配。
+const clientIPKey contextKey = "client_ip"
+
+const (
+	// 配置文件不是请求级状态。限制签名检查频率可以保留热重载能力，
+	// 同时避免每个 HTTP 请求都对主配置和 local 配置执行文件系统 stat。
+	configSignatureCheckInterval = 500 * time.Millisecond
+	// 正常请求不应进入高写入运行日志表；仅保留异常请求和明显慢请求，
+	// 让运行日志服务于诊断而不是变成逐请求访问日志。
+	httpRequestSlowLogThreshold = 2 * time.Second
+
+	twilightClientHeader             = "X-Twilight-Client"
+	twilightIntentHeader             = "X-Twilight-Intent"
+	twilightIntentCreateTelegramLink = "create-telegram-link"
+	twilightIntentCompleteSetup      = "complete-setup"
+)
+
+func New(cfg config.Config, st *store.Store) (*App, error) {
+	redisClient, err := newRedisClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	app := &App{
+		telegramPanels:       map[string]telegramPanelContext{},
+		developerJSCallbacks: map[string]developerJSCallbackContext{},
+		developerJSWaiters:   map[string]developerJSMessageWaiter{},
+		embyAdminCache:       map[string]embyAdminCacheEntry{},
+	}
+	app.runtime.Store(&runtimeState{
+		cfg:            cfg,
+		store:          st,
+		sessions:       newSessionStoreWithDB(cfg.SessionTTL, redisClient, st),
+		limiter:        newRateLimiter(redisClient),
+		redis:          redisClient,
+		trustedProxies: buildTrustedProxyMatcher(cfg.TrustedProxyCIDRs),
+	})
+	app.configSignature = configFileSignature(cfg.ConfigFile)
+	app.registerRoutes()
+	app.applyConfiguredAdmins()
+	// 从配置同步工单类型到 store（兼容旧配置 + 首次启动种子）
+	st.SyncTicketTypesFromConfig(cfg.TicketTypes)
+	// 启动期校验 CORS 配置一致性。
+	// applyCORS 默认就附带 Allow-Credentials: true，浏览器规范本就拒绝
+	// `*` + credentials 组合；早期管理员若误填 `*` 会得到一个静默无效的配置。
+	// 这里在启动 / reload 时强提示，配 .Error 让审计/告警系统能抓到。
+	validateCORSOriginsStartup(cfg.CORSOrigins, cfg.AllowCredential)
+	validateTrustedProxyStartup(cfg.TrustProxyHeaders, cfg.TrustedProxyCIDRs)
+	applyRuntimeMemoryLimit(cfg.RuntimeMemoryLimitMB)
+	ConfigureRuntimeLoggingStore(st, cfg.ZapLevel(), cfg.RuntimeLogLimit)
+	app.repairTelegramBindResidue("startup")
+	app.repairRegistrationResidue("startup")
+	return app, nil
+}
+
+func (a *App) repairTelegramBindResidue(source string) {
+	now := time.Now().Unix()
+	linksExpired := a.cleanupExpiredTelegramLinks(now)
+	linksOrphaned := a.cleanupOrphanedTelegramLinks()
+	persistedLegacy := 0
+	if st := a.store(); st != nil {
+		deleted, err := st.RepairLegacyTelegramBindResidue()
+		if err != nil {
+			zap.L().Warn("telegram bind residue repair failed", zap.String("source", source), zap.Error(err))
+			return
+		}
+		persistedLegacy = deleted
+	}
+	if linksExpired > 0 || linksOrphaned > 0 || persistedLegacy > 0 {
+		zap.L().Info("telegram bind residue repaired", zap.String("source", source), zap.Int("links_expired", linksExpired), zap.Int("links_orphaned", linksOrphaned), zap.Int("persisted_legacy", persistedLegacy))
+	}
+}
+
+func (a *App) repairRegistrationResidue(source string) {
+	st := a.store()
+	if st == nil {
+		return
+	}
+	result, err := st.RepairRegistrationResidue()
+	if err != nil {
+		zap.L().Warn("registration residue repair failed", zap.String("source", source), zap.Error(err))
+		return
+	}
+	if result.Total() > 0 {
+		zap.L().Info("registration residue repaired",
+			zap.String("source", source),
+			zap.Int("cleared_bound_pending", result.ClearedBoundPending),
+			zap.Int("restored_grant_locks", result.RestoredGrantLocks),
+			zap.Int("restored_pending_entitlements", result.RestoredPendingEntitlement),
+		)
+	}
+}
+
+func newRedisClient(cfg config.Config) (*redis.Client, error) {
+	redisClient, err := redis.New(cfg.RedisURL, 32)
+	if err != nil {
+		return nil, err
+	}
+	if redisClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := redisClient.Ping(ctx); err != nil {
+			cancel()
+			zap.L().Warn("redis configured but unavailable; using memory fallback", zap.Error(err))
+			redisClient = nil
+		} else {
+			cancel()
+			zap.L().Info("redis enabled for sessions and rate limits")
+		}
+	}
+	return redisClient, nil
+}
+
+// openConfiguredStore 只认 PostgreSQL：整个部署已收敛为单一后端，任何
+// 非 postgres 的 driver 值都视为配置错误直接拒开，不再回落到本地 JSON。
+// 历史 JSON 部署走一次性的 `twilight migrate-json` 命令导入，不在运行期打开。
+func openConfiguredStore(ctx context.Context, cfg config.Config) (*store.Store, error) {
+	if !config.IsPostgresDriver(cfg.DatabaseDriver) {
+		return nil, fmt.Errorf("unsupported database driver %q: only postgres is supported", cfg.DatabaseDriver)
+	}
+	dsn := cfg.PostgresDSN()
+	if dsn == "" {
+		return nil, fmt.Errorf("database driver is postgres but no PostgreSQL URL or host/user/database is configured")
+	}
+	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	st, err := store.OpenPostgres(openCtx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	st.ConfigurePostgres(cfg.PostgresMaxOpenConns, cfg.PostgresMaxIdleConns)
+	return st, nil
+}
+
+// storeBackendChanged 判定 reload 是否需要重开 store。后端已收敛为单一
+// PostgreSQL，driver 不再切换，因此只有 Postgres DSN（URL 或 host/user/
+// database/password 派生值）变化时才需要重开连接池。
+func storeBackendChanged(previous, next config.Config) bool {
+	return previous.PostgresDSN() != next.PostgresDSN()
+}
+
+func embyConnectionChanged(previous, next config.Config) bool {
+	return strings.TrimSpace(previous.EmbyURL) != strings.TrimSpace(next.EmbyURL) ||
+		strings.TrimSpace(previous.EmbyToken) != strings.TrimSpace(next.EmbyToken)
+}
+
+func (a *App) Routes() []Route {
+	out := make([]Route, len(a.routes))
+	copy(out, a.routes)
+	return out
+}
+
+func (a *App) reloadConfig() (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	var info map[string]any
+	err := config.WithWriteLock(ctx, a.configFilePath(), func() error {
+		a.runtimeMu.Lock()
+		defer a.runtimeMu.Unlock()
+		var err error
+		info, err = a.reloadConfigLocked()
+		return err
+	})
+	return info, err
+}
+
+var errSchedulerRuntimeBusy = errors.New("active scheduler runs must stop before replacing runtime resources")
+
+func (a *App) reloadConfigLocked() (map[string]any, error) {
+	prevState := a.runtimeSnapshot()
+	if prevState == nil {
+		return nil, fmt.Errorf("runtime not initialized")
+	}
+	previous := prevState.cfg
+	next, err := config.NewReader(previous.ConfigFile).Read()
+	if err != nil {
+		return nil, err
+	}
+
+	if storeBackendChanged(previous, next) || previous.RedisURL != next.RedisURL || previous.SessionTTL != next.SessionTTL {
+		active := false
+		a.schedulerLocks.Range(func(_, _ any) bool { active = true; return false })
+		if active {
+			return nil, errSchedulerRuntimeBusy
+		}
+	}
+	// 在快照副本上累积所有变更：开新 store / 新 redis / 新 sessions 等都先
+	// 写 nextState，最后一次 atomic.Store 把整组 hot 字段一并切换。读端走
+	// 访问器只能看到旧快照或新快照两种自洽视图，不会出现"cfg 已是 next、
+	// store 还是 prev"的撕裂态。
+	nextState := *prevState
+	nextState.cfg = next
+	// 受信代理网段随 cfg 一起在冷路径解析好，热路径 clientIP 只做匹配不再解析。
+	nextState.trustedProxies = buildTrustedProxyMatcher(next.TrustedProxyCIDRs)
+
+	reinitialized := []string{}
+	closeOldStore := false
+	if storeBackendChanged(previous, next) {
+		// Postgres DSN 变了：先开新连接池，确认成功后再关旧 store。
+		// 不能"先关后开"——那会留下 store==nil 窗口，并发 ServeHTTP 走到
+		// store().IsIPBlacklisted / store().User 等点会直接 nil panic；
+		// 失败时也无法干净回滚。
+		nextStore, err := openConfiguredStore(context.Background(), next)
+		if err != nil {
+			return nil, err
+		}
+		nextState.store = nextStore
+		closeOldStore = prevState.store != nil
+		reinitialized = append(reinitialized, "database")
+	}
+	closeOldRedis := false
+	if previous.RedisURL != next.RedisURL || previous.SessionTTL != next.SessionTTL {
+		redisClient, err := newRedisClient(next)
+		if err != nil {
+			if closeOldStore {
+				_ = nextState.store.Close()
+			}
+			return nil, err
+		}
+		nextState.sessions = newSessionStoreWithDB(next.SessionTTL, redisClient, nextState.store)
+		nextState.limiter = newRateLimiter(redisClient)
+		nextState.redis = redisClient
+		closeOldRedis = prevState.redis != nil && prevState.redis != redisClient
+		reinitialized = append(reinitialized, "sessions", "rate_limiter")
+	} else if nextState.store != prevState.store {
+		// store 换了但 redis 没换：sessions 内部持有 store 引用，需要重新
+		// 绑定到新 store，否则会话回写还是落到旧 backend 上。
+		nextState.sessions = newSessionStoreWithDB(next.SessionTTL, nextState.redis, nextState.store)
+	}
+
+	if nextState.store.Backend() == store.BackendPostgres && (previous.PostgresMaxOpenConns != next.PostgresMaxOpenConns || previous.PostgresMaxIdleConns != next.PostgresMaxIdleConns) {
+		nextState.store.ConfigurePostgres(next.PostgresMaxOpenConns, next.PostgresMaxIdleConns)
+		reinitialized = append(reinitialized, "postgres_pool")
+	}
+
+	// 原子切换：在此之前任何 return 都不会污染当前运行时；之后读端就是新状态。
+	a.runtime.Store(&nextState)
+	if !next.TwoFactorEnrollmentEnabled {
+		if err := nextState.store.CancelTwoFactorSetups(context.Background()); err != nil {
+			zap.L().Warn("cancel two-factor setups failed")
+		}
+	}
+	if embyConnectionChanged(previous, next) {
+		a.invalidateEmbyConfigurationCaches()
+	}
+
+	// applyConfiguredAdmins 读 cfg / 写 store，必须在 atomic Store 之后调用，
+	// 否则它内部的 a.cfg() / a.store() 还会看到旧快照。
+	a.applyConfiguredAdmins()
+
+	if closeOldStore {
+		_ = prevState.store.Close()
+	}
+	if closeOldRedis {
+		_ = prevState.redis.Close()
+	}
+
+	// reload 也走一遍 CORS 校验，捕获 hot reload 引入的错配置。
+	if !sameStringSlice(previous.CORSOrigins, next.CORSOrigins) ||
+		previous.AllowCredential != next.AllowCredential {
+		validateCORSOriginsStartup(next.CORSOrigins, next.AllowCredential)
+	}
+	if previous.TrustProxyHeaders != next.TrustProxyHeaders ||
+		!sameStringSlice(previous.TrustedProxyCIDRs, next.TrustedProxyCIDRs) {
+		validateTrustedProxyStartup(next.TrustProxyHeaders, next.TrustedProxyCIDRs)
+	}
+	if previous.RuntimeMemoryLimitMB != next.RuntimeMemoryLimitMB {
+		applyRuntimeMemoryLimit(next.RuntimeMemoryLimitMB)
+		reinitialized = append(reinitialized, "runtime_memory_limit")
+	}
+	ConfigureRuntimeLoggingStore(nextState.store, next.ZapLevel(), next.RuntimeLogLimit)
+	reinitialized = append(reinitialized, "runtime_logger")
+	a.repairTelegramBindResidue("config_reload")
+	a.repairRegistrationResidue("config_reload")
+
+	restartRequired := []string{}
+	if previous.Host != next.Host || previous.Port != next.Port {
+		restartRequired = append(restartRequired, "listen_addr")
+	}
+	// liveApplied 列出"本次 reload 后立即对运行中的 handler 生效"的字段。
+	// 这些字段都不缓存到任何长寿命对象上：要么走 a.cfg() 在每次请求时重读
+	// （SessionCookie / CookieSecure / CookieSameSite / RegisterEnabled /
+	// 各类 RateLimit*），要么作为 reload 自身重建链路的输入（DatabaseDriver /
+	// RedisURL / SessionTTL / Postgres pool / ZapLevel）。
+	//
+	// 这一段的目的不是改变行为——之前 cookie 三件套就是被实时读的——而是
+	// 把"哪些字段实际生效 / 哪些不生效"做成可观察的响应字段，避免运营手改
+	// 配置后只看到 200 而不知道是不是真的下发了。restartRequired 仍然只覆盖
+	// listen_addr：那是唯一一个 reload 无法替换的整体监听器。
+	liveApplied := liveAppliedConfigFields(previous, next)
+	a.configSignature = configFileSignature(next.ConfigFile)
+
+	info := map[string]any{
+		"reloaded":            true,
+		"config_file":         next.ConfigFile,
+		"reinitialized":       reinitialized,
+		"restart_required":    restartRequired,
+		"live_applied":        liveApplied,
+		"active_database":     nextState.store.Backend(),
+		"configured_database": next.DatabaseDriver,
+		"runtime_restarted":   len(reinitialized) > 0,
+	}
+	zap.L().Info("config hot reloaded", zap.String("config_file", next.ConfigFile), zap.String("reinitialized", strings.Join(reinitialized, ",")), zap.String("restart_required", strings.Join(restartRequired, ",")), zap.String("live_applied", strings.Join(liveApplied, ",")))
+	// 同步配置中的 TicketTypes 到 store（兼容旧配置 + 配置变更后的覆盖）
+	nextState.store.SyncTicketTypesFromConfig(next.TicketTypes)
+	return info, nil
+}
+
+// liveAppliedConfigFields 返回本次 reload 中"实际值发生变化且立即对运行
+// 时生效"的字段名（首字母 lower / TOML key 风格）。给出这一列表是为了让
+// /admin/config/reload 的响应能区分三种状态：
+//   - reinitialized: 引发重建（store / sessions / limiter / postgres / logger）
+//   - live_applied: 字段值变化但走 a.cfg() 实时重读，无需重建对象
+//   - restart_required: 字段变化需要进程重启（目前只有 listen_addr）
+//
+// 字段没出现 = 字段没变。空列表 = reload 仅触发过 reinit，没有更细粒度的
+// 即时变更。这一函数是纯读，不写任何运行时状态。
+func liveAppliedConfigFields(previous, next config.Config) []string {
+	out := []string{}
+	add := func(name string) { out = append(out, name) }
+	if previous.SessionCookie != next.SessionCookie {
+		add("session_cookie_name")
+	}
+	if previous.CookieSecure != next.CookieSecure {
+		add("session_cookie_secure")
+	}
+	if !strings.EqualFold(previous.CookieSameSite, next.CookieSameSite) {
+		add("session_cookie_samesite")
+	}
+	if previous.CookieDomain != next.CookieDomain {
+		add("session_cookie_domain")
+	}
+	if previous.RegisterEnabled != next.RegisterEnabled {
+		add("register_enabled")
+	}
+	if previous.AllowPendingRegister != next.AllowPendingRegister {
+		add("allow_pending_register")
+	}
+	if previous.MediaRequestEnabled != next.MediaRequestEnabled {
+		add("media_request_enabled")
+	}
+	if previous.SigninEnabled != next.SigninEnabled {
+		add("signin_enabled")
+	}
+	if previous.InviteEnabled != next.InviteEnabled {
+		add("invite_enabled")
+	}
+	if previous.RateLimitEnabled != next.RateLimitEnabled {
+		add("rate_limit_enabled")
+	}
+	if previous.RateLimitGlobalPerMinute != next.RateLimitGlobalPerMinute {
+		add("rate_limit_global_per_minute")
+	}
+	if previous.RateLimitAPIKeyDefaultPerMinute != next.RateLimitAPIKeyDefaultPerMinute {
+		add("rate_limit_apikey_default_per_minute")
+	}
+	if !sameStringSlice(previous.CORSOrigins, next.CORSOrigins) {
+		add("cors_origins")
+	}
+	if previous.AllowCredential != next.AllowCredential {
+		add("allow_credential")
+	}
+	if previous.TrustProxyHeaders != next.TrustProxyHeaders {
+		add("trust_proxy_headers")
+	}
+	if !sameStringSlice(previous.TrustedProxyCIDRs, next.TrustedProxyCIDRs) {
+		add("trusted_proxy_cidrs")
+	}
+	if previous.MaxUploadSize != next.MaxUploadSize {
+		add("max_upload_size")
+	}
+	return out
+}
+
+func (a *App) shouldCheckConfigSignature(now time.Time) bool {
+	lastChecked := a.configSignatureCheckedAt.Load()
+	nowUnixNano := now.UnixNano()
+	elapsed := nowUnixNano - lastChecked
+	if lastChecked > 0 && elapsed >= 0 && elapsed < configSignatureCheckInterval.Nanoseconds() {
+		return false
+	}
+	if !a.configSignatureCheckedAt.CompareAndSwap(lastChecked, nowUnixNano) {
+		return false
+	}
+	return true
+}
+
+func (a *App) reloadConfigIfChanged() {
+	if !a.shouldCheckConfigSignature(time.Now()) {
+		return
+	}
+	current := configFileSignature(a.cfg().ConfigFile)
+	a.runtimeMu.Lock()
+	unchanged := current == "" || current == a.configSignature
+	a.runtimeMu.Unlock()
+	if unchanged {
+		return
+	}
+	// A hot-reload reader must not publish another process's uncommitted file.
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	err := config.WithWriteLock(ctx, a.configFilePath(), func() error {
+		a.runtimeMu.Lock()
+		defer a.runtimeMu.Unlock()
+		current = configFileSignature(a.cfg().ConfigFile)
+		if current == "" || current == a.configSignature {
+			return nil
+		}
+		_, err := a.reloadConfigLocked()
+		if err != nil && !errors.Is(err, errSchedulerRuntimeBusy) {
+			a.configSignature = current
+		}
+		return err
+	})
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, errSchedulerRuntimeBusy) {
+		zap.L().Warn("config hot reload check failed", zap.Error(err))
+	}
+
+}
+
+func configFileSignature(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "config.toml"
+	}
+	paths := []string{path}
+	local := os.Getenv("TWILIGHT_CONFIG_LOCAL_FILE")
+	if local == "" {
+		local = strings.TrimSuffix(path, filepath.Ext(path)) + ".local" + filepath.Ext(path)
+	}
+	paths = append(paths, local)
+	parts := make([]string, 0, len(paths))
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				parts = append(parts, p+":missing")
+			} else {
+				parts = append(parts, p+":error")
+			}
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s:%d:%d", p, info.Size(), info.ModTime().UnixNano()))
+	}
+	return strings.Join(parts, "|")
+}
+
+func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	lw := &statusResponseWriter{ResponseWriter: w}
+	var principalLog *principal
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			// panic 值可能携带请求字段（密码 / token / Emby 凭据等），
+			// zap.Any 会原样落盘绕过日志脱敏；先 fmt + redact 再写。
+			panicMsg := redactSensitiveText(fmt.Sprintf("%v", recovered))
+			zap.L().Error("panic in api handler",
+				zap.String("panic", panicMsg),
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+			)
+			// envelope 必须带 error_code，前端才能用 errcode 而非文案匹配。
+			// status==0 表示尚未写入响应头，避免 panic 后再写一次造成 superfluous WriteHeader。
+			if lw.status == 0 {
+				failWithCode(lw, http.StatusInternalServerError, ErrInternal, "服务器内部错误")
+			}
+		}
+		status := lw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		duration := time.Since(started)
+		if status < 400 && duration < httpRequestSlowLogThreshold {
+			return
+		}
+		fields := []zap.Field{
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.Int("status", status),
+			zap.Int("bytes", lw.bytes),
+			zap.Int64("duration_ms", duration.Milliseconds()),
+			zap.String("ip", a.clientIP(r)),
+		}
+		if principalLog != nil {
+			fields = append(fields, zap.Int64("uid", principalLog.User.UID), zap.String("username", principalLog.User.Username))
+		}
+		if status >= 500 {
+			zap.L().Error("http request completed", fields...)
+			return
+		}
+		if status >= 400 {
+			zap.L().Warn("http request completed", fields...)
+			return
+		}
+		zap.L().Warn("slow http request completed", fields...)
+	}()
+	a.reloadConfigIfChanged()
+	// reload 之后 runtime 快照（cfg + trustedProxies）已是最新，此时解析一次
+	// 客户端 IP 写进 context：后续黑名单 / 限速 / 访问日志及各 handler 全部复用，
+	// 连 OPTIONS 早返回路径上的 defer 访问日志也命中缓存，不再二次解析。
+	clientIP := a.computeClientIP(r)
+	r = r.WithContext(context.WithValue(r.Context(), clientIPKey, clientIP))
+	a.applySecurityHeaders(lw)
+	if a.applyCORS(lw, r) && r.Method == http.MethodOptions {
+		lw.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// 路由匹配用的是清理后的路径，但不少 handler（会话管理员视图、上传大小例外、
+	// 启用/停用方向判断等）直接看 r.URL.Path。带 “..” / “.” / 空段的请求会让两边
+	// 看到不同的路径，例如 /api/v1/users/admin/../me/sessions 能以普通用户身份拿到
+	// 管理员视图。正常客户端不会发出这种路径，入口处一律拒绝。
+	if !requestPathCanonical(r.URL.Path) {
+		failWithCode(lw, http.StatusBadRequest, ErrBadRequest, "请求路径不规范")
+		return
+	}
+	bodyLimit := requestBodyLimit(r.URL.Path, a.cfg().MaxUploadSize)
+	if bodyLimit > 0 {
+		r.Body = http.MaxBytesReader(lw, r.Body, bodyLimit)
+	}
+	if !a.allowRate(r.Context(), rateKey("global:", clientIP), a.cfg().RateLimitGlobalPerMinute, time.Minute) {
+		failWithCode(lw, http.StatusTooManyRequests, ErrGlobalRateLimited, "请求过于频繁，请稍后再试")
+		return
+	}
+
+	// Every process owns a Store snapshot. Refresh after cheap transport guards
+	// but before blacklist checks, routing, authentication, or any handler read.
+	// Handler-level guards reuse the request marker.
+	r = withRequestStoreRefreshState(r)
+	if a.refreshStoreForRequest(lw, r) {
+		return
+	}
+	if a.store().IsIPBlacklisted(clientIP) {
+		failWithCode(lw, http.StatusForbidden, ErrIPBlacklisted, "IP 已被封禁")
+		return
+	}
+
+	// ============================================================
+	// 严禁修改 CSRF/CORS - V1 生产兼容性要求
+	// DO NOT MODIFY CSRF/CORS - V1 production compatibility required
+	// ============================================================
+
+	route, params, methodAllowed := a.match(r.Method, r.URL.Path)
+	if route == nil {
+		if methodAllowed {
+			failWithCode(lw, http.StatusMethodNotAllowed, ErrRouteMethodNotAllow, "请求方法不允许")
+		} else {
+			failWithCode(lw, http.StatusNotFound, ErrRouteNotFound, "接口不存在")
+		}
+		return
+	}
+
+	principal, ok := a.authenticate(lw, r, route.Auth)
+	if !ok {
+		return
+	}
+	principalLog = principal
+	if principal != nil && a.blockRestrictedEmbyAdmin(lw, r, route, principal.User) {
+		return
+	}
+	auditState := &auditRequestState{}
+	r = r.WithContext(context.WithValue(r.Context(), auditRequestKey, auditState))
+	if principal != nil {
+		r = r.WithContext(context.WithValue(r.Context(), principalKey, *principal))
+	}
+	route.Handler(lw, r, params)
+	status := lw.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	a.maybeAuditHTTPMutation(r, route, params, principal, status, lw.errorCode)
+}
+
+func (a *App) allowRate(ctx context.Context, key string, limit int, window time.Duration) bool {
+	if !a.cfg().RateLimitEnabled || limit <= 0 {
+		return true
+	}
+	return a.limiter().Allow(ctx, key, limit, window)
+}
+func (a *App) add(method, pattern string, auth AuthLevel, handler HandlerFunc) {
+	parts := splitPath(pattern)
+	literals := 0
+	for _, part := range parts {
+		if !strings.HasPrefix(part, ":") {
+			literals++
+		}
+	}
+	index := len(a.routes)
+	a.routes = append(a.routes, Route{Method: method, Pattern: pattern, Parts: parts, Auth: auth, Handler: handler, Literals: literals})
+	if a.routeIndex == nil {
+		a.routeIndex = make(map[routeIndexKey][]int)
+		a.routePathIndex = make(map[routePathIndexKey][]int)
+	}
+	group := routeGroup(parts)
+	methodKey := routeIndexKey{method: method, partCount: len(parts), group: group}
+	pathKey := routePathIndexKey{partCount: len(parts), group: group}
+	a.routeIndex[methodKey] = append(a.routeIndex[methodKey], index)
+	a.routePathIndex[pathKey] = append(a.routePathIndex[pathKey], index)
+}
+
+func (a *App) match(method, requestPath string) (*Route, Params, bool) {
+	requestParts := splitPath(requestPath)
+	group := routeGroup(requestParts)
+	methodKey := routeIndexKey{method: method, partCount: len(requestParts), group: group}
+	methodFallbackKey := routeIndexKey{method: method, partCount: len(requestParts)}
+	if route, params := a.matchIndexedRoutes(
+		a.routeIndex[methodKey],
+		a.routeIndex[methodFallbackKey],
+		requestParts,
+		"",
+	); route != nil {
+		return route, params, true
+	}
+
+	pathKey := routePathIndexKey{partCount: len(requestParts), group: group}
+	pathFallbackKey := routePathIndexKey{partCount: len(requestParts)}
+	methodAllowed, _ := a.matchIndexedRoutes(
+		a.routePathIndex[pathKey],
+		a.routePathIndex[pathFallbackKey],
+		requestParts,
+		method,
+	)
+	return nil, nil, methodAllowed != nil
+}
+
+// matchIndexedRoutes merges the exact-group and wildcard-group registration
+// indexes without allocating a combined slice. Both input slices contain
+// monotonically increasing route indexes, so choosing the lower index preserves
+// the original registration priority even when a wildcard group precedes a
+// static group.
+func (a *App) matchIndexedRoutes(exact, wildcard []int, requestParts []string, excludeMethod string) (*Route, Params) {
+	if len(exact) > 0 && len(wildcard) > 0 && &exact[0] == &wildcard[0] {
+		wildcard = nil
+	}
+	// 不再"首个匹配即返回"：同桶内可能同时存在 `/x/:id` 与 `/x/batch` 这类
+	// 同形路由，注册顺序决定了谁生效，而注册顺序是偶然的。这里按字面量段数
+	// 选最具体的那条（同分保留先注册的），让静态路由不再被参数位遮蔽。
+	var (
+		best       *Route
+		bestParams Params
+	)
+	exactPos, wildcardPos := 0, 0
+	for exactPos < len(exact) || wildcardPos < len(wildcard) {
+		index := 0
+		switch {
+		case exactPos >= len(exact):
+			index = wildcard[wildcardPos]
+			wildcardPos++
+		case wildcardPos >= len(wildcard):
+			index = exact[exactPos]
+			exactPos++
+		case exact[exactPos] <= wildcard[wildcardPos]:
+			index = exact[exactPos]
+			exactPos++
+			if index == wildcard[wildcardPos] {
+				wildcardPos++
+			}
+		default:
+			index = wildcard[wildcardPos]
+			wildcardPos++
+		}
+		route := &a.routes[index]
+		if excludeMethod != "" && route.Method == excludeMethod {
+			continue
+		}
+		if best != nil && route.Literals <= best.Literals {
+			// 不如已选中的具体；同分时保留先注册者。仍要试匹配吗？不需要——
+			// 即使它也匹配，按规则也不会取代 best。
+			continue
+		}
+		if params, ok := matchPattern(route.Parts, requestParts); ok {
+			best, bestParams = route, params
+		}
+	}
+	return best, bestParams
+}
+
+func routeGroup(parts []string) string {
+	if len(parts) == 0 {
+		return "/"
+	}
+	position := 0
+	if len(parts) > 2 {
+		position = 2
+	}
+	if strings.HasPrefix(parts[position], ":") {
+		return ""
+	}
+	return parts[position]
+}
+
+func matchPattern(patternParts, requestParts []string) (Params, bool) {
+	if len(patternParts) != len(requestParts) {
+		return nil, false
+	}
+	// params 延迟到遇到首个 `:` 占位符才分配：绝大多数静态路由（无路径参数）
+	// 与所有 length/字面量 不匹配的路由都不再产生一次 map 分配，match 每请求
+	// 遍历整张路由表时省掉大量短命 map。读端从 nil Params 取值等价于取空串。
+	var params Params
+	for i := range patternParts {
+		if strings.HasPrefix(patternParts[i], ":") {
+			if params == nil {
+				params = Params{}
+			}
+			params[strings.TrimPrefix(patternParts[i], ":")] = requestParts[i]
+			continue
+		}
+		if patternParts[i] != requestParts[i] {
+			return nil, false
+		}
+	}
+	return params, true
+}
+
+func splitPath(p string) []string {
+	if p == "" {
+		return nil
+	}
+	// Request URL paths and every registered route already start with '/'. Avoid
+	// concatenating another prefix on that hot path; path.Clean keeps the same
+	// duplicate-slash and dot-segment normalization semantics.
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	p = path.Clean(p)
+	if p == "/" {
+		return nil
+	}
+	return strings.Split(strings.Trim(p, "/"), "/")
+}
+
+func (a *App) authenticate(w http.ResponseWriter, r *http.Request, auth AuthLevel) (*principal, bool) {
+	if auth == AuthPublic {
+		return nil, true
+	}
+	if auth == AuthAPIKey {
+		p, ok := a.authenticateAPIKey(r)
+		if !ok {
+			failWithCode(w, http.StatusUnauthorized, ErrAPIKeyInvalid, "API Key 无效")
+			return nil, false
+		}
+		return p, true
+	}
+	p, ok := a.authenticateUser(r)
+	if !ok {
+		failWithCode(w, http.StatusUnauthorized, ErrUnauthorized, "登录状态已失效，请重新登录")
+		return nil, false
+	}
+	if !p.User.Active {
+		// 与 handleLogin / handleLoginByAPIKey 同口径：session 仍然挂在 user 上，
+		// 但 admin 把账号 Active=false（手动禁用 vs check_expired 触发的到期），
+		// 路径上拿到不同 ErrCode 才能让 webui 把"续费"和"申诉"两条 CTA 分开。
+		if userExpiredOnly(p.User) {
+			failWithCode(w, http.StatusForbidden, ErrAccountExpired, "账号有效期已到期，请续费后再继续操作")
+			return nil, false
+		}
+		failWithCode(w, http.StatusForbidden, ErrAccountDisabled, "账号已被禁用")
+		return nil, false
+	}
+	if auth == AuthAdmin && p.User.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusForbidden, ErrForbidden, "需要管理员权限")
+		return nil, false
+	}
+	return p, true
+}
+
+func (a *App) authenticateUser(r *http.Request) (*principal, bool) {
+	token := bearerToken(r.Header.Get("Authorization"))
+	fromCookie := false
+	if token == "" {
+		if cookie, err := r.Cookie(a.cfg().SessionCookie); err == nil {
+			token = cookie.Value
+			fromCookie = true
+		}
+	}
+	record, ok := a.sessions().GetRecord(r.Context(), token)
+	if !ok {
+		return nil, false
+	}
+	u, ok := a.store().User(record.UID)
+	if !ok {
+		return nil, false
+	}
+	// Active 兜底：用户被 ban / scheduler 自动失活 / 用户主动注销后，stale token
+	// 必须立即被拒。redis 缓存的 sessionRecord 不含 active 字段，所以不能依赖
+	// 缓存层做这件事；store.User 才是 active 的唯一真相源。
+	// 与 authenticateAPIKey:495 的 `!u.Active` 检查口径一致。
+	if !u.Active {
+		return nil, false
+	}
+	return &principal{User: u, Token: token, FromCookie: fromCookie, Session: record}, true
+}
+
+func (a *App) authenticateAPIKey(r *http.Request) (*principal, bool) {
+	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
+	fromQuery := false
+	if key == "" {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		// 大小写不敏感前缀判定：不再对整个 Authorization 头做 strings.ToLower
+		// 分配，改用 EqualFold 只比较前 7 字节（"bearer " / "apikey "）。
+		switch {
+		case len(auth) > len("bearer ") && strings.EqualFold(auth[:len("bearer ")], "bearer "):
+			key = strings.TrimSpace(auth[len("bearer "):])
+		case len(auth) > len("apikey ") && strings.EqualFold(auth[:len("apikey ")], "apikey "):
+			key = strings.TrimSpace(auth[len("apikey "):])
+		}
+	}
+	if key == "" {
+		if raw := r.URL.Query().Get("apikey"); raw != "" {
+			key = strings.TrimSpace(raw)
+			fromQuery = true
+		}
+	}
+	if key == "" {
+		return nil, false
+	}
+	hash := hashAPIKey(key)
+	ak, u, ok := a.store().FindAPIKeyByHash(hash)
+	if !ok || !u.Active {
+		return nil, false
+	}
+	if fromQuery && (ak.ID == 0 || !ak.AllowQuery) {
+		return nil, false
+	}
+	limit := ak.RateLimit
+	if limit <= 0 {
+		limit = a.cfg().RateLimitAPIKeyDefaultPerMinute
+	}
+	if !a.allowRate(r.Context(), rateKey("apikey:", hash), limit, time.Minute) {
+		return nil, false
+	}
+	if ak.ID > 0 {
+		_ = a.store().RecordAPIKeyUse(ak.ID)
+	}
+	return &principal{User: u, APIKey: ak}, true
+}
+
+func current(r *http.Request) principal {
+	p, _ := r.Context().Value(principalKey).(principal)
+	return p
+}
+
+func bearerToken(header string) string {
+	// 大小写不敏感的 "bearer " 前缀校验：先做长度剪枝，再用 EqualFold 只比较
+	// 前 7 字节，避免对整段 Authorization 头做一次 strings.ToLower 分配（原
+	// strings.ToLower(header) 会复制整个头）。只有确为 bearer 才切出 token。
+	if len(header) > len("bearer ") && strings.EqualFold(header[:len("bearer ")], "bearer ") {
+		return strings.TrimSpace(header[len("bearer "):])
+	}
+	return ""
+}
+
+func (a *App) applySecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+	w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
+	// 后端只输出 JSON / 静态上传资源，不渲染 HTML 应用本身：
+	// 限制 default-src 'none'，避免 application/json 错误识别后被注入脚本。
+	// 文档/图片仍可加载（img-src + style-src 'self'）。
+	// 前端 Next.js 的 CSP 由 webui 自身在 next.config.ts / middleware 中负责。
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "+
+			"script-src 'self'; connect-src 'self'; font-src 'self' data:; "+
+			"frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-site")
+}
+
+// ============================================================
+// 严禁修改 CSRF/CORS - V1 生产兼容性要求
+// DO NOT MODIFY CSRF/CORS - V1 production compatibility required
+// ============================================================
+func (a *App) applyCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	origin = normalizeCORSOrigin(origin)
+	if origin == "" {
+		return false
+	}
+	// origin 已在入口规范化一次；下面三个判定（白名单 / 同源 / 宽松反射）都
+	// 直接消费这份规范化结果，不再各自重复 url.Parse + strings.ToLower。
+	allowed := a.corsOriginAllowed(origin) || a.corsOriginMatchesHost(origin, r) || a.corsOriginRelaxed()
+	if !allowed {
+		return false
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Vary", "Origin")
+	// 仅在 allow_credential 开启时下发凭据头；否则运维显式关闭凭据共享的意图
+	// 必须被尊重（此前无条件下发，使该开关形同虚设，列入白名单的低信任 origin
+	// 仍可携带 cookie 读取已登录用户的鉴权响应）。origin 反射始终受白名单约束。
+	if a.cfg().AllowCredential {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+	// 求片管理员更新使用 If-Match 做 revision 并发保护；它必须包含在
+	// 预检允许头中，否则浏览器会在实际 PUT 发出前直接拦截请求。
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, If-Match, Idempotency-Key, X-Twilight-Client, X-Twilight-Intent, X-Telegram-Link-Secret")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+	w.Header().Set("Access-Control-Max-Age", "600")
+	return true
+}
+
+// corsOriginAllowed reports whether a normalized origin is present in the
+// configured allowlist. The origin must already be normalized (applyCORS does
+// this once); it is re-checked defensively for the `*` sentinel which is never a
+// concrete match.
+func (a *App) corsOriginAllowed(origin string) bool {
+	if origin == "" || origin == "*" {
+		return false
+	}
+	for _, candidate := range a.cfg().CORSOrigins {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || candidate == "*" {
+			continue
+		}
+		if strings.EqualFold(normalizeCORSOrigin(candidate), origin) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) corsOriginRelaxed() bool {
+	for _, candidate := range a.cfg().CORSOrigins {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		return candidate == "*"
+	}
+	return true
+}
+
+// corsOriginMatchesHost returns whether Origin matches the current request host
+// as scheme://host[:port]. This preserves the pre-98b1c3d same-host CORS
+// behavior for deployments where browsers send an Origin header on same-origin
+// requests even though the API host is not duplicated in cors_origins.
+// The origin is already normalized by applyCORS.
+func (a *App) corsOriginMatchesHost(origin string, r *http.Request) bool {
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return false
+	}
+	scheme := "https"
+	if !a.cfg().CookieSecure && r.TLS == nil {
+		scheme = "http"
+	}
+	hostOrigin := scheme + "://" + host
+	return strings.EqualFold(origin, hostOrigin)
+}
+
+func requireWebUIIntent(w http.ResponseWriter, r *http.Request, intent string) bool {
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get(twilightClientHeader)), "webui") ||
+		!strings.EqualFold(strings.TrimSpace(r.Header.Get(twilightIntentHeader)), intent) {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "缺少显式前端操作意图")
+		return false
+	}
+	if isPrefetchRequest(r) {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "预取请求不能创建绑定码")
+		return false
+	}
+	return true
+}
+
+func isPrefetchRequest(r *http.Request) bool {
+	for _, name := range []string{"Purpose", "Sec-Purpose", "X-Moz"} {
+		if strings.Contains(strings.ToLower(r.Header.Get(name)), "prefetch") {
+			return true
+		}
+	}
+	return false
+}
+
+// validateCORSOriginsStartup 在启动 / reload 时对 CORS 配置做静态体检：
+//   - 显式 `*` 与 Allow-Credentials: true 是浏览器规范禁止的组合，
+//     applyCORS 已运行期跳过 `*`，但管理员看不到任何反馈，
+//     因此这里强制 zap.Error 让监控/SRE 抓到错配置；
+//   - 同时把无法 normalize 的 origin（拼写错误 / 含路径 / 含 query）
+//     列出来，给运维一个可定位的失败信号。
+//
+// 函数本身不返回 error，仅打印 —— App 不会因为 CORS 错配置启动失败，
+// 因为反代/容器重启场景下这往往是非致命的退化。
+func validateCORSOriginsStartup(origins []string, allowCredential bool) {
+	if len(origins) == 0 {
+		zap.L().Info(
+			"cors_origins is empty; valid http/https Origins will be reflected for easier self-hosting setup",
+			zap.Bool("allow_credential", allowCredential),
+		)
+		return
+	}
+	var hasWildcard bool
+	var hasLocalhost bool
+	var invalid []string
+	cleaned := make([]string, 0, len(origins))
+	for _, raw := range origins {
+		o := strings.TrimSpace(raw)
+		if o == "" {
+			continue
+		}
+		if o == "*" {
+			hasWildcard = true
+			continue
+		}
+		if normalizeCORSOrigin(o) == "" {
+			invalid = append(invalid, o)
+			continue
+		}
+		lower := strings.ToLower(o)
+		if strings.Contains(lower, "://localhost") || strings.Contains(lower, "://127.0.0.1") || strings.Contains(lower, "://[::1]") {
+			hasLocalhost = true
+		}
+		cleaned = append(cleaned, o)
+	}
+	if hasWildcard {
+		zap.L().Info(
+			"cors_origins contains `*`; valid http/https Origins will be reflected for compatibility",
+			zap.Strings("configured_origins", origins),
+			zap.Strings("effective_origins", cleaned),
+			zap.Bool("allow_credential", allowCredential),
+		)
+	}
+	if len(invalid) > 0 {
+		zap.L().Warn(
+			"cors_origins 含无法解析的条目，已忽略；条目必须是 scheme://host[:port]，无 path/query/fragment",
+			zap.Strings("invalid_entries", invalid),
+		)
+	}
+	// AllowCredential=true 同时放行 localhost / 127.0.0.1 / [::1] 在生产环境是高危：
+	// 任何用户在本机起 dev 前端就能携带 cookie 跨站访问。dev 场景应通过显式 dev profile
+	// 而不是默认放行。
+	if allowCredential && hasLocalhost {
+		zap.L().Warn(
+			"cors_origins includes localhost/127.0.0.1 while allow_credential=true; keep this only for development or trusted local deployments",
+			zap.Strings("configured_origins", origins),
+		)
+	}
+}
+
+// validateTrustedProxyStartup 在启动 / reload 时核验"信任代理头 + 上游 CIDR"
+// 这对配置：
+//   - TrustProxyHeaders=true 但 TrustedProxyCIDRs 为空：打 Error 提醒——
+//     trustedProxyMatcher 为空时 contains 恒返回 false（fail-closed），
+//     意味着 trust_proxy_headers=true 此时实际无效，所有 IP 限流 / 黑名单
+//     都基于 TCP 对端地址。运维必须补全 CIDR 才能生效。
+//   - 单条 CIDR 解析失败：打 Warn 列出出错条目，调用方仍然按剩余可用条目工作；
+//   - TrustProxyHeaders=false 且 CIDRs 非空：打 Info 提示 CIDRs 当前不会生效，
+//     避免运维误以为已经启用。
+func validateTrustedProxyStartup(trust bool, cidrs []string) {
+	if !trust {
+		if len(cidrs) > 0 {
+			zap.L().Info(
+				"trusted_proxy_cidrs 已配置但 trust_proxy_headers=false；当前不会消费任何代理头",
+				zap.Strings("trusted_proxy_cidrs", cidrs),
+			)
+		}
+		return
+	}
+	var invalid []string
+	var valid int
+	for _, raw := range cidrs {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		if !strings.Contains(entry, "/") {
+			if net.ParseIP(entry) == nil {
+				invalid = append(invalid, entry)
+				continue
+			}
+			valid++
+			continue
+		}
+		if _, _, err := net.ParseCIDR(entry); err != nil {
+			invalid = append(invalid, entry)
+			continue
+		}
+		valid++
+	}
+	if valid == 0 {
+		zap.L().Error(
+			"trust_proxy_headers=true 但 trusted_proxy_cidrs 未配置任何有效条目；"+
+				"代理头将被忽略（fail-closed），所有 IP 维度策略基于 TCP 对端地址。"+
+				"如需消费 X-Forwarded-For / X-Real-IP / CF-Connecting-IP，请补 "+
+				"API.trusted_proxy_cidrs（CIDR 或单 IP，逗号分隔）",
+			zap.Strings("configured_cidrs", cidrs),
+		)
+	}
+	if len(invalid) > 0 {
+		zap.L().Warn(
+			"trusted_proxy_cidrs 含无法解析的条目，已忽略；条目必须是 IP 或 CIDR (a.b.c.d/N)",
+			zap.Strings("invalid_entries", invalid),
+		)
+	}
+}
+
+// sameStringSlice 判断两个 string 切片在元素 + 顺序意义上完全相同。
+// reload 时仅当 CORS 配置实际变化才重跑 validateCORSOriginsStartup，
+// 避免每次 hot reload 都刷一条 Info 日志。
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeCORSOrigin(raw string) string {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if raw == "" || raw == "*" {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	parsed.Scheme = scheme
+	parsed.Path = ""
+	return parsed.String()
+}
+
+// cookieDomain 返回配置的 cookie Domain；未配置或不含 "." 的值退化为 host-only。
+// 会话 cookie 与其它需要跟随部署拓扑的 cookie 共用同一口径。
+func (a *App) cookieDomain() string {
+	domain := strings.TrimSpace(a.cfg().CookieDomain)
+	if domain != "" && (strings.Count(domain, ".") < 1 || !strings.Contains(domain, ".")) {
+		return ""
+	}
+	return domain
+}
+
+func (a *App) setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	cookie := &http.Cookie{
+		Name:     a.cfg().SessionCookie,
+		Value:    token,
+		Path:     "/",
+		Domain:   a.cookieDomain(),
+		Expires:  expires,
+		MaxAge:   int(time.Until(expires).Seconds()),
+		HttpOnly: true,
+		Secure:   a.cfg().CookieSecure,
+		SameSite: sameSite(a.cfg().CookieSameSite),
+	}
+	http.SetCookie(w, cookie)
+}
+
+func (a *App) clearSessionCookie(w http.ResponseWriter) {
+	// 清除时 Domain 必须与 setSessionCookie 完全一致，否则浏览器会按
+	// "default-domain (= 设置时的请求 host)" 寻找另一份同名 cookie，登出
+	// 留下幽灵 cookie 的概率极高——这正是双子域部署里常见的"登出后再访
+	// 问还是登录态"现象。
+	cfg := a.cfg()
+	http.SetCookie(w, &http.Cookie{Name: cfg.SessionCookie, Path: "/", Domain: cfg.CookieDomain, MaxAge: -1, Expires: time.Unix(0, 0), HttpOnly: true, Secure: cfg.CookieSecure, SameSite: sameSite(cfg.CookieSameSite)})
+	// V1 兼容性：CSRF 保护已禁用
+	// 同时清除 CSRF token cookie
+	// http.SetCookie(w, &http.Cookie{Name: "twilight_csrf", Path: "/", Domain: cfg.CookieDomain, MaxAge: -1, Expires: time.Unix(0, 0), HttpOnly: false, Secure: cfg.CookieSecure, SameSite: http.SameSiteLaxMode})
+}
+
+func (a *App) issueSessionCookies(w http.ResponseWriter, sessionToken string, expires time.Time) {
+	a.setSessionCookie(w, sessionToken, expires)
+	// V1 兼容性：CSRF 保护已禁用
+	// 同时颁发 CSRF token（Double Submit Cookie 方案）
+	// csrfToken, err := generateCSRFToken()
+	// if err != nil {
+	// 	// CSRF token 生成失败不应阻止登录，记录日志并继续
+	// 	// 用户在后续请求中会因为缺少 CSRF token 而被拒绝
+	// 	zap.L().Error("failed to generate CSRF token", zap.Error(err))
+	// 	return
+	// }
+	// a.issueCSRFCookie(w, csrfToken, expires)
+}
+
+func sameSite(value string) http.SameSite {
+	switch strings.ToLower(value) {
+	case "strict":
+		return http.SameSiteStrictMode
+	case "none":
+		return http.SameSiteNoneMode
+	default:
+		return http.SameSiteLaxMode
+	}
+}
+
+func (a *App) clientIP(r *http.Request) string {
+	// 命中 ServeHTTP 入口写入的缓存：同一请求内黑名单 / 限速 / 访问日志及各
+	// handler 多次调用只解析一次，省掉重复的 XFF 剥离 + 网段匹配。
+	if cached, ok := r.Context().Value(clientIPKey).(string); ok && cached != "" {
+		return cached
+	}
+	return a.computeClientIP(r)
+}
+
+// computeClientIP 真正解析客户端 IP。受信代理场景下才消费 CF-Connecting-IP /
+// X-Real-IP / X-Forwarded-For 这些可被任意调用方伪造的代理头；否则一律走
+// RemoteAddr。受信判定用 reload 期预解析好的 trustedProxies 匹配器，热路径不再
+// 每请求 net.ParseCIDR。
+//
+// 安全策略：trustedProxies 为空 ⇒ contains 恒 false（fail-closed）。配置不完整时
+// 直接走 RemoteAddr，由启动期日志引导运维补全 TrustedProxyCIDRs，避免任何人通过
+// 伪造 X-Forwarded-For 绕过 IP 限速 / 黑名单。
+func (a *App) computeClientIP(r *http.Request) string {
+	if rt := a.runtimeSnapshot(); rt != nil && rt.cfg.TrustProxyHeaders && rt.trustedProxies.contains(remoteAddrIP(r.RemoteAddr)) {
+		for _, header := range []string{"CF-Connecting-IP", "X-Real-IP"} {
+			if value := parseClientIPHeader(r.Header.Get(header)); value != "" {
+				return value
+			}
+		}
+		// XFF 右向左剥离：直接对端是受信代理，但代理本身可能再被另一层
+		// 受信代理转发；攻击者控制的客户端在最左端塞任何字符串。从
+		// 最右一跳开始，逐跳验证是否仍处于 trustedProxies 范围内，
+		// 第一个不在范围内的 IP 才是真实客户端 IP。
+		// 例：XFF = "spoofed, 1.1.1.1, 10.0.0.5"，RemoteAddr=10.0.0.1，
+		//   trusted = [10.0.0.0/24]，则结果应为 1.1.1.1（spoofed 不可信）。
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				ipStr := parseClientIPHeader(parts[i])
+				if ipStr == "" {
+					continue
+				}
+				// 最左侧（i==0）始终视为客户端原始 IP，直接返回。
+				if i == 0 {
+					return ipStr
+				}
+				if rt.trustedProxies.contains(net.ParseIP(ipStr)) {
+					continue
+				}
+				return ipStr
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// remoteAddrIP 从 host:port 或裸 IP 形式的 RemoteAddr 中解析出 net.IP，解析失败返回 nil。
+func remoteAddrIP(remoteAddr string) net.IP {
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	return net.ParseIP(strings.TrimSpace(host))
+}
+
+func parseClientIPHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+func urlPathEscape(value string) string {
+	return url.PathEscape(value)
+}
+
+func decodeJSON(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return nil
+	}
+	// 与 decodeMap 一致地施加 256KB 上限。MaxUploadSize（默认 5MB）面向上传场景，
+	// JSON body 不应当吃到那个量级；任何接近 256KB 的请求基本是滥用 / 探测，
+	// 提早 EOF 即可。
+	body := http.MaxBytesReader(nil, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+// maxJSONBodyBytes 是 decodeMap / decodeJSON 默认接受的 JSON 上限，避免攻击者
+// 提交超大 payload 在 map[string]any 解码阶段吃光内存。256KB 远高于业务实际
+// 用到的 payload（绑定 / 注册 / 列表查询都在数 KB 量级），但又足以挡住明显
+// 异常的批量提交。需要更大的接口（如导入 / 上传）应单独走 MaxUploadSize 路径
+// 与显式的 schema，不再过 decodeMap。
+const maxJSONBodyBytes = 256 * 1024
+
+// maxJSONNestingDepth 限制 decodeMap 接受的最大嵌套层级。Go 的 encoding/json
+// 没有原生 depth guard，恶意构造的 [[[[…]]]] 在解码阶段并不会立刻报错，但会
+// 让后续基于 reflect / type assertion 的遍历放大到栈爆炸的程度。32 层对真实
+// 业务（最多嵌套对象/数组几层）远绰绰有余。
+const maxJSONNestingDepth = 32
+
+func decodeMap(r *http.Request) map[string]any {
+	payload := map[string]any{}
+	if r.Body == nil {
+		return payload
+	}
+	body := http.MaxBytesReader(nil, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(&payload); err != nil {
+		return map[string]any{}
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return map[string]any{}
+	}
+	if jsonDepthExceeds(payload, maxJSONNestingDepth) {
+		return map[string]any{}
+	}
+	noteAuditDryRunFromPayload(r, payload)
+	return payload
+}
+
+// jsonDepthExceeds 在解码后做后置检查，发现深度超过 limit 立即返回 true。
+// 按 map / slice 递归即可；其它叶子值（string / float64 / bool / nil）算 0 层。
+func jsonDepthExceeds(value any, limit int) bool {
+	return jsonDepth(value, 0, limit)
+}
+
+func jsonDepth(value any, current, limit int) bool {
+	if current > limit {
+		return true
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		for _, child := range v {
+			if jsonDepth(child, current+1, limit) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if jsonDepth(child, current+1, limit) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stringValue(payload map[string]any, key string) string {
+	if v, ok := payload[key]; ok {
+		switch typed := v.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case int:
+			return strconv.Itoa(typed)
+		case int64:
+			return strconv.FormatInt(typed, 10)
+		case float64:
+			return strconv.FormatInt(int64(typed), 10)
+		case bool:
+			return strconv.FormatBool(typed)
+		}
+	}
+	return ""
+}
+
+func intValue(payload map[string]any, key string, fallback int) int {
+	if v, ok := payload[key]; ok {
+		switch typed := v.(type) {
+		case float64:
+			return int(typed)
+		case int:
+			return typed
+		case int64:
+			return int(typed)
+		case string:
+			if i, err := strconv.Atoi(typed); err == nil {
+				return i
+			}
+		}
+	}
+	return fallback
+}
+
+func boolValue(payload map[string]any, key string, fallback bool) bool {
+	if v, ok := payload[key]; ok {
+		switch typed := v.(type) {
+		case bool:
+			return typed
+		case string:
+			return typed == "1" || strings.EqualFold(typed, "true") || strings.EqualFold(typed, "yes")
+		}
+	}
+	return fallback
+}
+
+func strictBoolValue(payload map[string]any, key string) (bool, bool) {
+	v, ok := payload[key]
+	if !ok {
+		return false, false
+	}
+	typed, ok := v.(bool)
+	return typed, ok
+}
+
+func requireStrictBoolValue(w http.ResponseWriter, payload map[string]any, key string) (value bool, present bool, ok bool) {
+	if _, exists := payload[key]; !exists {
+		return false, false, true
+	}
+	value, valid := strictBoolValue(payload, key)
+	if !valid {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, key+" 必须是布尔值")
+		return false, true, false
+	}
+	return value, true, true
+}
+
+func int64Param(params Params, key string) (int64, error) {
+	return strconv.ParseInt(params[key], 10, 64)
+}
+
+// userNotFoundMessage 是所有 ErrUserNotFound 响应的统一文案。
+//
+// 历史上 handlers.go / upload_handlers.go 用英文 "user not found"，
+// admin_extra.go / library_handlers.go 用 "用户不存在"，invite_handlers.go
+// 用 "目标用户不存在"——同一个语义在 9 个 call site 里漂移成 3 种 copy，
+// 前端按 message 分支时永远落不了一致的 fallback 文案。统一成中文 "用户不存在"
+// 以与系统其他错误响应一致；前端 validators.ts 已经映射 USER_NOT_FOUND → "用户不存在"，
+// 这只是把后端 message 也对齐过来。
+const userNotFoundMessage = "用户不存在"
+
+// userFromPath 抽掉"按 :uid path-param 加载用户，不存在则 404"的
+// 重复模板。原先 handlers.go / upload_handlers.go / admin_extra.go /
+// library_handlers.go 各处共有 9 个完全一样的 4 行片段：
+//
+//	uid, _ := int64Param(params, "uid")
+//	u, ok := a.store().User(uid)
+//	if !ok { failWithCode(w, 404, ErrUserNotFound, "user not found"); return }
+//
+// 抽到这里之后调用方变成 `u, ok := a.userFromPath(w, params, "uid"); if !ok { return }`，
+// 同时把所有响应统一到 ErrUserNotFound + userNotFoundMessage，消除 R64-7 提到
+// 的"同一个 ErrUserNotFound 同义词散落在三种 copy"的问题。返回值用 ok 模式
+// 而不是 error，是因为 handler 在 not-found 时已经写好响应直接 return，
+// 调用方没有继续处理 error 的场景；强制返回 error 反倒诱使调用方再写一遍判空。
+func (a *App) userFromPath(w http.ResponseWriter, params Params, key string) (store.User, bool) {
+	uid, _ := int64Param(params, key)
+	u, okUser := a.store().User(uid)
+	if !okUser {
+		failWithCode(w, http.StatusNotFound, ErrUserNotFound, userNotFoundMessage)
+		return store.User{}, false
+	}
+	return u, true
+}
+
+func adminUserActionState(u store.User, now int64) map[string]any {
+	hasEmby := strings.TrimSpace(u.EmbyID) != ""
+	protectedRole := u.Role == store.RoleAdmin || u.Role == store.RoleWhitelist
+	expiredByTime := u.Role == store.RoleNormal && u.ExpiredAt > 0 && u.ExpiredAt < now
+	canGrantRegistrationEntitlement := !hasEmby && u.Active && !u.PendingEmby
+	canEnableEmby := hasEmby && u.Active && !expiredByTime
+	reasons := map[string]string{}
+	if hasEmby {
+		reasons["grant_registration_entitlement"] = "已绑定 Emby，无需授予资格"
+	} else if !u.Active {
+		reasons["grant_registration_entitlement"] = "账号已禁用，先启用"
+	} else if u.PendingEmby {
+		reasons["grant_registration_entitlement"] = "用户已在待开通队列中"
+	}
+	if !hasEmby {
+		reasons["enable_emby"] = "用户未绑定 Emby"
+	} else if !u.Active {
+		reasons["enable_emby"] = "Web 已禁用，不能启用 Emby"
+	} else if expiredByTime {
+		reasons["enable_emby"] = "账号已到期，先调整到期时间"
+	}
+	if u.Role == store.RoleAdmin {
+		reasons["delete"] = "管理员账号受保护"
+	} else if u.Role == store.RoleWhitelist {
+		reasons["delete"] = "白名单账号受保护"
+	}
+	return map[string]any{
+		"has_emby":                           hasEmby,
+		"protected_role":                     protectedRole,
+		"can_enable_emby":                    canEnableEmby,
+		"can_disable_emby":                   hasEmby,
+		"can_grant_registration_entitlement": canGrantRegistrationEntitlement,
+		"can_clear_registration_queue":       !hasEmby && (u.PendingEmby || u.PendingEmbyDays != nil || strings.TrimSpace(u.RegistrationCode) != ""),
+		"can_delete":                         !protectedRole,
+		"reasons":                            reasons,
+	}
+}
+
+func publicUser(u store.User) map[string]any {
+	return publicUserAt(u, time.Now().Unix())
+}
+
+// publicUserAt 是 publicUser 的 now 注入版。publicUser 本身每条记录都会读一次
+// time.Now，公共字段本身不依赖时间，真正的耗时在 adminUserActionState 与
+// expireStatus 的 now 比较；列表页一页渲染 N 行时复用同一 now，避免每行系统调用。
+func publicUserAt(u store.User, now int64) map[string]any {
+	return map[string]any{
+		"uid":               u.UID,
+		"username":          u.Username,
+		"email":             u.Email,
+		"email_verified":    u.EmailVerified,
+		"telegram_id":       nullableInt(u.TelegramID),
+		"telegram_username": u.TelegramUsername,
+		"role":              u.Role,
+		"role_name":         roleName(u.Role),
+		"active":            u.Active,
+		"expire_status":     expireStatusAt(u.ExpiredAt, now),
+		"expired_at":        publicExpiryUnix(u.ExpiredAt),
+		"emby_id":           u.EmbyID,
+		"emby_username":     u.EmbyUsername,
+		"emby_bound":        u.EmbyID != "",
+		// emby_disabled：远端 Emby 启停的尽力镜像，让列表能展示「Web 正常但 Emby 被
+		// 单独禁用」。与计算字段 emby_disabled_by_expiry 互补（后者只覆盖到期场景）。
+		"emby_disabled":            u.EmbyDisabled,
+		"avatar":                   u.Avatar,
+		"background":               u.Background,
+		"bgm_mode":                 u.BGMMode,
+		"bgm_manage_mode":          u.BGMManageMode,
+		"bgm_token_set":            u.BGMToken != "",
+		"bgm_sync_ready":           u.BGMMode && u.BGMToken != "",
+		"created_at":               u.CreatedAt,
+		"register_time":            u.RegisterTime,
+		"emby_grant_locked":        u.EmbyGrantLocked,
+		"is_pending":               u.Role == store.RoleUnrecognized,
+		"pending_emby":             u.PendingEmby,
+		"pending_emby_days":        u.PendingEmbyDays,
+		"registration_source":      u.RegistrationSource,
+		"registration_source_name": registrationSourceLabel(u.RegistrationSource),
+		"registration_code":        u.RegistrationCode,
+		// 与 handleEmbyURLs 同口径：普通用户到期后只禁用 Emby（系统账号仍可登录），
+		// 据此让管理列表把「Web 账号状态」与「Emby 账号状态」分开展示。
+		"emby_disabled_by_expiry":             u.Role == store.RoleNormal && u.ExpiredAt > 0 && u.ExpiredAt < now,
+		"admin_action_state":                  adminUserActionState(u, now),
+		"rebinding_in_progress":               u.RebindingInProgress,
+		"notify_on_ticket_email":              u.NotifyOnTicketEmail,
+		"notify_on_expiry_email":              u.NotifyOnExpiryEmail,
+		"notify_on_expiry_telegram":           u.ExpiryTelegramNotificationsEnabled(),
+		"notify_on_login_telegram":            u.NotifyOnLoginTelegram,
+		"notify_on_login_email":               u.NotifyOnLoginEmail,
+		"notify_on_ticket_telegram":           u.NotifyOnTicketTelegram,
+		"signin_auto_renewal":                 u.SigninAutoRenewal,
+		"password_change_email_required":      u.RequireEmailForPasswordChange,
+		"emby_password_email_required":        u.RequireEmailForEmbyPasswordChange,
+		"emby_password_old_password_required": u.RequireOldPasswordForEmbyPasswordChange,
+	}
+}
+
+func nullableInt(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+func roleName(role int) string {
+	switch role {
+	case store.RoleAdmin:
+		return "管理员"
+	case store.RoleWhitelist:
+		return "白名单"
+	case store.RoleUnrecognized:
+		return "未注册"
+	default:
+		return "普通用户"
+	}
+}
+
+func expireStatus(expiredAt int64) string {
+	return expireStatusAt(expiredAt, time.Now().Unix())
+}
+
+// expireStatusAt 是 expireStatus 的 now 注入版：管理列表等一页渲染 N 个用户时
+// 复用同一个 now，避免每行各做一次 time.Now 系统调用。
+func expireStatusAt(expiredAt, now int64) string {
+	if expiryIsPermanent(expiredAt) {
+		return "永不过期"
+	}
+	if expiredAt == 0 {
+		return "未设置"
+	}
+	if expiredAt < now {
+		return "已过期"
+	}
+	days := int((expiredAt - now) / 86400)
+	return fmt.Sprintf("剩余 %d 天", days)
+}
+
+func hashAPIKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+func maskAPIKey(key string) (prefix, suffix, masked string) {
+	if len(key) <= 16 {
+		return key, "", key
+	}
+	prefix = key[:12]
+	suffix = key[len(key)-6:]
+	return prefix, suffix, prefix + "..." + suffix
+}
+
+// requireAdmin 是 admin-only handler 的入口断言。AuthAdmin 路由已在
+// dispatcher（app.go:611）处把非 admin 阻挡在外，但 handler 自身再确认一次
+// caller 角色，避免：
+//
+//  1. 路由表手抖把 admin handler 挂到 AuthUser；
+//  2. 同一 handler 同时挂在 AuthUser / AuthAdmin 两条路由（典型如
+//     handleLoginHistory / handleDevices），handler 内部
+//     靠 path string 推断鉴权时漏判；
+//  3. 未来引入 ApiKey / TG webhook 等新鉴权来源时绕过 AuthAdmin。
+//
+// 写为 true 时表示已写 403，调用方直接 return 即可。
+func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if current(r).User.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusForbidden, ErrUserProtected, "权限不足")
+		return true
+	}
+	return false
+}
+
+// requireAdminForUIDParam 用于"AuthUser / AuthAdmin 共用 handler，路径上有
+// :uid 时必须是 admin"的场景：在 :uid 存在但 caller 不是 admin 的情况下回
+// 403。返回 (target uid, written 403)；调用方在 written 为 true 时直接
+// return。target uid 解析失败则回退到 caller 自身（保留现状），但若 :uid 是
+// 字符串且 parse 失败应改为 400（R44-7 单独跟进）。
+func requireAdminForUIDParam(w http.ResponseWriter, r *http.Request, params Params) (int64, bool) {
+	caller := current(r).User
+	if params["uid"] == "" {
+		return caller.UID, false
+	}
+	if caller.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusForbidden, ErrUserProtected, "权限不足")
+		return 0, true
+	}
+	paramUID, err := int64Param(params, "uid")
+	if err != nil || paramUID <= 0 {
+		// 路径参数解析失败不能回退到管理员自己的 UID：这会把一个拼写错误
+		// 变成对当前账号的误操作，也会让共用 handler 的错误响应失去一致性。
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "uid 必须是正整数")
+		return 0, true
+	}
+	return paramUID, false
+}
+
+func statusFromError(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		failWithCode(w, http.StatusNotFound, ErrNotFound, "资源不存在")
+		return true
+	}
+	if errors.Is(err, store.ErrConflict) {
+		failWithCode(w, http.StatusConflict, ErrConflict, "资源已存在")
+		return true
+	}
+	if errors.Is(err, store.ErrExpired) {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "资源已过期")
+		return true
+	}
+	if errors.Is(err, store.ErrRegCodeAlreadyUsedByUser) {
+		failWithCode(w, http.StatusConflict, ErrCodeAlreadyUsedByUser, "你已经使用过这张卡码，不能重复使用")
+		return true
+	}
+	if errors.Is(err, store.ErrInvalid) {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "请求参数无效")
+		return true
+	}
+	if errors.Is(err, store.ErrTicketClosed) {
+		failWithCode(w, http.StatusBadRequest, ErrTicketAlreadyClosed, "工单已关闭")
+		return true
+	}
+	if errors.Is(err, store.ErrDeviceBlocked) {
+		failWithCode(w, http.StatusForbidden, ErrDeviceBlocked, "该设备已被管理员封禁")
+		return true
+	}
+	// ErrLastAdmin 之前由各 handler 单独 errors.Is 分支判，漏一处就直接降级
+	// 到下面的 ErrInternal/500，前端拿到泛化错误码无法 routing 到"最后一个
+	// 管理员"提示。集中映射后所有调用 statusFromError 的路径自动获得正确的
+	// 409 + ErrAdminLastAdminProtected。
+	if errors.Is(err, store.ErrLastAdmin) {
+		failWithCode(w, http.StatusConflict, ErrAdminLastAdminProtected, "无法移除最后一个管理员的权限，系统至少需要一个管理员")
+		return true
+	}
+	failWithCode(w, http.StatusInternalServerError, ErrInternal, "操作失败")
+	return true
+}
+
+// requestPathCanonical 报告路径是否已是规范形式：不含 “.”、“..” 段，也没有连续斜杠。
+// 末尾单个斜杠允许（部分客户端会带），其余一律视为不规范。
+func requestPathCanonical(p string) bool {
+	if p == "" || p[0] != '/' {
+		return false
+	}
+	trimmed := strings.TrimSuffix(p[1:], "/")
+	if trimmed == "" {
+		return true
+	}
+	for _, segment := range strings.Split(trimmed, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// migrationImportPaths 是允许上传迁移封包、因而放宽请求体上限的路由（精确匹配）。
+var migrationImportPaths = map[string]bool{
+	"/api/v1/system/admin/migration/import": true,
+	"/api/v2/admin/migration/import":        true,
+}
+
+// requestBodyLimit 返回某路径的请求体上限。
+//
+// 迁移封包受封包解析器自身的上限约束，不走普通图片上传上限；路由仍先按管理员鉴权
+// 再由 handler 读 body。旧实现按原始路径前缀 /api/v1/system/admin/migration/ 放宽，
+// 而路由匹配用的是清理后的路径——带 “..” 的请求能让任意路由拿到约 536MB 的上限。
+// 入口已拒绝非规范路径（requestPathCanonical），这里再改成只对导入路由精确放宽，
+// 同前缀下的 status / export 等不再沾光；V2 导入路由一并放宽，与 V1 口径一致。
+func requestBodyLimit(path string, defaultLimit int64) int64 {
+	if migrationImportPaths[strings.TrimSuffix(path, "/")] {
+		return migration.MaxArchiveBytes + 8<<20
+	}
+	return defaultLimit
+}

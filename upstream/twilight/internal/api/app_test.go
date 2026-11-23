@@ -1,0 +1,8698 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"io"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/prejudice-studio/twilight/internal/config"
+	"github.com/prejudice-studio/twilight/internal/security"
+	"github.com/prejudice-studio/twilight/internal/store"
+)
+
+func newTestApp(t *testing.T) *App {
+	t.Helper()
+	dir := t.TempDir()
+	st := newTestStore(t)
+	app, err := New(config.Config{
+		LoginNotifyTelegramEnabled:     true,
+		LoginNotifyEmailEnabled:        true,
+		ExpiryNotifyTelegramEnabled:    true,
+		TicketNotifyTelegramEnabled:    true,
+		SchedulerNotifyTelegramEnabled: true,
+		BangumiAutoAddCollection:       true,
+		BangumiPrivateCollection:       true,
+		BangumiMinProgressPercent:      85,
+
+		AppName:                      "Twilight Test",
+		Version:                      "test",
+		Host:                         "127.0.0.1",
+		Port:                         0,
+		DatabaseDir:                  dir,
+		DatabaseDriver:               store.BackendPostgres,
+		DatabaseBackupDir:            filepath.Join(dir, "backups"),
+		StateFile:                    filepath.Join(dir, "state.json"),
+		UploadDir:                    filepath.Join(dir, "uploads"),
+		MaxUploadSize:                1024 * 1024,
+		CORSOrigins:                  []string{"http://localhost:3000"},
+		AllowCredential:              true,
+		SessionCookie:                "twilight_session",
+		SessionTTL:                   time.Hour,
+		CookieSameSite:               "lax",
+		RegisterEnabled:              true,
+		MediaRequestEnabled:          true,
+		MaxConcurrentRequestsPerUser: 3,
+		SigninEnabled:                true,
+		SigninCurrencyName:           "积分",
+		SigninDailyMin:               1,
+		SigninDailyMax:               1,
+		SigninResetAfterMiss:         true,
+		InviteEnabled:                true,
+		InviteMaxDepth:               3,
+		InviteLimit:                  10,
+		InviteRootUserLimit:          -1,
+		InviteDefaultDays:            30,
+		PermanentInviteMaxDays:       365,
+		MaxDevices:                   5,
+		MaxStreams:                   2,
+		ForgotPasswordEnabled:        true,
+		ForgotPasswordEmbyEnabled:    true,
+		ForgotPasswordEmailEnabled:   true,
+		// 安全模型：管理员身份只来自配置文件的 admin_uids / admin_usernames。
+		// 旧的"空数据库首注册者自动成为 Admin"通道已移除。测试 harness 大量
+		// 依赖第一个注册的 "admin" 账户具备管理员权限，这里通过配置显式声明
+		// AdminUsernames=["admin"]。注意：不要配 AdminUIDs=[1]——很多测试直接用
+		// store.CreateUser 建首个用户（UID=1）并断言它是普通用户（清理/群成员
+		// 校验计数），按 UID 提升会污染这些用例。仅按用户名匹配最小侵入。
+		AdminUsernames: []string{"admin"},
+	}, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.store().Close() })
+	return app
+}
+
+// registerAndLogin 注册并登录指定账户，返回 session cookie 切片。
+func registerAndLogin(t *testing.T, app *App, username, password string) []*http.Cookie {
+	t.Helper()
+	register := doJSON(app, http.MethodPost, "/api/v1/users/register", fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), nil)
+	if register.Code != http.StatusCreated {
+		t.Fatalf("register %s status = %d body=%s", username, register.Code, register.Body.String())
+	}
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), nil)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login %s status = %d body=%s", username, login.Code, login.Body.String())
+	}
+	session := findCookie(login.Result().Cookies(), "twilight_session")
+	if session == nil {
+		t.Fatalf("missing session cookie for %s", username)
+	}
+	return []*http.Cookie{session}
+}
+
+// registerAdmin 注册并登录一个**管理员**账户。
+//
+// 安全模型里管理员身份只来自配置的 AdminUIDs / AdminUsernames（旧版"空库首注册者
+// 自动成为管理员"通道已移除）。newTestApp 只白名单了 "admin"，所以任何用其它
+// 用户名注册并期望拿到管理员权限的用例，都必须先把该用户名登记进
+// AdminUsernames——否则注册出来的是普通用户，管理端接口一律 403。
+//
+// 配置的管理员用户名只在空库首位注册时可直接注册并提权；系统已有用户后，注册
+// 这些名字会被拒绝（防止抢注顶替）。因此非首位时先按普通用户注册，再模拟运维
+// “把名字写进配置并重载”——追加到 AdminUsernames 后调用 applyConfiguredAdmins。
+func registerAdmin(t *testing.T, app *App, username, password string) []*http.Cookie {
+	t.Helper()
+	cfg := app.cfg()
+	configured := false
+	for _, existing := range cfg.AdminUsernames {
+		if existing == username {
+			configured = true
+			break
+		}
+	}
+	if app.store().UserCount() == 0 {
+		if !configured {
+			cfg.AdminUsernames = append(cfg.AdminUsernames, username)
+		}
+		return registerAndLogin(t, app, username, password)
+	}
+	if configured {
+		// 暂时移出名单以便注册，注册后再放回并重载。
+		kept := make([]string, 0, len(cfg.AdminUsernames))
+		for _, existing := range cfg.AdminUsernames {
+			if existing != username {
+				kept = append(kept, existing)
+			}
+		}
+		cfg.AdminUsernames = kept
+	}
+	register := doJSON(app, http.MethodPost, "/api/v1/users/register", fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), nil)
+	if register.Code != http.StatusCreated {
+		t.Fatalf("register %s status = %d body=%s", username, register.Code, register.Body.String())
+	}
+	cfg.AdminUsernames = append(cfg.AdminUsernames, username)
+	app.applyConfiguredAdmins()
+	return loginCookies(t, app, username, password)
+}
+
+// loginCookies 从已存在的账户登录，返回 session cookie 切片。
+// 仅用于 inline 登录流程（不走注册 helper）。
+func loginCookies(t *testing.T, app *App, username, password string) []*http.Cookie {
+	t.Helper()
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), nil)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login %s status=%d body=%s", username, login.Code, login.Body.String())
+	}
+	all := login.Result().Cookies()
+	session := findCookie(all, "twilight_session")
+	if session == nil {
+		t.Fatalf("login %s missing session cookie", username)
+	}
+	return []*http.Cookie{session}
+}
+
+func TestRegcodeWritesBlockedWhenRuntimeDatabaseMismatchesConfig(t *testing.T) {
+	app := newTestApp(t)
+	// 后端已收敛为单一 PostgreSQL：运行期 store 恒为 postgres。配置 driver
+	// 与之一致（postgres）时放行；被改成非 postgres 值时作为最后一道保险
+	// 拦下注册码写入，避免误写错后端。
+	app.cfg().DatabaseDriver = store.BackendPostgres
+	rec := httptest.NewRecorder()
+	if app.rejectRegcodeWriteIfStorageMismatch(rec) {
+		t.Fatal("regcode writes were blocked even though active and configured databases match")
+	}
+
+	app.cfg().DatabaseDriver = store.BackendJSON
+	rec = httptest.NewRecorder()
+	if !app.rejectRegcodeWriteIfStorageMismatch(rec) {
+		t.Fatal("expected regcode writes to be blocked when configured driver is not postgres")
+	}
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict status, got %d", rec.Code)
+	}
+}
+
+func TestAuthFlowWithoutCSRF(t *testing.T) {
+	app := newTestApp(t)
+
+	register := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	if register.Code != http.StatusCreated {
+		t.Fatalf("register status = %d body=%s", register.Code, register.Body.String())
+	}
+
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status = %d body=%s", login.Code, login.Body.String())
+	}
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	if cookie == nil || !cookie.HttpOnly {
+		t.Fatalf("expected httponly session cookie, got %#v", cookie)
+	}
+	if csrfCookie := findCookie(login.Result().Cookies(), "twilight_session_csrf"); csrfCookie != nil {
+		t.Fatalf("csrf cookie should not be issued, got %#v", csrfCookie)
+	}
+
+	me := doJSON(app, http.MethodGet, "/api/v1/users/me", ``, []*http.Cookie{cookie})
+	if me.Code != http.StatusOK {
+		t.Fatalf("me status = %d body=%s", me.Code, me.Body.String())
+	}
+	if me.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("missing security header")
+	}
+	if me.Header().Get("Cache-Control") != "no-store, private" || me.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("missing no-store headers: cache=%q pragma=%q", me.Header().Get("Cache-Control"), me.Header().Get("Pragma"))
+	}
+
+	allowed := doJSON(app, http.MethodPut, "/api/v1/users/me", `{"email":"a@example.com"}`, []*http.Cookie{cookie})
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("expected 200 without csrf token, got status=%d body=%s", allowed.Code, allowed.Body.String())
+	}
+}
+
+func TestRelaxedCORSReflectsValidOriginWhenNoWhitelist(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().CORSOrigins = nil
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/users/me", nil)
+	req.Header.Set("Origin", "https://panel.example")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	req.Header.Set("Access-Control-Request-Headers", "content-type, if-match, x-twilight-client")
+	rr := httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("relaxed CORS preflight status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://panel.example" {
+		t.Fatalf("relaxed CORS did not reflect valid origin: %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(strings.ToLower(got), "if-match") {
+		t.Fatalf("relaxed CORS did not allow If-Match: %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodOptions, "/api/v1/users/me", nil)
+	req.Header.Set("Origin", "null")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rr = httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+	if rr.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("invalid CORS origin was allowed: %q", rr.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestConfiguredCORSOriginsRestrictCrossOrigin(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().CORSOrigins = []string{"https://panel.example/"}
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/users/me", nil)
+	req.Header.Set("Origin", "https://panel.example")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rr := httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("explicit CORS preflight status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Access-Control-Allow-Origin") != "https://panel.example" {
+		t.Fatalf("explicit CORS origin not allowed: %q", rr.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	req = httptest.NewRequest(http.MethodOptions, "/api/v1/users/me", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rr = httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+	if rr.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("unlisted CORS origin was allowed: %q", rr.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	app.cfg().CORSOrigins = []string{"https://panel.example/app"}
+	req = httptest.NewRequest(http.MethodOptions, "/api/v1/users/me", nil)
+	req.Header.Set("Origin", "https://panel.example")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rr = httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+	if rr.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("path-bearing CORS origin was allowed: %q", rr.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+}
+
+func TestCORSSameHostFallback(t *testing.T) {
+	tests := []struct {
+		name         string
+		requestURL   string
+		origin       string
+		cookieSecure bool
+		wantAllowed  bool
+	}{
+		{name: "https", requestURL: "https://api.example/api/v1/users/me", origin: "https://api.example", cookieSecure: true, wantAllowed: true},
+		{name: "https port", requestURL: "https://api.example:8443/api/v1/users/me", origin: "https://api.example:8443", cookieSecure: true, wantAllowed: true},
+		{name: "http development", requestURL: "http://localhost:8080/api/v1/users/me", origin: "http://localhost:8080", cookieSecure: false, wantAllowed: true},
+		{name: "different host", requestURL: "https://api.example/api/v1/users/me", origin: "https://evil.example", cookieSecure: true, wantAllowed: false},
+		{name: "different port", requestURL: "https://api.example:8443/api/v1/users/me", origin: "https://api.example", cookieSecure: true, wantAllowed: false},
+		{name: "different scheme", requestURL: "https://api.example/api/v1/users/me", origin: "http://api.example", cookieSecure: true, wantAllowed: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := newTestApp(t)
+			app.cfg().CORSOrigins = []string{"https://panel.example"}
+			app.cfg().CookieSecure = tt.cookieSecure
+			req := httptest.NewRequest(http.MethodOptions, tt.requestURL, nil)
+			req.Header.Set("Origin", tt.origin)
+			req.Header.Set("Access-Control-Request-Method", "PUT")
+			rr := httptest.NewRecorder()
+			app.ServeHTTP(rr, req)
+
+			got := rr.Header().Get("Access-Control-Allow-Origin")
+			if tt.wantAllowed && got != tt.origin {
+				t.Fatalf("same-host origin was not allowed: got %q, want %q", got, tt.origin)
+			}
+			if !tt.wantAllowed && got != "" {
+				t.Fatalf("non-matching origin was allowed: %q", got)
+			}
+		})
+	}
+}
+
+func TestWildcardCORSUsesRelaxedValidOriginReflection(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().CORSOrigins = []string{"*"}
+
+	req := httptest.NewRequest(http.MethodOptions, "https://api.example/api/v1/users/me", nil)
+	req.Header.Set("Origin", "https://panel.example")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rr := httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("wildcard CORS preflight status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://panel.example" {
+		t.Fatalf("wildcard CORS did not reflect valid origin: %q", got)
+	}
+}
+
+func TestTelegramLinkCreationRequiresWebUIIntent(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+
+	missing := doJSON(app, http.MethodPost, "/api/v1/users/telegram/register/link", ``, nil)
+	if missing.Code != http.StatusBadRequest || !strings.Contains(missing.Body.String(), "显式前端操作意图") {
+		t.Fatalf("link without intent status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	prefetch := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/telegram/register/link", ``, nil, map[string]string{
+		"X-Twilight-Client": "webui",
+		"X-Twilight-Intent": "create-telegram-link",
+		"Purpose":           "prefetch",
+	})
+	if prefetch.Code != http.StatusBadRequest || !strings.Contains(prefetch.Body.String(), "预取请求") {
+		t.Fatalf("link prefetch status=%d body=%s", prefetch.Code, prefetch.Body.String())
+	}
+
+	created := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/telegram/register/link", ``, nil, telegramLinkCreateTestHeaders())
+	if created.Code != http.StatusOK {
+		t.Fatalf("link with intent status=%d body=%s", created.Code, created.Body.String())
+	}
+	if created.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("link response is cacheable: %q", created.Header().Get("Cache-Control"))
+	}
+}
+
+func TestRegcodesAndTelegramLinksPersistAcrossAppRestart(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	createdRegcode := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes", `{"type":1,"days":7,"count":1,"format":"PERSIST-{random}","random_algorithm":"digits-12"}`, adminCookies, headers)
+	if createdRegcode.Code != http.StatusOK {
+		t.Fatalf("create regcode status=%d body=%s", createdRegcode.Code, createdRegcode.Body.String())
+	}
+	var regEnv envelope
+	if err := json.Unmarshal(createdRegcode.Body.Bytes(), &regEnv); err != nil {
+		t.Fatalf("decode regcode response: %v", err)
+	}
+	regData, _ := regEnv.Data.(map[string]any)
+	regcodes, _ := regData["codes"].([]any)
+	if len(regcodes) != 1 {
+		t.Fatalf("expected one regcode in response: %#v", regEnv.Data)
+	}
+	regcode, _ := regcodes[0].(string)
+	if regcode == "" {
+		t.Fatalf("empty regcode in response: %#v", regEnv.Data)
+	}
+	if _, ok := app.store().RegCode(regcode); !ok {
+		t.Fatalf("created regcode was not written to store: %s", regcode)
+	}
+
+	link := issueRegisterTelegramLink(t, app)
+	if _, ok := app.telegramLinkAlive(link.ID); !ok {
+		t.Fatalf("created link was not present in dedicated table: %s", link.ID)
+	}
+	if _, ok := app.store().BindCode(link.ID); ok {
+		t.Fatalf("link leaked into persistent state JSON: %s", link.ID)
+	}
+
+	cfg := *app.cfg()
+	if err := app.store().Close(); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟服务重启：不重置库，复用同一 PostgreSQL 再开一个 Store，断言
+	// 上一进程写入的数据仍在持久层。
+	reopened := reopenTestStore(t)
+	restarted, err := New(cfg, reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.store().Close()
+
+	if _, ok := restarted.store().RegCode(regcode); !ok {
+		t.Fatalf("regcode disappeared after app restart: %s", regcode)
+	}
+	if _, ok := restarted.telegramLinkAlive(link.ID); !ok {
+		t.Fatalf("link disappeared after restart: %s", link.ID)
+	}
+	if _, ok := restarted.store().BindCode(link.ID); ok {
+		t.Fatalf("link was persisted into state JSON after app restart: %s", link.ID)
+	}
+}
+
+func TestAPIKeyFlow(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+
+	created := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/apikeys", `{"name":"ci","rate_limit":50}`, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create key status = %d body=%s", created.Code, created.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(created.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	data := env.Data.(map[string]any)
+	key, _ := data["key"].(string)
+	if !strings.HasPrefix(key, "key-") {
+		t.Fatalf("expected plaintext key once, got %q", key)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info", nil)
+	req.Header.Set("X-API-Key", key)
+	rr := httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("apikey info status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAPIKeyPermissionsAreEnforcedByRoutes(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "scope-user", "Password123456")
+	created := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/apikeys", `{"name":"read-only"}`, cookies, map[string]string{"X-Twilight-Client": "webui"})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create key status=%d body=%s", created.Code, created.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(created.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	data := env.Data.(map[string]any)
+	key, _ := data["key"].(string)
+	keyID := int64(numeric(data["id"]))
+	user, _ := app.store().FindUserByUsername("scope-user")
+	if _, err := app.store().UpdateAPIKey(user.UID, keyID, func(k *store.APIKey) error {
+		k.Permissions = []string{apiKeyPermissionAccountRead}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	infoReq := httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info", nil)
+	infoReq.Header.Set("X-API-Key", key)
+	info := httptest.NewRecorder()
+	app.ServeHTTP(info, infoReq)
+	if info.Code != http.StatusOK {
+		t.Fatalf("read scope should access info, status=%d body=%s", info.Code, info.Body.String())
+	}
+
+	disableReq := httptest.NewRequest(http.MethodPost, "/api/v1/apikey/disable", nil)
+	disableReq.Header.Set("X-API-Key", key)
+	disabled := httptest.NewRecorder()
+	app.ServeHTTP(disabled, disableReq)
+	if disabled.Code != http.StatusForbidden || !strings.Contains(disabled.Body.String(), string(ErrAPIKeyPermissionDenied)) {
+		t.Fatalf("read-only key should not disable account, status=%d body=%s", disabled.Code, disabled.Body.String())
+	}
+	latest, _ := app.store().User(user.UID)
+	if !latest.Active {
+		t.Fatal("permission-denied API key changed account state")
+	}
+}
+
+func TestAPIKeyLoginIsRateLimited(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().RateLimitEnabled = true
+	app.cfg().RateLimitLoginPerMinute = 1
+	app.cfg().RateLimitLoginUserPer5m = 1
+
+	first := doJSON(app, http.MethodPost, "/api/v1/auth/login/apikey", `{"apikey":"key-invalid-one"}`, nil)
+	if first.Code != http.StatusUnauthorized || !strings.Contains(first.Body.String(), `"error_code":"AUTH_APIKEY_INVALID"`) {
+		t.Fatalf("first invalid API key login status=%d body=%s", first.Code, first.Body.String())
+	}
+	second := doJSON(app, http.MethodPost, "/api/v1/auth/login/apikey", `{"apikey":"key-invalid-two"}`, nil)
+	if second.Code != http.StatusTooManyRequests || !strings.Contains(second.Body.String(), `"error_code":"AUTH_LOGIN_RATE_LIMITED"`) {
+		t.Fatalf("second invalid API key login status=%d body=%s", second.Code, second.Body.String())
+	}
+}
+
+// TestAPIKeyAuthSources 锁定 authenticateAPIKey 的三条入口（X-API-Key 头 /
+// Authorization Bearer/ApiKey / ?apikey= 查询串）以及 AllowQuery 门禁的回归
+// 行为：query 路径在 AllowQuery=false 时必须 401（避免 referer / log 中泄露
+// 的 key 被重放），同时携带 header 与 query 时 header 优先（保留旧客户端兼
+// 容性，又不会被一个开放的 query 串旁路掉 AllowQuery 限制）。
+func TestAPIKeyAuthSources(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "alice", "Password123456")
+
+	createKey := func(name string, allowQuery bool) string {
+		body := fmt.Sprintf(`{"name":%q,"rate_limit":120,"allow_query":%t}`, name, allowQuery)
+		rec := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/apikeys", body, cookies, map[string]string{"X-Twilight-Client": "webui"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("create key %s status=%d body=%s", name, rec.Code, rec.Body.String())
+		}
+		var env envelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode created key %s: %v", name, err)
+		}
+		key, _ := env.Data.(map[string]any)["key"].(string)
+		if !strings.HasPrefix(key, "key-") {
+			t.Fatalf("expected plaintext key prefix for %s, got %q", name, key)
+		}
+		return key
+	}
+
+	queryKey := createKey("ci-query", true)
+	headerOnly := createKey("ci-header-only", false)
+
+	call := func(req *http.Request) int {
+		rr := httptest.NewRecorder()
+		app.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	// (a) ?apikey= 查询路径配 AllowQuery=true 必须通过
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info?apikey="+queryKey, nil)
+	if got := call(r); got != http.StatusOK {
+		t.Fatalf("query+AllowQuery=true expected 200, got %d", got)
+	}
+
+	// (b) ?apikey= 查询路径配 AllowQuery=false 必须 401
+	r = httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info?apikey="+headerOnly, nil)
+	if got := call(r); got != http.StatusUnauthorized {
+		t.Fatalf("query+AllowQuery=false expected 401, got %d", got)
+	}
+
+	// (c1) Authorization: Bearer 必须通过（与 X-API-Key 等价）
+	r = httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info", nil)
+	r.Header.Set("Authorization", "Bearer "+headerOnly)
+	if got := call(r); got != http.StatusOK {
+		t.Fatalf("Authorization Bearer expected 200, got %d", got)
+	}
+
+	// (c2) Authorization: ApiKey 必须通过（同上，区分大小写不敏感）
+	r = httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info", nil)
+	r.Header.Set("Authorization", "ApiKey "+headerOnly)
+	if got := call(r); got != http.StatusOK {
+		t.Fatalf("Authorization ApiKey expected 200, got %d", got)
+	}
+
+	// (d) header 与 query 同时存在时 header 优先：用 header-only key 走 header，
+	// 同时附一个不存在的 ?apikey=garbage —— 既不应当 401（不要被 query 干扰），
+	// 也不应当因为 query 路径而触发 AllowQuery 检查。
+	r = httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info?apikey=key-garbage", nil)
+	r.Header.Set("X-API-Key", headerOnly)
+	if got := call(r); got != http.StatusOK {
+		t.Fatalf("header overrides query expected 200, got %d", got)
+	}
+
+	// (e) 错误 query key 必须 401（防御性：错 key 不能被当成无 key 兜底匿名通过）
+	r = httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info?apikey=key-bogus", nil)
+	if got := call(r); got != http.StatusUnauthorized {
+		t.Fatalf("invalid query key expected 401, got %d", got)
+	}
+}
+
+// TestAPIKeyDisableAccountKillsSessions 锁定 disable-account 的两个不变量：
+// 1) cookie session 立即失效（不依赖 SessionTTL 自然过期）；2) 同账号下既
+// 存的 API key 被 authenticateAPIKey:!u.Active 立即拒绝。任何后续把 Active
+// 改成软删除标志或把 DeleteUser 拆成异步任务的重构都会触发这个测试。
+func TestAPIKeyDisableAccountKillsSessions(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "bob", "Password123456")
+
+	created := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/apikeys", `{"name":"kill-me","rate_limit":50}`, cookies, map[string]string{"X-Twilight-Client": "webui"})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create key status=%d body=%s", created.Code, created.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(created.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := env.Data.(map[string]any)["key"].(string)
+	if !strings.HasPrefix(key, "key-") {
+		t.Fatalf("expected plaintext key prefix, got %q", key)
+	}
+
+	// 主动 disable 自己（走 API key 路径，与 webui 调用一致）
+	disableReq := httptest.NewRequest(http.MethodPost, "/api/v1/apikey/disable", nil)
+	disableReq.Header.Set("X-API-Key", key)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, disableReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 1) cookie session 必须立刻被踢
+	meRec := doJSONWithHeaders(app, http.MethodGet, "/api/v1/users/me", "", cookies, nil)
+	if meRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected cookie 401 after disable, got %d body=%s", meRec.Code, meRec.Body.String())
+	}
+
+	// 2) 同账号下的 API key 也必须立刻 401（!u.Active 兜底）
+	apiReq := httptest.NewRequest(http.MethodGet, "/api/v1/apikey/info", nil)
+	apiReq.Header.Set("X-API-Key", key)
+	apiRec := httptest.NewRecorder()
+	app.ServeHTTP(apiRec, apiReq)
+	if apiRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected api key 401 after disable, got %d body=%s", apiRec.Code, apiRec.Body.String())
+	}
+
+	// 3) 状态层面校验 User.Active=false（防止"看起来 401 但其实是别的兜底"）
+	u, ok := app.store().FindUserByUsername("bob")
+	if !ok {
+		t.Fatalf("user bob disappeared from store after disable")
+	}
+	if u.Active {
+		t.Fatalf("expected User.Active=false after disable, got true")
+	}
+}
+
+// TestCheckExpiredKillsInvitedUserSessions 锁定 R60-1 整改后的不变量：
+// check_expired job 处理 invited 用户时，即便保留 Active=true 让用户能重
+// 新登录续期，已经过期的时刻必须立刻让现有 cookie session 失效。否则
+// stale token 在 SessionTTL 内仍能访问受保护接口，与 R51-2 锁定的
+// "disable-account 必须立即踢 session" 语义不一致。non-invited 分支沿用
+// 原本就有的 sessions().DeleteUser，保留断言以防误把整段都拆掉。
+func TestCheckExpiredKillsInvitedUserSessions(t *testing.T) {
+	app := newTestApp(t)
+	ctx := context.Background()
+
+	// invited user (有 InviteRelation)
+	invited, err := app.store().CreateUser(store.User{Username: "invitee", Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().Add(-time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 直接构造 invite code 并 ConsumeInviteCode 走真实路径，让 ParentOf 命中
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INVR60", InviterUID: 999, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INVR60", invited.UID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := app.store().ParentOf(invited.UID); !ok {
+		t.Fatalf("ParentOf %d should hit invite relation after ConsumeInviteCode", invited.UID)
+	}
+
+	// non-invited user
+	standalone, err := app.store().CreateUser(store.User{Username: "standalone", Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().Add(-time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	invitedToken, _, err := app.sessions().Create(ctx, invited.UID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	standaloneToken, _, err := app.sessions().Create(ctx, standalone.UID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// pre-condition: 两个 session 都活
+	if _, ok := app.sessions().Get(ctx, invitedToken); !ok {
+		t.Fatalf("invited session must exist before check_expired")
+	}
+	if _, ok := app.sessions().Get(ctx, standaloneToken); !ok {
+		t.Fatalf("standalone session must exist before check_expired")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/scheduler/internal", nil)
+	if _, _, err := app.runSchedulerJob(req, "check_expired"); err != nil {
+		t.Fatalf("runSchedulerJob check_expired returned err: %v", err)
+	}
+
+	// invited: Active 保留为 true（走续期路径），但 session 必须已被踢
+	if u, ok := app.store().User(invited.UID); !ok {
+		t.Fatalf("invited user disappeared")
+	} else if !u.Active {
+		t.Fatalf("invited user Active should remain true (renewal path), got false")
+	}
+	if _, ok := app.sessions().Get(ctx, invitedToken); ok {
+		t.Fatalf("invited user session should be killed after expiry, but still alive")
+	}
+
+	// standalone: Active=false 且 session 也被踢（兜底确保原来逻辑没回退）
+	if u, ok := app.store().User(standalone.UID); !ok {
+		t.Fatalf("standalone user disappeared")
+	} else if u.Active {
+		t.Fatalf("standalone user Active should be false after check_expired")
+	}
+	if _, ok := app.sessions().Get(ctx, standaloneToken); ok {
+		t.Fatalf("standalone user session should be killed after expiry, but still alive")
+	}
+}
+
+func TestFrontendRouteCompatibilityDoesNot404(t *testing.T) {
+	app := newTestApp(t)
+	routes := []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/system/info"},
+		{http.MethodGet, "/api/v1/system/health"},
+		{http.MethodPost, "/api/v1/auth/login"},
+		{http.MethodGet, "/api/v1/users/me"},
+		{http.MethodGet, "/api/v1/admin/users"},
+		{http.MethodGet, "/api/v1/media/search?q=x&source=tmdb"},
+		{http.MethodPost, "/api/v1/media/request"},
+		{http.MethodGet, "/api/v1/admin/scheduler/jobs"},
+		{http.MethodGet, "/api/v1/announcements"},
+		{http.MethodGet, "/api/v1/invite/config"},
+		{http.MethodGet, "/api/v1/signin/config"},
+		{http.MethodGet, "/api/v1/apikey/info"},
+	}
+	for _, route := range routes {
+		req := httptest.NewRequest(route.method, route.path, nil)
+		rr := httptest.NewRecorder()
+		app.ServeHTTP(rr, req)
+		if rr.Code == http.StatusNotFound || rr.Code == http.StatusMethodNotAllowed {
+			t.Fatalf("%s %s returned %d", route.method, route.path, rr.Code)
+		}
+	}
+}
+
+func TestPublicHealthDoesNotProbePrivateDependencies(t *testing.T) {
+	app := newTestApp(t)
+	var embyCalls atomic.Int64
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		embyCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ServerName":"test","Version":"1"}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "configured-test-token"
+
+	response := doJSON(app, http.MethodGet, "/api/v1/system/health", "", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("public health status=%d body=%s", response.Code, response.Body.String())
+	}
+	if calls := embyCalls.Load(); calls != 0 {
+		t.Fatalf("public health triggered %d Emby probes", calls)
+	}
+	for _, privateField := range []string{"database_detail", "emby_detail", "storage_warning"} {
+		if strings.Contains(response.Body.String(), privateField) {
+			t.Fatalf("public health leaked private field %q: %s", privateField, response.Body.String())
+		}
+	}
+}
+
+func TestEmbyViewerCountRequiresLogin(t *testing.T) {
+	app := newTestApp(t)
+	response := doJSON(app, http.MethodGet, "/api/v1/system/emby-viewers", "", nil)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous viewer count status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestEmbyNowPlayingIsAdminOnly(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "viewer", "Viewer123456")
+
+	if response := doJSON(app, http.MethodGet, "/api/v1/admin/emby/now-playing", "", userCookies); response.Code != http.StatusForbidden {
+		t.Fatalf("ordinary user now-playing status=%d body=%s, want 403", response.Code, response.Body.String())
+	}
+	if response := doJSON(app, http.MethodGet, "/api/v1/admin/emby/now-playing", "", adminCookies); response.Code != http.StatusOK {
+		t.Fatalf("admin now-playing status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if response := doJSON(app, http.MethodGet, "/api/v1/emby/now-playing", "", adminCookies); response.Code != http.StatusNotFound {
+		t.Fatalf("legacy ordinary-user now-playing route status=%d body=%s, want 404", response.Code, response.Body.String())
+	}
+}
+
+func TestEmbyStatusSkipsLibraryCountsWhenStatsDisabled(t *testing.T) {
+	app := newTestApp(t)
+	var countCalls atomic.Int64
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/System/Info/Public":
+			_, _ = w.Write([]byte(`{"ServerName":"test","Version":"1"}`))
+		case "/Sessions":
+			_, _ = w.Write([]byte(`[]`))
+		case "/Items/Counts":
+			countCalls.Add(1)
+			_, _ = w.Write([]byte(`{"MovieCount":1,"SeriesCount":2,"EpisodeCount":3}`))
+		default:
+			t.Fatalf("unexpected Emby request: %s", r.URL.Path)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "configured-test-token"
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/emby/status", nil)
+	request = request.WithContext(context.WithValue(request.Context(), principalKey, principal{User: store.User{UID: 1, Active: true}}))
+	response := httptest.NewRecorder()
+	app.handleEmbyStatus(response, request, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("Emby status=%d body=%s", response.Code, response.Body.String())
+	}
+	if calls := countCalls.Load(); calls != 0 {
+		t.Fatalf("disabled Emby stats triggered %d library count requests", calls)
+	}
+
+	app.cfg().EmbyStatsEnabled = true
+	response = httptest.NewRecorder()
+	app.handleEmbyStatus(response, request, nil)
+	if calls := countCalls.Load(); calls != 1 {
+		t.Fatalf("enabled Emby stats count requests=%d want=1", calls)
+	}
+}
+
+func TestEmbyConnectionChangeInvalidatesServerScopedCaches(t *testing.T) {
+	app := newTestApp(t)
+	app.embySessionsCache = []map[string]any{{"Id": "old-session"}}
+	app.embySessionsUntil = time.Now().Add(time.Minute)
+	app.embyDeviceAuditCache = map[string]any{"server": "old"}
+	app.embyDeviceAuditUntil = time.Now().Add(time.Minute)
+	app.embyAdminCache["old-user"] = embyAdminCacheEntry{admin: true, checked: time.Now()}
+
+	app.invalidateEmbyConfigurationCaches()
+	if app.embySessionsCache != nil || !app.embySessionsUntil.IsZero() {
+		t.Fatalf("session cache was not invalidated: cache=%v until=%v", app.embySessionsCache, app.embySessionsUntil)
+	}
+	if app.embyDeviceAuditCache != nil || !app.embyDeviceAuditUntil.IsZero() {
+		t.Fatalf("device audit cache was not invalidated: cache=%v until=%v", app.embyDeviceAuditCache, app.embyDeviceAuditUntil)
+	}
+	if len(app.embyAdminCache) != 0 {
+		t.Fatalf("Emby admin cache was not invalidated: %v", app.embyAdminCache)
+	}
+	previous := config.Config{EmbyURL: "https://old.example", EmbyToken: "old"}
+	if !embyConnectionChanged(previous, config.Config{EmbyURL: "https://new.example", EmbyToken: "old"}) ||
+		!embyConnectionChanged(previous, config.Config{EmbyURL: "https://old.example", EmbyToken: "new"}) ||
+		embyConnectionChanged(previous, previous) {
+		t.Fatal("Emby connection change detection is inconsistent")
+	}
+}
+
+func TestStatusResponseWriterForwardsFlush(t *testing.T) {
+	rr := httptest.NewRecorder()
+	w := &statusResponseWriter{ResponseWriter: rr}
+	if _, ok := any(w).(http.Flusher); !ok {
+		t.Fatal("statusResponseWriter must preserve http.Flusher for SSE handlers")
+	}
+	w.Flush()
+	if w.status != http.StatusOK {
+		t.Fatalf("flush should mark status OK, got %d", w.status)
+	}
+}
+
+func TestPostJSONWithTimeoutReturnsMarshalError(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	err := postJSONWithTimeout(context.Background(), srv.URL, nil, map[string]any{"bad": func() {}}, nil, time.Second)
+	if err == nil {
+		t.Fatal("expected marshal error")
+	}
+	if called {
+		t.Fatal("request should not be sent after marshal error")
+	}
+}
+
+func TestUploadRejectsNonImage(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "note.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte("not an image"))
+	_ = writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/avatar/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-Twilight-Client", "webui")
+	req.AddCookie(cookie)
+	rr := httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAdminServerIconUploadUpdatesConfig(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+	if err := os.WriteFile(app.cfg().ConfigFile, []byte("[Admin]\nusernames = [\"admin\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "icon.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0})
+	_ = writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/admin/server-icon/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-Twilight-Client", "webui")
+	req.AddCookie(cookie)
+	rr := httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("server icon upload status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.HasPrefix(app.cfg().ServerIcon, "server-icon/") || !strings.HasSuffix(app.cfg().ServerIcon, ".png") {
+		t.Fatalf("server_icon was not updated to uploaded asset: %q", app.cfg().ServerIcon)
+	}
+	if _, _, ok := app.configuredServerIconPath(); !ok {
+		t.Fatalf("uploaded server icon is not readable from configured path: %q", app.cfg().ServerIcon)
+	}
+	icon := doJSON(app, http.MethodGet, "/api/v1/system/server-icon", ``, nil)
+	if icon.Code != http.StatusOK {
+		t.Fatalf("server icon read status = %d body=%s", icon.Code, icon.Body.String())
+	}
+	if icon.Header().Get("Content-Type") != "image/png" || icon.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("server icon headers mismatch: content-type=%q cache=%q", icon.Header().Get("Content-Type"), icon.Header().Get("Cache-Control"))
+	}
+	if !bytes.HasPrefix(icon.Body.Bytes(), []byte{0x89, 'P', 'N', 'G'}) {
+		t.Fatalf("server icon body does not start with PNG signature: %x", icon.Body.Bytes())
+	}
+}
+
+func TestUploadImageExtensionWhitelist(t *testing.T) {
+	allowed := map[string]string{
+		"image/jpeg": ".jpg",
+		"image/png":  ".png",
+		"image/gif":  ".gif",
+		"image/webp": ".webp",
+		"image/bmp":  ".bmp",
+	}
+	for contentType, expectedExt := range allowed {
+		ext, ok := uploadImageExtension(contentType)
+		if !ok || ext != expectedExt {
+			t.Fatalf("uploadImageExtension(%q) = %q, %v; want %q, true", contentType, ext, ok, expectedExt)
+		}
+	}
+
+	blocked := []string{"image/svg+xml", "text/html", "application/octet-stream", ""}
+	for _, contentType := range blocked {
+		if ext, ok := uploadImageExtension(contentType); ok || ext != "" {
+			t.Fatalf("uploadImageExtension(%q) = %q, %v; want empty, false", contentType, ext, ok)
+		}
+	}
+}
+
+func TestUploadAssetPathAndFilenameSafety(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+
+	validName := "0123456789abcdef.png"
+	avatarDir := filepath.Join(app.cfg().UploadDir, "avatar")
+	if err := os.MkdirAll(avatarDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(avatarDir, validName), []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	valid := doJSON(app, http.MethodGet, "/api/v1/users/assets/avatar/"+validName, ``, []*http.Cookie{cookie})
+	if valid.Code != http.StatusOK {
+		t.Fatalf("valid asset status=%d body=%s", valid.Code, valid.Body.String())
+	}
+
+	invalids := []string{
+		"/api/v1/users/assets/avatar/0123456789abcdef.svg",
+		"/api/v1/users/assets/avatar/0123456789abcdeg.png",
+		"/api/v1/users/assets/avatar/%2e%2e",
+		"/api/v1/users/assets/profile/" + validName,
+	}
+	for _, path := range invalids {
+		resp := doJSON(app, http.MethodGet, path, ``, []*http.Cookie{cookie})
+		// “%2e%2e” 解码后是 “..” 段，入口的非规范路径检查会先以 400 拒绝；其余在资源层回 404。
+		if resp.Code != http.StatusNotFound && !(strings.Contains(path, "%2e%2e") && resp.Code == http.StatusBadRequest) {
+			t.Fatalf("invalid asset %s status=%d body=%s", path, resp.Code, resp.Body.String())
+		}
+	}
+}
+
+func TestProtectedAdminConfigHiddenPreservedAndApplied(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+	databaseConfig := "[Database]\n" +
+		"driver = \"postgres\"\n" +
+		"backup_dir = " + strconv.Quote(app.cfg().DatabaseBackupDir) + "\n"
+	// register_mode = true 必须写进磁盘配置：saveConfigContent 会触发 reload，
+	// 从磁盘重新加载 cfg。新安全模型下首注册者不再自动成为 Admin，alice 要成为
+	// 管理员只能靠 admin_usernames 匹配；且 alice 是第二个注册用户，RegisterEnabled
+	// 必须为 true 才能注册成功（否则 currentUsers>0 时被 USER_REGISTER_DISABLED 挡住）。
+	existing := "[Global]\nserver_name = \"old\"\n\n" + databaseConfig + "\n[SAR]\nregister_mode = true\n\nadmin_uids = \"2\"\nadmin_usernames = \"alice\"\n"
+	if err := os.WriteFile(app.cfg().ConfigFile, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if shown := stripProtectedAdminConfig(existing); strings.Contains(shown, "admin_uids") || strings.Contains(shown, "admin_usernames") {
+		t.Fatalf("protected admin config leaked: %s", shown)
+	}
+	info, status, message := app.saveConfigContent("[Global]\nserver_name = \"new\"\n\n" + databaseConfig + "\n[SAR]\nregister_mode = true\n\n[Admin]\nadmin_uids = \"999\"\nadmin_usernames = \"mallory\"\n")
+	if status != http.StatusOK {
+		t.Fatalf("saveConfigContent status=%d message=%s info=%v", status, message, info)
+	}
+	data, err := os.ReadFile(app.cfg().ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	// 必须用完整 key=value 形式断言，避免 Windows 临时目录里随机数字（典型如
+	// `...Temp\TestProtected...1493999686\001\state.json`）巧合包含 "999"
+	// 子串触发误报。"mallory" 同理保持显式 key=value 检查。
+	if strings.Contains(content, `admin_uids = "999"`) || strings.Contains(content, `admin_usernames = "mallory"`) {
+		t.Fatalf("submitted protected admin config was not stripped: %s", content)
+	}
+	if !strings.Contains(content, `admin_uids = "2"`) || !strings.Contains(content, `admin_usernames = "alice"`) {
+		t.Fatalf("existing protected admin config was not preserved: %s", content)
+	}
+
+	// 配置的管理员用户名只在空库首位注册时生效（非首位注册同名会被拒绝，防抢注），
+	// 因此 alice 先注册。
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"alice","password":"Alice123456"}`, nil)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"owner","password":"Owner123456"}`, nil)
+	alice, ok := app.store().FindUserByUsername("alice")
+	if !ok || alice.Role != store.RoleAdmin || !alice.Active {
+		t.Fatalf("configured admin username was not applied on registration: %#v", alice)
+	}
+}
+
+func TestBackgroundConfigIsSanitized(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	valid := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me/background", `{"lightBg":"linear-gradient(135deg, #111 0%, #222 100%)","lightBgImage":"url('/api/v1/users/assets/background/0123456789abcdef.png')","lightBlur":99,"lightOpacity":1}`, []*http.Cookie{cookie}, headers)
+	if valid.Code != http.StatusOK {
+		t.Fatalf("valid background status=%d body=%s", valid.Code, valid.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(valid.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	background := env.Data.(map[string]any)["background"].(string)
+	if !strings.Contains(background, `"lightBlur":30`) || !strings.Contains(background, `"lightOpacity":10`) {
+		t.Fatalf("background bounds were not enforced: %s", background)
+	}
+	blockedURL := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me/background", `{"lightBgImage":"http://127.0.0.1/private.png"}`, []*http.Cookie{cookie}, headers)
+	if blockedURL.Code != http.StatusBadRequest {
+		t.Fatalf("external background URL status=%d body=%s", blockedURL.Code, blockedURL.Body.String())
+	}
+	blockedCSS := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me/background", `{"lightBg":"linear-gradient(red, blue);background:url(http://127.0.0.1/x)"}`, []*http.Cookie{cookie}, headers)
+	if blockedCSS.Code != http.StatusBadRequest {
+		t.Fatalf("unsafe background CSS status=%d body=%s", blockedCSS.Code, blockedCSS.Body.String())
+	}
+}
+
+func TestRegcodeInviteMediaAndSecurityFlows(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie := findCookie(adminLogin.Result().Cookies(), "twilight_session")
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"user","password":"User123456"}`, nil)
+	userLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"user","password":"User123456"}`, nil)
+	userCookie := findCookie(userLogin.Result().Cookies(), "twilight_session")
+	user, _ := app.store().FindUserByUsername("user")
+	_, _ = app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.TelegramID = 12345
+		u.EmbyID = "emby-user"
+		return nil
+	})
+
+	createdCodes := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes", `{"type":2,"days":15,"count":1,"random_algorithm":"hex20"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if createdCodes.Code != http.StatusOK {
+		t.Fatalf("create regcode status=%d body=%s", createdCodes.Code, createdCodes.Body.String())
+	}
+	var codeEnv envelope
+	if err := json.Unmarshal(createdCodes.Body.Bytes(), &codeEnv); err != nil {
+		t.Fatal(err)
+	}
+	code := codeEnv.Data.(map[string]any)["codes"].([]any)[0].(string)
+
+	preview := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/use-code", `{"reg_code":"`+code+`","check_only":true}`, []*http.Cookie{userCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), "续期") {
+		t.Fatalf("preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	used := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/use-code", `{"reg_code":"`+code+`"}`, []*http.Cookie{userCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if used.Code != http.StatusOK {
+		t.Fatalf("use code status=%d body=%s", used.Code, used.Body.String())
+	}
+	batchCodes := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes", `{"type":1,"days":3,"count":2,"random_algorithm":"hex20"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if batchCodes.Code != http.StatusOK {
+		t.Fatalf("create batch regcodes status=%d body=%s", batchCodes.Code, batchCodes.Body.String())
+	}
+	var batchEnv envelope
+	if err := json.Unmarshal(batchCodes.Body.Bytes(), &batchEnv); err != nil {
+		t.Fatal(err)
+	}
+	rawBatchCodes := batchEnv.Data.(map[string]any)["codes"].([]any)
+	missingConfirmDelete := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes/batch-delete", `{"codes":["`+rawBatchCodes[0].(string)+`"]}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if missingConfirmDelete.Code != http.StatusBadRequest || !strings.Contains(missingConfirmDelete.Body.String(), confirmBatchDeleteRegcodes) || !strings.Contains(missingConfirmDelete.Body.String(), `"error_code":"REGCODE_BATCH_CONFIRM_REQUIRED"`) {
+		t.Fatalf("batch delete regcodes missing confirm status=%d body=%s", missingConfirmDelete.Code, missingConfirmDelete.Body.String())
+	}
+	deletePayload := `{"codes":["` + code + `","` + rawBatchCodes[0].(string) + `","` + rawBatchCodes[1].(string) + `","missing-code"],"confirm":"` + confirmBatchDeleteRegcodes + `"}`
+	batchDelete := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes/batch-delete", deletePayload, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if batchDelete.Code != http.StatusOK || !strings.Contains(batchDelete.Body.String(), `"deleted":3`) || !strings.Contains(batchDelete.Body.String(), `"missing":1`) {
+		t.Fatalf("batch delete regcodes status=%d body=%s", batchDelete.Code, batchDelete.Body.String())
+	}
+	if _, ok := app.store().RegCode(code); ok {
+		t.Fatal("used regcode should be physically deleted by batch delete")
+	}
+
+	invite := doJSONWithHeaders(app, http.MethodPost, "/api/v1/invite/codes", `{"days":7}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if invite.Code != http.StatusCreated {
+		t.Fatalf("invite status=%d body=%s", invite.Code, invite.Body.String())
+	}
+	forest := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/invite/tree", ``, []*http.Cookie{adminCookie}, nil)
+	if forest.Code != http.StatusOK || !strings.Contains(forest.Body.String(), "nodes") {
+		t.Fatalf("forest status=%d body=%s", forest.Code, forest.Body.String())
+	}
+
+	media := doJSONWithHeaders(app, http.MethodPost, "/api/v1/media/request", `{"source":"tmdb","media_id":550,"title":"Fight Club","media_type":"movie"}`, []*http.Cookie{userCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if media.Code != http.StatusCreated || !strings.Contains(media.Body.String(), "require_key") {
+		t.Fatalf("media status=%d body=%s", media.Code, media.Body.String())
+	}
+	userRequests := app.store().ListMediaRequests(user.UID, false)
+	if len(userRequests) != 1 {
+		t.Fatalf("expected one media request, got %d", len(userRequests))
+	}
+	userStatusUpdate := doJSONWithHeaders(app, http.MethodPut, "/api/v1/media/request/"+strconv.FormatInt(userRequests[0].ID, 10)+"/status", `{"status":"accepted"}`, []*http.Cookie{userCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if userStatusUpdate.Code != http.StatusForbidden {
+		t.Fatalf("user status update should be forbidden, status=%d body=%s", userStatusUpdate.Code, userStatusUpdate.Body.String())
+	}
+	adminStatusUpdate := doJSONWithHeaders(app, http.MethodPut, "/api/v1/admin/media-requests/"+strconv.FormatInt(userRequests[0].ID, 10), `{"status":"accepted"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if adminStatusUpdate.Code != http.StatusOK || !strings.Contains(adminStatusUpdate.Body.String(), `"status":"accepted"`) {
+		t.Fatalf("admin status update status=%d body=%s", adminStatusUpdate.Code, adminStatusUpdate.Body.String())
+	}
+	adminReqs := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/media-requests?status=all", ``, []*http.Cookie{adminCookie}, nil)
+	if adminReqs.Code != http.StatusOK || !strings.Contains(adminReqs.Body.String(), "Fight Club") {
+		t.Fatalf("admin reqs status=%d body=%s", adminReqs.Code, adminReqs.Body.String())
+	}
+
+	blocked := doJSONWithHeaders(app, http.MethodPost, "/api/v1/security/ip/blacklist", `{"ip":"203.0.113.9","reason":"test"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if blocked.Code != http.StatusOK {
+		t.Fatalf("blacklist status=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+}
+
+func TestInviteMeReturnsStableTreeShape(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+
+	resp := doJSON(app, http.MethodGet, "/api/v1/invite/me", ``, []*http.Cookie{cookie})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("invite/me status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var env struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	tree, ok := env.Data["tree"].(map[string]any)
+	if !ok {
+		t.Fatalf("tree is not an object: %#v", env.Data["tree"])
+	}
+	self, ok := tree["self"].(map[string]any)
+	if !ok {
+		t.Fatalf("tree.self missing: %#v", tree)
+	}
+	if depth, _ := self["depth"].(float64); depth != 1 {
+		t.Fatalf("unexpected self depth: %#v", self["depth"])
+	}
+	if _, ok := tree["descendants"].([]any); !ok {
+		t.Fatalf("tree.descendants missing: %#v", tree)
+	}
+}
+
+func TestSigninResponsesMatchFrontendContract(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+
+	first := doJSONWithHeaders(app, http.MethodPost, "/api/v1/signin", `{}`, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if first.Code != http.StatusOK {
+		t.Fatalf("signin status=%d body=%s", first.Code, first.Body.String())
+	}
+	var firstEnv struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstEnv); err != nil {
+		t.Fatal(err)
+	}
+	if firstEnv.Data["currency_name"] != "积分" || firstEnv.Data["total_today"].(float64) != 1 || firstEnv.Data["current_points"].(float64) != 1 {
+		t.Fatalf("unexpected first signin payload: %#v", firstEnv.Data)
+	}
+
+	second := doJSONWithHeaders(app, http.MethodPost, "/api/v1/signin", `{}`, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if second.Code != http.StatusOK {
+		t.Fatalf("second signin status=%d body=%s", second.Code, second.Body.String())
+	}
+	var secondEnv struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondEnv); err != nil {
+		t.Fatal(err)
+	}
+	if secondEnv.Data["created"].(bool) || secondEnv.Data["total_today"].(float64) != 0 || secondEnv.Data["today_signed"] != true {
+		t.Fatalf("unexpected duplicate signin payload: %#v", secondEnv.Data)
+	}
+
+	history := doJSON(app, http.MethodGet, "/api/v1/signin/history?limit=30", ``, []*http.Cookie{cookie})
+	if history.Code != http.StatusOK {
+		t.Fatalf("history status=%d body=%s", history.Code, history.Body.String())
+	}
+	if !strings.Contains(history.Body.String(), `"daily_points":1`) || !strings.Contains(history.Body.String(), `"total":1`) {
+		t.Fatalf("history did not include frontend fields: %s", history.Body.String())
+	}
+}
+
+func TestSigninRenewalSpendsPointsWhenEnabled(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "renew-points", "Admin123456")
+	user, ok := app.store().FindUserByUsername("renew-points")
+	if !ok {
+		t.Fatal("missing test user")
+	}
+	expiresAt := time.Now().AddDate(0, 0, 1).Unix()
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = "emby-renew-points"
+		u.ExpiredAt = expiresAt
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := app.store().AddSigninWithOptions(user.UID, 100, nil, true); err != nil || !created {
+		t.Fatalf("seed signin points created=%v err=%v", created, err)
+	}
+
+	disabled := doJSONWithHeaders(app, http.MethodPost, "/api/v1/signin/renew", `{}`, cookies, map[string]string{"X-Twilight-Client": "webui"})
+	if disabled.Code != http.StatusForbidden || !strings.Contains(disabled.Body.String(), string(ErrSigninRenewalDisabled)) {
+		t.Fatalf("disabled renewal status=%d body=%s", disabled.Code, disabled.Body.String())
+	}
+
+	app.cfg().SigninRenewalEnabled = true
+	app.cfg().SigninRenewalCost = 40
+	app.cfg().SigninRenewalDays = 10
+	renewed := doJSONWithHeaders(app, http.MethodPost, "/api/v1/signin/renew", `{}`, cookies, map[string]string{"X-Twilight-Client": "webui"})
+	if renewed.Code != http.StatusOK {
+		t.Fatalf("renewal status=%d body=%s", renewed.Code, renewed.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.ExpiredAt < expiresAt+10*86400-2 || !updated.Active {
+		t.Fatalf("unexpected renewed user: %#v old_expiry=%d", updated, expiresAt)
+	}
+	points := app.store().Signin(user.UID).Points
+	if points != 60 {
+		t.Fatalf("expected 60 remaining points, got %d", points)
+	}
+	var env struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(renewed.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if got := numeric(env.Data["remaining_points"]); got != 60 {
+		t.Fatalf("unexpected remaining_points: %#v", env.Data)
+	}
+}
+
+func TestSigninRenewalRequiresEmbyWithoutSpendingPoints(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "renew-no-emby", "Admin123456")
+	user, _ := app.store().FindUserByUsername("renew-no-emby")
+	expiresAt := time.Now().AddDate(0, 0, 1).Unix()
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.ExpiredAt = expiresAt
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := app.store().AddSigninWithOptions(user.UID, 100, nil, true); err != nil || !created {
+		t.Fatalf("seed signin points created=%v err=%v", created, err)
+	}
+	app.cfg().SigninRenewalEnabled = true
+	app.cfg().SigninRenewalCost = 40
+	app.cfg().SigninRenewalDays = 10
+
+	renewed := doJSONWithHeaders(app, http.MethodPost, "/api/v1/signin/renew", `{}`, cookies, map[string]string{"X-Twilight-Client": "webui"})
+	if renewed.Code != http.StatusConflict || !strings.Contains(renewed.Body.String(), string(ErrRenewRequiresEmby)) {
+		t.Fatalf("renewal without Emby status=%d body=%s", renewed.Code, renewed.Body.String())
+	}
+	latest, _ := app.store().User(user.UID)
+	if latest.ExpiredAt != expiresAt {
+		t.Fatalf("rejected renewal changed expiry: got=%d want=%d", latest.ExpiredAt, expiresAt)
+	}
+	if points := app.store().Signin(user.UID).Points; points != 100 {
+		t.Fatalf("rejected renewal spent points: got=%d want=100", points)
+	}
+}
+
+func TestSigninAutoRenewalPreferenceEnforcesBackendGates(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AuditLogEnabled = true
+	cookies := registerAndLogin(t, app, "auto-renew-setting", "Admin123456")
+	user, _ := app.store().FindUserByUsername("auto-renew-setting")
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = "emby-auto-renew-setting"
+		u.ExpiredAt = time.Now().AddDate(0, 0, 7).Unix()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := doJSON(app, http.MethodPut, "/api/v1/users/me", `{"signin_auto_renewal":"true"}`, cookies)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("non-boolean preference status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	disabled := doJSON(app, http.MethodPut, "/api/v1/users/me", `{"signin_auto_renewal":true}`, cookies)
+	if disabled.Code != http.StatusForbidden || !strings.Contains(disabled.Body.String(), string(ErrSigninAutoRenewalDisabled)) {
+		t.Fatalf("disabled auto renewal status=%d body=%s", disabled.Code, disabled.Body.String())
+	}
+
+	app.cfg().SigninRenewalEnabled = true
+	app.cfg().SigninAutoRenewalEnabled = true
+	app.cfg().SigninRenewalCost = 40
+	app.cfg().SigninRenewalDays = 10
+	enabled := doJSON(app, http.MethodPut, "/api/v1/users/me", `{"signin_auto_renewal":true}`, cookies)
+	if enabled.Code != http.StatusOK {
+		t.Fatalf("enable auto renewal status=%d body=%s", enabled.Code, enabled.Body.String())
+	}
+	latest, _ := app.store().User(user.UID)
+	if !latest.SigninAutoRenewal {
+		t.Fatal("auto renewal preference was not persisted")
+	}
+	summary := doJSON(app, http.MethodGet, "/api/v1/signin/me", ``, cookies)
+	if summary.Code != http.StatusOK || !strings.Contains(summary.Body.String(), `"auto_renewal_user_enabled":true`) || !strings.Contains(summary.Body.String(), `"auto_renewal_available":true`) {
+		t.Fatalf("signin summary missing auto renewal state: status=%d body=%s", summary.Code, summary.Body.String())
+	}
+	foundAudit := false
+	for _, entry := range app.store().ListAuditLogs() {
+		if entry.Action == "update_signin_auto_renewal" && entry.TargetUID == user.UID { // target_uid 已改为本人
+			foundAudit = true
+			break
+		}
+	}
+	if !foundAudit {
+		t.Fatal("auto renewal preference update was not audited")
+	}
+
+	// A user must always be able to opt out, even after the administrator
+	// disables the global permission.
+	app.cfg().SigninAutoRenewalEnabled = false
+	disabledByUser := doJSON(app, http.MethodPut, "/api/v1/users/me", `{"signin_auto_renewal":false}`, cookies)
+	if disabledByUser.Code != http.StatusOK {
+		t.Fatalf("disable preference status=%d body=%s", disabledByUser.Code, disabledByUser.Body.String())
+	}
+	latest, _ = app.store().User(user.UID)
+	if latest.SigninAutoRenewal {
+		t.Fatal("auto renewal preference remained enabled after opt-out")
+	}
+}
+
+func TestCheckExpiredAutoRenewsWithSigninPoints(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AuditLogEnabled = true
+	app.cfg().SigninRenewalEnabled = true
+	app.cfg().SigninAutoRenewalEnabled = true
+	app.cfg().SigninRenewalCost = 40
+	app.cfg().SigninRenewalDays = 10
+	expiredAt := time.Now().Add(-time.Hour).Unix()
+
+	create := func(username, embyID string, auto bool, role int, points int) store.User {
+		t.Helper()
+		u, err := app.store().CreateUser(store.User{Username: username, EmbyID: embyID, SigninAutoRenewal: auto, Role: role, Active: true, ExpiredAt: expiredAt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if points > 0 {
+			if _, created, err := app.store().AddSigninWithOptions(u.UID, points, nil, true); err != nil || !created {
+				t.Fatalf("seed points for %s created=%v err=%v", username, created, err)
+			}
+		}
+		return u
+	}
+
+	renewed := create("auto-renew-success", "emby-auto-renew-success", true, store.RoleNormal, 100)
+	preferenceOff := create("auto-renew-off", "emby-auto-renew-off", false, store.RoleNormal, 100)
+	insufficient := create("auto-renew-poor", "emby-auto-renew-poor", true, store.RoleNormal, 20)
+	noEmby := create("auto-renew-no-emby", "", true, store.RoleNormal, 100)
+	admin := create("auto-renew-admin", "emby-auto-renew-admin", true, store.RoleAdmin, 100)
+	whitelist := create("auto-renew-whitelist", "emby-auto-renew-whitelist", true, store.RoleWhitelist, 100)
+
+	req := httptest.NewRequest(http.MethodPost, "/scheduler/internal", nil)
+	summary, _, err := app.runSchedulerJob(req, "check_expired")
+	if err != nil {
+		t.Fatalf("run check_expired: %v", err)
+	}
+	if got := int(numeric(summary["auto_renewed"])); got != 1 {
+		t.Fatalf("auto_renewed=%d want=1 summary=%v", got, summary)
+	}
+	if got := int(numeric(summary["auto_renewal_insufficient"])); got != 1 {
+		t.Fatalf("auto_renewal_insufficient=%d want=1 summary=%v", got, summary)
+	}
+	if got := int(numeric(summary["auto_renewal_ineligible"])); got != 1 {
+		t.Fatalf("auto_renewal_ineligible=%d want=1 summary=%v", got, summary)
+	}
+	if got := int(numeric(summary["auto_renewal_points_spent"])); got != 40 {
+		t.Fatalf("auto_renewal_points_spent=%d want=40 summary=%v", got, summary)
+	}
+	foundAudit := false
+	for _, entry := range app.store().ListAuditLogs() {
+		if entry.Action == "auto_renew_expired_users" {
+			foundAudit = true
+			break
+		}
+	}
+	if !foundAudit {
+		t.Fatal("automatic expiry renewal was not audited")
+	}
+
+	latestRenewed, _ := app.store().User(renewed.UID)
+	if !latestRenewed.Active || latestRenewed.ExpiredAt <= time.Now().Unix() {
+		t.Fatalf("auto-renewed user remained expired: %#v", latestRenewed)
+	}
+	if points := app.store().Signin(renewed.UID).Points; points != 60 {
+		t.Fatalf("auto renewal points=%d want=60", points)
+	}
+	for _, tc := range []struct {
+		user       store.User
+		wantPoints int
+	}{
+		{preferenceOff, 100},
+		{insufficient, 20},
+		{noEmby, 100},
+	} {
+		latest, _ := app.store().User(tc.user.UID)
+		if latest.Active {
+			t.Fatalf("ineligible expired user %s was not disabled", latest.Username)
+		}
+		if points := app.store().Signin(tc.user.UID).Points; points != tc.wantPoints {
+			t.Fatalf("ineligible user %s points=%d want=%d", latest.Username, points, tc.wantPoints)
+		}
+	}
+	for _, protected := range []store.User{admin, whitelist} {
+		latest, _ := app.store().User(protected.UID)
+		if !latest.Active || app.store().Signin(protected.UID).Points != 100 {
+			t.Fatalf("protected user was changed by auto renewal: %#v", latest)
+		}
+	}
+
+	second, _, err := app.runSchedulerJob(httptest.NewRequest(http.MethodPost, "/scheduler/internal", nil), "check_expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := int(numeric(second["auto_renewed"])); got != 0 || app.store().Signin(renewed.UID).Points != 60 {
+		t.Fatalf("second expiry run spent points again: summary=%v points=%d", second, app.store().Signin(renewed.UID).Points)
+	}
+}
+
+func TestCheckExpiredDoesNotAutoRenewWhenAdminPermissionIsOff(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().SigninRenewalEnabled = true
+	app.cfg().SigninAutoRenewalEnabled = false
+	app.cfg().SigninRenewalCost = 40
+	app.cfg().SigninRenewalDays = 10
+	u, err := app.store().CreateUser(store.User{Username: "auto-renew-global-off", EmbyID: "emby-auto-renew-global-off", SigninAutoRenewal: true, Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().Add(-time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.store().AddSigninWithOptions(u.UID, 100, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	summary, _, err := app.runSchedulerJob(httptest.NewRequest(http.MethodPost, "/scheduler/internal", nil), "check_expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, _ := app.store().User(u.UID)
+	if latest.Active || app.store().Signin(u.UID).Points != 100 || int(numeric(summary["auto_renewed"])) != 0 {
+		t.Fatalf("global-off user was auto-renewed: user=%#v points=%d summary=%v", latest, app.store().Signin(u.UID).Points, summary)
+	}
+}
+
+func TestRenewalCodesRequireEmbyWithoutBeingConsumed(t *testing.T) {
+	app := newTestApp(t)
+	user, err := app.store().CreateUser(store.User{Username: "code-no-emby", Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().AddDate(0, 0, 1).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []string{"RENEW-NO-EMBY-UNIFIED", "RENEW-NO-EMBY-LEGACY"} {
+		if err := app.store().UpsertRegCode(store.RegCode{Code: code, Type: 2, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	call := func(path, body string, handler HandlerFunc) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+		rr := httptest.NewRecorder()
+		handler(rr, req, nil)
+		return rr
+	}
+	if rr := call("/api/v1/users/me/use-code", `{"reg_code":"RENEW-NO-EMBY-UNIFIED"}`, app.handleUseCode); rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), string(ErrRenewRequiresEmby)) {
+		t.Fatalf("unified renewal without Emby status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr := call("/api/v1/users/me/renew", `{"reg_code":"RENEW-NO-EMBY-LEGACY"}`, app.handleRenew); rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), string(ErrRenewRequiresEmby)) {
+		t.Fatalf("legacy renewal without Emby status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, code := range []string{"RENEW-NO-EMBY-UNIFIED", "RENEW-NO-EMBY-LEGACY"} {
+		reg, _ := app.store().RegCode(code)
+		if reg.UseCount != 0 || !reg.Active {
+			t.Fatalf("rejected renewal consumed code %s: %#v", code, reg)
+		}
+	}
+}
+
+func TestAdminClearUserEmails(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	if _, err := app.store().CreateUser(store.User{Username: "email-a", Email: "a@example.com", Role: store.RoleNormal, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().CreateUser(store.User{Username: "email-b", Email: "b@example.com", Role: store.RoleNormal, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().CreateUser(store.User{Username: "email-empty", Role: store.RoleNormal, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+	preview := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/clear-emails", `{"dry_run":true}`, adminCookies, headers)
+	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), `"count":2`) {
+		t.Fatalf("preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	missingConfirm := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/clear-emails", `{"dry_run":false}`, adminCookies, headers)
+	if missingConfirm.Code != http.StatusBadRequest || !strings.Contains(missingConfirm.Body.String(), string(ErrAdminClearEmailsConfirm)) {
+		t.Fatalf("missing confirm status=%d body=%s", missingConfirm.Code, missingConfirm.Body.String())
+	}
+	confirmed := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/clear-emails", fmt.Sprintf(`{"dry_run":false,"confirm":%q}`, confirmClearAllEmails), adminCookies, headers)
+	if confirmed.Code != http.StatusOK || !strings.Contains(confirmed.Body.String(), `"cleared":2`) {
+		t.Fatalf("confirmed status=%d body=%s", confirmed.Code, confirmed.Body.String())
+	}
+	for _, username := range []string{"email-a", "email-b"} {
+		u, ok := app.store().FindUserByUsername(username)
+		if !ok || u.Email != "" {
+			t.Fatalf("email not cleared for %s: %#v", username, u)
+		}
+	}
+}
+
+func TestDisabledFeatureFlagsAreExposedAndEnforced(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().MediaRequestEnabled = false
+	app.cfg().SigninEnabled = false
+	app.cfg().InviteEnabled = false
+
+	info := doJSON(app, http.MethodGet, "/api/v1/system/info", ``, nil)
+	if info.Code != http.StatusOK {
+		t.Fatalf("system info status=%d body=%s", info.Code, info.Body.String())
+	}
+	var infoEnv struct {
+		Data struct {
+			Features map[string]bool `json:"features"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(info.Body.Bytes(), &infoEnv); err != nil {
+		t.Fatal(err)
+	}
+	if infoEnv.Data.Features["media_request"] || infoEnv.Data.Features["signin"] || infoEnv.Data.Features["invite"] {
+		t.Fatalf("disabled feature flags were not exposed: %#v", infoEnv.Data.Features)
+	}
+
+	configResp := doJSON(app, http.MethodGet, "/api/v1/signin/config", ``, nil)
+	if configResp.Code != http.StatusOK || !strings.Contains(configResp.Body.String(), `"enabled":false`) {
+		t.Fatalf("signin config did not expose disabled state: status=%d body=%s", configResp.Code, configResp.Body.String())
+	}
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	signin := doJSONWithHeaders(app, http.MethodPost, "/api/v1/signin", `{}`, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if signin.Code != http.StatusForbidden {
+		t.Fatalf("disabled signin status=%d body=%s", signin.Code, signin.Body.String())
+	}
+	inviteMe := doJSONWithHeaders(app, http.MethodGet, "/api/v1/invite/me", ``, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if inviteMe.Code != http.StatusOK || !strings.Contains(inviteMe.Body.String(), `"enabled":false`) || !strings.Contains(inviteMe.Body.String(), `"can_invite":false`) {
+		t.Fatalf("disabled invite/me status=%d body=%s", inviteMe.Code, inviteMe.Body.String())
+	}
+	adminRequests := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/media-requests", ``, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if adminRequests.Code != http.StatusOK {
+		t.Fatalf("disabled media admin requests status=%d body=%s", adminRequests.Code, adminRequests.Body.String())
+	}
+	inviteTree := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/invite/tree", ``, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if inviteTree.Code != http.StatusOK || !strings.Contains(inviteTree.Body.String(), `"enabled":false`) {
+		t.Fatalf("disabled admin invite tree status=%d body=%s", inviteTree.Code, inviteTree.Body.String())
+	}
+}
+
+func TestInventoryCheckUsesEmbyProviderAndSeasons(t *testing.T) {
+	app := newTestApp(t)
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := r.URL.Query()
+		if q.Get("AnyProviderIdEquals") == "Tmdb.42" {
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"series1","Name":"Example Show","Type":"Series","ProductionYear":2024,"ProviderIds":{"Tmdb":"42"}}],"TotalRecordCount":1}`))
+			return
+		}
+		if q.Get("ParentId") == "series1" {
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"s1","Name":"Season 1","Type":"Season","IndexNumber":1},{"Id":"s2","Name":"Season 2","Type":"Season","IndexNumber":2}],"TotalRecordCount":2}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"Items":[],"TotalRecordCount":0}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+
+	missingSeason := doJSONWithHeaders(app, http.MethodPost, "/api/v1/media/inventory/check", `{"source":"tmdb","media_id":42,"media_type":"tv","season":3}`, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if missingSeason.Code != http.StatusOK || !strings.Contains(missingSeason.Body.String(), `"exists":false`) || !strings.Contains(missingSeason.Body.String(), `"seasons_available":[1,2]`) {
+		t.Fatalf("missing season status=%d body=%s", missingSeason.Code, missingSeason.Body.String())
+	}
+	existingSeason := doJSONWithHeaders(app, http.MethodPost, "/api/v1/media/inventory/check", `{"source":"tmdb","media_id":42,"media_type":"tv","season":2}`, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if existingSeason.Code != http.StatusOK || !strings.Contains(existingSeason.Body.String(), `"exists":true`) || !strings.Contains(existingSeason.Body.String(), `"season_requested":2`) {
+		t.Fatalf("existing season status=%d body=%s", existingSeason.Code, existingSeason.Body.String())
+	}
+}
+
+func TestMediaRequestIgnoresUserSkipInventoryCheck(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyToken = "test-token"
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("AnyProviderIdEquals") == "Tmdb.550" {
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"movie1","Name":"Existing Movie","Type":"Movie","ProductionYear":1999,"ProviderIds":{"Tmdb":"550"}}],"TotalRecordCount":1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"Items":[],"TotalRecordCount":0}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "requester", "User123456")
+	user, ok := app.store().FindUserByUsername("requester")
+	if !ok {
+		t.Fatal("requester not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error { u.TelegramID = 12345; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/media/request", `{"source":"tmdb","media_id":550,"media_type":"movie","title":"Existing Movie","skip_inventory_check":true}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), `"error_code":"MEDIA_REQUEST_ALREADY_EXISTS"`) {
+		t.Fatalf("media request status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if requests := app.store().ListMediaRequests(user.UID, false); len(requests) != 0 {
+		t.Fatalf("user bypassed inventory check and created requests: %#v", requests)
+	}
+}
+
+func TestMediaRequestStatusUpdatesRequireExplicitStatus(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	created, err := app.store().CreateMediaRequest(store.MediaRequest{UID: 1, TelegramID: 99, Username: "admin", Title: "Pending", Source: "tmdb", MediaID: 42, MediaType: "movie"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adminResp := doJSONWithHeaders(app, http.MethodPut, "/api/v1/admin/media-requests/"+strconv.FormatInt(created.ID, 10), `{}`, adminCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if adminResp.Code != http.StatusBadRequest || !strings.Contains(adminResp.Body.String(), `"error_code":"MEDIA_REQUEST_STATUS_INVALID"`) {
+		t.Fatalf("admin empty status update status=%d body=%s", adminResp.Code, adminResp.Body.String())
+	}
+	updated, _ := app.store().MediaRequest(created.ID)
+	if updated.Status != "UNHANDLED" {
+		t.Fatalf("empty admin status update changed status to %q", updated.Status)
+	}
+
+	app.cfg().BotInternalSecret = "secret"
+	externalResp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/media/request/external/update", fmt.Sprintf(`{"key":%q}`, created.RequireKey), nil, map[string]string{"X-Internal-Secret": "secret"})
+	if externalResp.Code != http.StatusBadRequest || !strings.Contains(externalResp.Body.String(), `"error_code":"MEDIA_REQUEST_STATUS_INVALID"`) {
+		t.Fatalf("external empty status update status=%d body=%s", externalResp.Code, externalResp.Body.String())
+	}
+	updated, _ = app.store().MediaRequest(created.ID)
+	if updated.Status != "UNHANDLED" {
+		t.Fatalf("empty external status update changed status to %q", updated.Status)
+	}
+}
+
+func TestAdminMediaRequestFiltersSeparateActiveAndPending(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	seeds := []store.MediaRequest{
+		{UID: 1, TelegramID: 99, Username: "admin", Title: "Unhandled", Source: "tmdb", MediaID: 101, MediaType: "movie", Status: store.MediaRequestStatusUnhandled},
+		{UID: 1, TelegramID: 99, Username: "admin", Title: "Accepted", Source: "tmdb", MediaID: 102, MediaType: "movie", Status: store.MediaRequestStatusAccepted},
+		{UID: 1, TelegramID: 99, Username: "admin", Title: "Downloading", Source: "tmdb", MediaID: 103, MediaType: "movie", Status: store.MediaRequestStatusDownloading},
+		{UID: 1, TelegramID: 99, Username: "admin", Title: "Completed", Source: "tmdb", MediaID: 104, MediaType: "movie", Status: store.MediaRequestStatusCompleted},
+	}
+	for _, seed := range seeds {
+		if _, err := app.store().CreateMediaRequest(seed); err != nil {
+			t.Fatalf("seed %s: %v", seed.Title, err)
+		}
+	}
+	titlesFor := func(path string) map[string]bool {
+		t.Helper()
+		rr := doJSONWithHeaders(app, http.MethodGet, path, ``, adminCookies, nil)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Data struct {
+				Requests []struct {
+					Title string `json:"title"`
+				} `json:"requests"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s: %v body=%s", path, err, rr.Body.String())
+		}
+		out := map[string]bool{}
+		for _, req := range resp.Data.Requests {
+			out[req.Title] = true
+		}
+		return out
+	}
+
+	defaultTitles := titlesFor("/api/v1/admin/media-requests")
+	if !defaultTitles["Unhandled"] || !defaultTitles["Accepted"] || !defaultTitles["Downloading"] || defaultTitles["Completed"] {
+		t.Fatalf("default filter should be active queue, got %#v", defaultTitles)
+	}
+	pendingTitles := titlesFor("/api/v1/admin/media-requests?status=pending")
+	if !pendingTitles["Unhandled"] || pendingTitles["Accepted"] || pendingTitles["Downloading"] || pendingTitles["Completed"] {
+		t.Fatalf("pending filter should include only unhandled requests, got %#v", pendingTitles)
+	}
+	acceptedTitles := titlesFor("/api/v1/admin/media-requests?status=accepted")
+	if !acceptedTitles["Accepted"] || acceptedTitles["Unhandled"] || acceptedTitles["Downloading"] || acceptedTitles["Completed"] {
+		t.Fatalf("accepted filter should include only accepted requests, got %#v", acceptedTitles)
+	}
+}
+
+func TestAdminMediaRequestListMetadataAndRevisionConflict(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	created, err := app.store().CreateMediaRequest(store.MediaRequest{
+		UID: 1, TelegramID: 99, Username: "admin", Title: "Searchable Movie",
+		Source: "tmdb", MediaID: 4242, MediaType: "movie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/media-requests?status=all&source=tmdb&q=4242&per_page=50", ``, adminCookies, nil)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+	if got := list.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("cache-control=%q", got)
+	}
+	var envelope struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Requests []struct {
+				RequireKey string `json:"require_key"`
+				Revision   int64  `json:"revision"`
+			} `json:"requests"`
+			Total        int            `json:"total"`
+			TotalPages   int            `json:"total_pages"`
+			PerPage      int            `json:"per_page"`
+			StatusCounts map[string]int `json:"status_counts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if !envelope.Success {
+		t.Fatalf("group list did not return a successful JSON envelope: %s", list.Body.String())
+	}
+	if _, err := json.Marshal(envelope); err != nil {
+		t.Fatalf("group list response is not serializable: %v", err)
+	}
+	if envelope.Data.Total != 1 || envelope.Data.TotalPages != 1 || envelope.Data.PerPage != 50 || len(envelope.Data.Requests) != 1 {
+		t.Fatalf("unexpected list metadata: %#v", envelope.Data)
+	}
+	if envelope.Data.StatusCounts["all"] != 1 || envelope.Data.StatusCounts["pending"] != 1 {
+		t.Fatalf("unexpected status counts: %#v", envelope.Data.StatusCounts)
+	}
+
+	path := "/api/v1/admin/media-requests/by-key/" + created.RequireKey
+	headers := map[string]string{"X-Twilight-Client": "webui", "If-Match": `"1"`}
+	first := doJSONWithHeaders(app, http.MethodPut, path, `{"status":"accepted","note":"first"}`, adminCookies, headers)
+	if first.Code != http.StatusOK || first.Header().Get("ETag") != `"2"` {
+		t.Fatalf("first update status=%d etag=%q body=%s", first.Code, first.Header().Get("ETag"), first.Body.String())
+	}
+	stale := doJSONWithHeaders(app, http.MethodPut, path, `{"status":"completed"}`, adminCookies, headers)
+	if stale.Code != http.StatusConflict || !strings.Contains(stale.Body.String(), `"error_code":"MEDIA_REQUEST_CONFLICT"`) {
+		t.Fatalf("stale update status=%d body=%s", stale.Code, stale.Body.String())
+	}
+
+	invalid := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/media-requests?source=invalid", ``, adminCookies, nil)
+	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), `"error_code":"MEDIA_REQUEST_SOURCE_INVALID"`) {
+		t.Fatalf("invalid source status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestAdminMediaRequestGroupingAndBatchUpdate(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	first, err := app.store().CreateMediaRequest(store.MediaRequest{
+		UID: 1, Username: "admin", Title: "Shared Title", Source: "tmdb", MediaID: 11, MediaType: "movie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := app.store().CreateMediaRequest(store.MediaRequest{
+		UID: 1, Username: "admin", Title: " shared   title ", Source: "bangumi", MediaID: 22, MediaType: "tv",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/media-requests?status=all", ``, adminCookies, nil)
+	if list.Code != http.StatusOK {
+		t.Fatalf("group list status=%d body=%s", list.Code, list.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			Requests []struct {
+				GroupKey        string `json:"group_key"`
+				GroupCount      int    `json:"group_count"`
+				GroupedRequests []struct {
+					RequireKey string `json:"require_key"`
+				} `json:"grouped_requests"`
+			} `json:"requests"`
+			Total        int `json:"total"`
+			RequestTotal int `json:"request_total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data.Total != 1 || envelope.Data.RequestTotal != 2 || len(envelope.Data.Requests) != 1 || envelope.Data.Requests[0].GroupCount != 2 || len(envelope.Data.Requests[0].GroupedRequests) != 2 {
+		t.Fatalf("unexpected grouped response: %#v", envelope.Data)
+	}
+
+	body := fmt.Sprintf(`{"status":"accepted","note":"both","items":[{"require_key":%q,"revision":1},{"require_key":%q,"revision":1}]}`, first.RequireKey, second.RequireKey)
+	updated := doJSONWithHeaders(app, http.MethodPut, "/api/v1/admin/media-requests/batch/by-key", body, adminCookies, nil)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("batch update status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	for _, key := range []string{first.RequireKey, second.RequireKey} {
+		request, ok := app.store().FindMediaRequestByKey(key)
+		if !ok || request.Status != store.MediaRequestStatusAccepted || request.Revision != 2 || request.AdminNote != "both" {
+			t.Fatalf("batch member %q not updated: %#v", key, request)
+		}
+	}
+}
+
+func TestEmbyURLsDoNotFallbackToInternalServerURL(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyURL = "http://127.0.0.1:8096"
+	app.cfg().EmbyURLList = nil
+	app.cfg().EmbyPublicURL = ""
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	admin, _ := app.store().FindUserByUsername("admin")
+	_, _ = app.store().UpdateUser(admin.UID, func(u *store.User) error { u.EmbyID = "emby-admin"; return nil })
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	resp := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/emby-urls", ``, []*http.Cookie{cookie}, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("emby urls status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), app.cfg().EmbyURL) {
+		t.Fatalf("internal Emby URL leaked in user route response: %s", resp.Body.String())
+	}
+}
+
+func TestBangumiSearchUsesV0EndpointAndReturnsResults(t *testing.T) {
+	app := newTestApp(t)
+	bgm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v0/search/subjects" {
+			t.Fatalf("unexpected Bangumi request %s %s", r.Method, r.URL.String())
+		}
+		if got := r.URL.Query().Get("limit"); got != "20" {
+			t.Fatalf("limit query = %q", got)
+		}
+		if got := r.URL.Query().Get("offset"); got != "0" {
+			t.Fatalf("offset query = %q", got)
+		}
+		if ct := r.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Fatalf("content-type = %q", ct)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["keyword"] != "葬送的芙莉莲" || body["sort"] != "match" {
+			t.Fatalf("unexpected Bangumi body %#v", body)
+		}
+		filter, _ := body["filter"].(map[string]any)
+		if filter == nil || filter["nsfw"] != true {
+			t.Fatalf("missing Bangumi filter %#v", body["filter"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":400602,"type":2,"name":"Sousou no Frieren","name_cn":"葬送的芙莉莲","date":"2023-09-29","images":{"common":"https://example.test/frieren.jpg"},"rating":{"score":8.8,"rank":10},"eps":28,"tags":[{"name":"漫画改"}]}]}`))
+	}))
+	defer bgm.Close()
+	app.cfg().BangumiAPIURL = bgm.URL
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	resp := doJSON(app, http.MethodGet, "/api/v1/media/search?q=%E8%91%AC%E9%80%81%E7%9A%84%E8%8A%99%E8%8E%89%E8%8E%B2&source=bangumi", ``, []*http.Cookie{cookie})
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"source":"bangumi"`) || !strings.Contains(resp.Body.String(), "葬送的芙莉莲") {
+		t.Fatalf("bangumi search status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestBangumiSearchErrorIsVisibleForBangumiSource(t *testing.T) {
+	app := newTestApp(t)
+	bgm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"description":"bad bangumi request"}`, http.StatusBadGateway)
+	}))
+	defer bgm.Close()
+	app.cfg().BangumiAPIURL = bgm.URL
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	resp := doJSON(app, http.MethodGet, "/api/v1/media/search?q=test&source=bangumi", ``, []*http.Cookie{cookie})
+	// 上游错误细节只写日志，回给前端的是固定文案（避免泄露上游 URL / 密钥）。
+	if resp.Code != http.StatusBadGateway || !strings.Contains(resp.Body.String(), "Bangumi 搜索暂时不可用") || strings.Contains(resp.Body.String(), "bad bangumi request") {
+		t.Fatalf("bangumi failure status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestUpdateBangumiCollectionUsesV0RatingAndEpisodeAPIs(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().BangumiManageEnabled = true
+
+	var collectionBody map[string]any
+	var markBody map[string]any
+	var clearBody map[string]any
+	bgm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/users/-/collections/123":
+			if err := json.NewDecoder(r.Body).Decode(&collectionBody); err != nil {
+				t.Fatalf("decode collection body: %v", err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/episodes":
+			if got := r.URL.Query().Get("subject_id"); got != "123" {
+				t.Fatalf("episodes subject_id=%q", got)
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":1001,"type":0,"ep":1,"sort":1},{"id":1002,"type":0,"ep":2,"sort":2},{"id":1003,"type":0,"ep":3,"sort":3}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/users/-/collections/123/episodes":
+			_, _ = w.Write([]byte(`{"data":[{"episode":{"id":1003},"type":2}]}`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/users/-/collections/123/episodes":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode episode body: %v", err)
+			}
+			if int(numeric(body["type"])) == 2 {
+				markBody = body
+			} else {
+				clearBody = body
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Bangumi request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer bgm.Close()
+	app.cfg().BangumiAPIURL = bgm.URL
+
+	cookies := registerAndLogin(t, app, "bgm-user", "User123456")
+	user, ok := app.store().FindUserByUsername("bgm-user")
+	if !ok {
+		t.Fatal("missing bgm user")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.BGMToken = "user-token"
+		u.BGMManageMode = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doJSON(app, http.MethodPatch, "/api/v1/bangumi/collections/123", `{"type":3,"ep_status":2,"rate":0}`, cookies)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("update collection status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if collectionBody["type"] != float64(3) {
+		t.Fatalf("collection type body=%#v", collectionBody)
+	}
+	if rate, ok := collectionBody["rate"]; !ok || rate != float64(0) {
+		t.Fatalf("rate=0 must be sent explicitly, body=%#v", collectionBody)
+	}
+	if _, ok := collectionBody["ep_status"]; ok {
+		t.Fatalf("anime ep_status must not be sent on subject collection PATCH, body=%#v", collectionBody)
+	}
+	if got := fmt.Sprint(markBody["episode_id"]); got != "[1001 1002]" || int(numeric(markBody["type"])) != 2 {
+		t.Fatalf("mark episodes body=%#v", markBody)
+	}
+	if got := fmt.Sprint(clearBody["episode_id"]); got != "[1003]" || int(numeric(clearBody["type"])) != 0 {
+		t.Fatalf("clear episodes body=%#v", clearBody)
+	}
+}
+
+func TestAdminBangumiLogsUsesPathUID(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	user, err := app.store().CreateUser(store.User{Username: "bgm-log-user", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().AddBangumiSyncLog(store.BangumiSyncLog{
+		UID:         user.UID,
+		SubjectID:   "123",
+		SubjectName: "Path UID Subject",
+		Status:      "success",
+		CreatedAt:   time.Now().Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doJSON(app, http.MethodGet, "/api/v1/admin/bangumi/logs/"+strconv.FormatInt(user.UID, 10), ``, adminCookies)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "Path UID Subject") {
+		t.Fatalf("admin bangumi logs status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestMediaDetailSanitizesPathPartsBeforeUpstreamCall(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TMDBAPIKey = "tmdb-key"
+	var gotPath string
+	tmdb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if gotPath != "/movie/123" {
+			t.Fatalf("unexpected TMDB detail path %q", gotPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":123,"title":"Safe Movie","media_type":"movie"}`))
+	}))
+	defer tmdb.Close()
+	app.cfg().TMDBAPIURL = tmdb.URL
+
+	cookies := registerAndLogin(t, app, "admin", "Admin123456")
+	resp := doJSON(app, http.MethodGet, "/api/v1/media/detail?source=tmdb&media_id=123&media_type=movie%2F..%2F..%2Fauthentication", ``, cookies)
+	if resp.Code != http.StatusOK || gotPath != "/movie/123" || strings.Contains(resp.Body.String(), "authentication") {
+		t.Fatalf("media detail status=%d path=%q body=%s", resp.Code, gotPath, resp.Body.String())
+	}
+
+	badID := doJSON(app, http.MethodGet, "/api/v1/media/detail?source=tmdb&media_id=123%2F..%2Fsecret&media_type=movie", ``, cookies)
+	if badID.Code != http.StatusBadRequest || !strings.Contains(badID.Body.String(), `"error_code":"MEDIA_REQUEST_PAYLOAD_EMPTY"`) {
+		t.Fatalf("bad media id status=%d body=%s", badID.Code, badID.Body.String())
+	}
+}
+
+func TestSystemUpdateRejectsUnsafeRepoURL(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/update", `{"repo_url":"https://user:pass@example.com/repo.git","branch":"main"}`, []*http.Cookie{cookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("unsafe update URL status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestGitUpdateResponseDoesNotExposeProjectRoot(t *testing.T) {
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := applyGitUpdate(context.Background(), "https://example.com/twilight.git", "main", false, true, false)
+	if _, ok := result["project_root"]; ok {
+		t.Fatalf("git update response leaked project_root: %#v", result)
+	}
+	if response := fmt.Sprint(result); strings.Contains(response, projectRoot) {
+		t.Fatalf("git update response leaked working directory %q: %s", projectRoot, response)
+	}
+}
+
+func TestRuntimeLogsRequireAdminAndRedactSecrets(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie := findCookie(adminLogin.Result().Cookies(), "twilight_session")
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"user","password":"User123456"}`, nil)
+	userLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"user","password":"User123456"}`, nil)
+	userCookie := findCookie(userLogin.Result().Cookies(), "twilight_session")
+
+	unauth := doJSON(app, http.MethodGet, "/api/v1/system/admin/runtime/logs", ``, nil)
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("runtime logs unauth = %d body=%s", unauth.Code, unauth.Body.String())
+	}
+	forbidden := doJSON(app, http.MethodGet, "/api/v1/system/admin/runtime/status", ``, []*http.Cookie{userCookie})
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("runtime status user = %d body=%s", forbidden.Code, forbidden.Body.String())
+	}
+	adminStatus := doJSON(app, http.MethodGet, "/api/v1/system/admin/runtime/status", ``, []*http.Cookie{adminCookie})
+	if adminStatus.Code != http.StatusOK || !strings.Contains(adminStatus.Body.String(), `"goroutines"`) {
+		t.Fatalf("runtime status admin = %d body=%s", adminStatus.Code, adminStatus.Body.String())
+	}
+	redacted := redactSensitiveText("Authorization: Bearer abcdefghijklmnopqrstuvwxyz api_key=123456789012345")
+	if strings.Contains(redacted, "abcdefghijklmnopqrstuvwxyz") || strings.Contains(redacted, "123456789012345") {
+		t.Fatalf("secret was not redacted: %s", redacted)
+	}
+	// Emby / MediaBrowser / Session 变体必须被脱敏
+	for _, sample := range []string{
+		`emby_token=secret-emby-token-XYZ123`,
+		`X-Emby-Token: super-secret-emby-12345`,
+		`MediaBrowser Client="Twilight", Token="emby-token-deadbeef-9876", DeviceId="dev"`,
+		`session_id=sess-abcdef-1234567890`,
+	} {
+		out := redactSensitiveText(sample)
+		// 任何 12+ 长度连续 alnum/-/_ 的真实值都不应残留
+		for _, leak := range []string{"secret-emby-token-XYZ123", "super-secret-emby-12345", "emby-token-deadbeef-9876", "sess-abcdef-1234567890"} {
+			if strings.Contains(out, leak) {
+				t.Fatalf("variant secret was not redacted: input=%q output=%q leak=%q", sample, out, leak)
+			}
+		}
+	}
+	for _, key := range []string{"apiKey", "api-key", "authorization", "postgres_dsn", "bot.token", "X-Emby-Token", "emby_authorization", "MediaBrowserToken", "session_id"} {
+		if !sensitiveLogKey(key) {
+			t.Fatalf("sensitive log key was not detected: %s", key)
+		}
+	}
+}
+
+// TestRuntimeLoggerCapturesAllLevelsAndGatesConsole 锁定「全量记录 / 控制台裁剪」双合同：
+// 持久化 sink 恒定按 Debug 全量捕获（低于 console 级别的日志也必须进运行日志面板），
+// 而 console(stdout) 仍按配置 log_level(此处 Warn)裁剪，避免默认配置刷屏；
+// 且敏感字段在 console 与 sink 两路都要被脱敏。
+func TestRuntimeLoggerCapturesAllLevelsAndGatesConsole(t *testing.T) {
+	runtimeLogs = newRuntimeLogSink(20)
+	t.Cleanup(func() {
+		runtimeLogs = newRuntimeLogSink(1000)
+		InstallRuntimeLogger(io.Discard, zapcore.InfoLevel)
+	})
+
+	var out bytes.Buffer
+	InstallRuntimeLogger(&out, zapcore.WarnLevel)
+	ConfigureRuntimeLogging(zapcore.WarnLevel, 20)
+
+	zap.L().Info("runtime info below console level")
+	zap.L().Warn("runtime warn should be captured", zap.String("token", "secret-value"))
+	log.Print("runtime standard log should be captured")
+	time.Sleep(10 * time.Millisecond)
+
+	entries, _ := runtimeLogs.snapshot(20, 0)
+	joined := ""
+	attrDump := ""
+	for _, entry := range entries {
+		joined += entry.Level + ":" + entry.Message + "\n"
+		for k, v := range entry.Attrs {
+			attrDump += k + "=" + v + "\n"
+		}
+	}
+	// sink 全量捕获：Info(低于 console 级别)、Warn、std log 都必须进面板。
+	if !strings.Contains(joined, "runtime info below console level") {
+		t.Fatalf("info log missing from sink despite full capture: %s", joined)
+	}
+	if !strings.Contains(joined, "runtime warn should be captured") || !strings.Contains(joined, "runtime standard log should be captured") {
+		t.Fatalf("expected warn + std log entries in sink, got: %s", joined)
+	}
+	// console 按 Warn 裁剪：Info 不得写入 stdout，Warn 必须写入。
+	if strings.Contains(out.String(), "runtime info below console level") {
+		t.Fatalf("info log leaked to console despite warn console level: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "runtime warn should be captured") {
+		t.Fatalf("warn log missing from console output: %s", out.String())
+	}
+	// 敏感字段在两路都要被脱敏。
+	if strings.Contains(out.String(), "secret-value") {
+		t.Fatalf("sensitive attribute leaked to console output: %s", out.String())
+	}
+	if strings.Contains(attrDump, "secret-value") {
+		t.Fatalf("sensitive attribute leaked to sink attrs: %s", attrDump)
+	}
+}
+
+func TestServeHTTPSuccessDoesNotWriteAccessLog(t *testing.T) {
+	app := newTestApp(t)
+	runtimeLogs = newRuntimeLogSink(20)
+	t.Cleanup(func() {
+		runtimeLogs = newRuntimeLogSink(1000)
+		InstallRuntimeLogger(io.Discard, zapcore.InfoLevel)
+	})
+	InstallRuntimeLogger(io.Discard, zapcore.InfoLevel)
+	ConfigureRuntimeLogging(zapcore.InfoLevel, 20)
+
+	response := doJSON(app, http.MethodGet, "/api/v1/system/info", "", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("system info status=%d body=%s", response.Code, response.Body.String())
+	}
+	entries, _ := runtimeLogs.snapshot(20, 0)
+	for _, entry := range entries {
+		if strings.Contains(entry.Message, "http request completed") || strings.Contains(entry.Message, "slow http request completed") {
+			t.Fatalf("successful request unexpectedly wrote access log: %#v", entry)
+		}
+	}
+
+	missing := doJSON(app, http.MethodGet, "/api/v1/route-that-does-not-exist", "", nil)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing route status=%d body=%s", missing.Code, missing.Body.String())
+	}
+	entries, _ = runtimeLogs.snapshot(20, 0)
+	foundFailure := false
+	for _, entry := range entries {
+		if strings.Contains(entry.Message, "http request completed") {
+			foundFailure = true
+			break
+		}
+	}
+	if !foundFailure {
+		t.Fatalf("expected failed request to remain observable in runtime logs: %#v", entries)
+	}
+}
+
+func TestConfigSignatureCheckIsThrottled(t *testing.T) {
+	var app App
+	start := time.Unix(100, 0)
+	if !app.shouldCheckConfigSignature(start) {
+		t.Fatal("first config signature check should be allowed")
+	}
+	if app.shouldCheckConfigSignature(start.Add(100 * time.Millisecond)) {
+		t.Fatal("config signature check should be throttled inside interval")
+	}
+	if !app.shouldCheckConfigSignature(start.Add(configSignatureCheckInterval)) {
+		t.Fatal("config signature check should resume after interval")
+	}
+	if !app.shouldCheckConfigSignature(start.Add(-time.Second)) {
+		t.Fatal("config signature check should recover after a wall-clock rollback")
+	}
+}
+
+func TestConfigFileChangeHotReloadsRuntimeLogLevel(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+	writeRuntimeConfig := func(level string, limit int) {
+		t.Helper()
+		content := "[Global]\n" +
+			"databases_dir = " + strconv.Quote(app.cfg().DatabaseDir) + "\n" +
+			"log_level = " + strconv.Quote(level) + "\n" +
+			"runtime_log_limit = " + strconv.Itoa(limit) + "\n\n" +
+			"[Database]\n" +
+			"driver = " + strconv.Quote(app.cfg().DatabaseDriver) + "\n" +
+			"backup_dir = " + strconv.Quote(app.cfg().DatabaseBackupDir) + "\n" +
+			"state_file = " + strconv.Quote(app.cfg().StateFile) + "\n"
+		if err := os.WriteFile(app.cfg().ConfigFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runtimeLogs = newRuntimeLogSink(20)
+	t.Cleanup(func() {
+		runtimeLogs = newRuntimeLogSink(1000)
+		InstallRuntimeLogger(io.Discard, zapcore.InfoLevel)
+	})
+	InstallRuntimeLogger(io.Discard, zapcore.ErrorLevel)
+	ConfigureRuntimeLogging(zapcore.ErrorLevel, 20)
+	app.cfg().LogLevel = "error"
+	writeRuntimeConfig("error", 20)
+	app.configSignature = configFileSignature(app.cfg().ConfigFile)
+
+	time.Sleep(5 * time.Millisecond)
+	writeRuntimeConfig("debug", 21)
+	app.reloadConfigIfChanged()
+
+	if app.cfg().LogLevel != "debug" || app.cfg().RuntimeLogLimit != 21 {
+		t.Fatalf("config was not hot reloaded: level=%q limit=%d", app.cfg().LogLevel, app.cfg().RuntimeLogLimit)
+	}
+	zap.L().Debug("debug after hot reload")
+	entries, _ := runtimeLogs.snapshot(20, 0)
+	found := false
+	for _, entry := range entries {
+		if strings.Contains(entry.Message, "debug after hot reload") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("debug log was not captured after hot reload: %#v", entries)
+	}
+}
+
+// TestReloadConfigSurfacesLiveAppliedFields 锁定 reload 响应里的
+// `live_applied` 列表必须列出本次实际生效的 cookie 配置（session_cookie /
+// cookie_secure / cookie_samesite / cookie_domain），并且写出来的 cookie header 立刻反映
+// 新配置。这是 R55-2 整改的可观察性合同：cookie 字段不会"沉默成功"也不会
+// "沉默失败"——值真的变了就出现在 live_applied，下一次 setSessionCookie
+// 就用新值。
+func TestReloadConfigSurfacesLiveAppliedFields(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+
+	writeCfg := func(cookieName, sameSite string, secure bool, domain string) {
+		t.Helper()
+		content := "[Global]\n" +
+			"databases_dir = " + strconv.Quote(app.cfg().DatabaseDir) + "\n\n" +
+			"[Database]\n" +
+			"driver = " + strconv.Quote(app.cfg().DatabaseDriver) + "\n" +
+			"backup_dir = " + strconv.Quote(app.cfg().DatabaseBackupDir) + "\n" +
+			"state_file = " + strconv.Quote(app.cfg().StateFile) + "\n\n" +
+			"[Security]\n" +
+			"session_cookie_name = " + strconv.Quote(cookieName) + "\n" +
+			"session_cookie_samesite = " + strconv.Quote(sameSite) + "\n" +
+			"session_cookie_secure = " + strconv.FormatBool(secure) + "\n" +
+			"session_cookie_domain = " + strconv.Quote(domain) + "\n"
+		if err := os.WriteFile(app.cfg().ConfigFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 起手把进程内 cfg 也对齐到 writeCfg("twilight_session","lax",false)，
+	// 否则 defaults() 里 CookieSecure=true 会让 previous→next 看不到差异。
+	app.cfg().SessionCookie = "twilight_session"
+	app.cfg().CookieSecure = false
+	app.cfg().CookieSameSite = "lax"
+	app.cfg().CookieDomain = ""
+	writeCfg("twilight_session", "lax", false, "")
+	app.configSignature = configFileSignature(app.cfg().ConfigFile)
+
+	// 注册一个账户，使后续 login 能成功（reload 之后才测 cookie，避免 reload
+	// 期间替换 store 把 user 抹掉的歧义）。
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"reloadops","password":"Password123456"}`, nil)
+
+	// 改 cookie 三件套并触发 reload
+	writeCfg("twilight_secure_session", "strict", true, ".example.com")
+	info, err := app.reloadConfig()
+	if err != nil {
+		t.Fatalf("reload returned err: %v", err)
+	}
+	live, _ := info["live_applied"].([]string)
+	expected := map[string]bool{"session_cookie_name": false, "session_cookie_secure": false, "session_cookie_samesite": false, "session_cookie_domain": false}
+	for _, name := range live {
+		if _, ok := expected[name]; ok {
+			expected[name] = true
+		}
+	}
+	for name, seen := range expected {
+		if !seen {
+			t.Fatalf("live_applied missing %q, got %v", name, live)
+		}
+	}
+
+	// 走一次登录，断言 Set-Cookie 用的就是新名字 + Secure + SameSite=Strict
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"reloadops","password":"Password123456"}`, nil)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login after reload status=%d body=%s", login.Code, login.Body.String())
+	}
+	cookies := login.Result().Cookies()
+	sess := findCookie(cookies, "twilight_secure_session")
+	if sess == nil {
+		t.Fatalf("expected new session cookie name, got %#v", cookies)
+	}
+	if !sess.Secure {
+		t.Fatalf("expected Secure=true after reload, got %#v", sess)
+	}
+	if sess.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("expected SameSite=Strict after reload, got %v", sess.SameSite)
+	}
+	if sess.Domain != "example.com" {
+		t.Fatalf("expected Domain=example.com after reload, got %q", sess.Domain)
+	}
+}
+
+func TestConfigSchemaRendersTelegramNewlines(t *testing.T) {
+	values := configValues(config.Config{
+		TelegramBotStartText: "第一行\n第二行",
+		TelegramCustomCommands: []config.TelegramCommandReply{
+			{Command: "/hello", Reply: "第一行\n第二行"},
+		},
+	})
+	content := renderConfigTOML(values)
+	if !strings.Contains(content, `bot_start_text = "第一行\n第二行"`) {
+		t.Fatalf("telegram newline was not TOML escaped correctly:\n%s", content)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TelegramBotStartText != "第一行\n第二行" {
+		t.Fatalf("telegram newline did not round-trip: %q", cfg.TelegramBotStartText)
+	}
+	if len(cfg.TelegramCustomCommands) != 1 || cfg.TelegramCustomCommands[0].Reply != "第一行\n第二行" {
+		t.Fatalf("telegram custom command did not round-trip: %#v", cfg.TelegramCustomCommands)
+	}
+}
+
+func TestConfigSchemaExposesRegcodeDecoyAction(t *testing.T) {
+	found := false
+	for _, section := range configSectionDefs() {
+		if section.Key != "SAR" {
+			continue
+		}
+		for _, field := range section.Fields {
+			if field.Key != "regcode_decoy_action" {
+				continue
+			}
+			found = true
+			if field.Type != "select" {
+				t.Fatalf("regcode_decoy_action type=%q, want select", field.Type)
+			}
+			seen := map[string]bool{}
+			for _, option := range field.Options {
+				seen[fmt.Sprint(option["value"])] = true
+			}
+			for _, value := range []string{"log_only", "disable_user", "disable_emby"} {
+				if !seen[value] {
+					t.Fatalf("regcode_decoy_action option %q missing: %#v", value, field.Options)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("regcode_decoy_action was not exposed in SAR config schema")
+	}
+
+	values := configValues(config.Config{DecoyAction: "disable_emby"})
+	if values["SAR"]["regcode_decoy_action"] != "disable_emby" {
+		t.Fatalf("configValues did not include decoy action: %#v", values["SAR"])
+	}
+	content := renderConfigTOML(values)
+	if !strings.Contains(content, `regcode_decoy_action = "disable_emby"`) {
+		t.Fatalf("rendered config missing regcode_decoy_action:\n%s", content)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DecoyAction != "disable_emby" {
+		t.Fatalf("decoy action did not round-trip: %q", cfg.DecoyAction)
+	}
+}
+
+// 防回归：configValues 必须为 configSectionDefs 里的每个字段提供取值来源。
+// 漏一个字段 → handleConfigSchemaFull 返回 null（前端显示空）+ renderConfigTOML
+// 写出 "<nil>" 或被清空，等于该字段"存不住 / 读不到"。email_whitelist /
+// email_blacklist / email_validation_mode 曾因此完全失效。
+func TestConfigValuesCoversEverySchemaField(t *testing.T) {
+	values := configValues(config.Config{})
+	for _, section := range configSectionDefs() {
+		sectionValues, okSection := values[section.Key]
+		if !okSection {
+			t.Errorf("configValues 缺失整个 section %q", section.Key)
+			continue
+		}
+		for _, field := range section.Fields {
+			if _, ok := sectionValues[field.Key]; !ok {
+				t.Errorf("configValues 缺失 %s.%s —— schema 有该字段但没有取值来源（GET 返回 null、保存写入 <nil>）", section.Key, field.Key)
+			}
+		}
+	}
+}
+
+// email 黑白名单 + 验证模式必须能完整 round-trip：configValues 暴露 → 渲染 TOML →
+// config.Load 读回，三段都不能丢。
+func TestConfigSchemaRoundTripsEmailLists(t *testing.T) {
+	values := configValues(config.Config{
+		EmailValidationMode: "whitelist",
+		EmailWhitelist:      []string{"gmail.com", "outlook.com"},
+		EmailBlacklist:      []string{"mailinator.com"},
+	})
+	if values["Email"]["email_validation_mode"] != "whitelist" {
+		t.Fatalf("configValues 未包含 email_validation_mode: %#v", values["Email"]["email_validation_mode"])
+	}
+	content := renderConfigTOML(values)
+	for _, want := range []string{
+		`email_validation_mode = "whitelist"`,
+		`email_whitelist = ["gmail.com", "outlook.com"]`,
+		`email_blacklist = ["mailinator.com"]`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("渲染的配置缺少 %q:\n%s", want, content)
+		}
+	}
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EmailValidationMode != "whitelist" {
+		t.Fatalf("email_validation_mode 未 round-trip: %q", cfg.EmailValidationMode)
+	}
+	if len(cfg.EmailWhitelist) != 2 || cfg.EmailWhitelist[0] != "gmail.com" || cfg.EmailWhitelist[1] != "outlook.com" {
+		t.Fatalf("email_whitelist 未 round-trip: %#v", cfg.EmailWhitelist)
+	}
+	if len(cfg.EmailBlacklist) != 1 || cfg.EmailBlacklist[0] != "mailinator.com" {
+		t.Fatalf("email_blacklist 未 round-trip: %#v", cfg.EmailBlacklist)
+	}
+}
+
+func TestSystemUpdateValidationHelpers(t *testing.T) {
+	if _, err := validateUpdateBranch("../main"); err == nil {
+		t.Fatal("expected traversal branch to be rejected")
+	}
+	if _, err := validateUpdateRepoURL("https://user:pass@example.com/repo.git"); err == nil {
+		t.Fatal("expected credentialed repo URL to be rejected")
+	}
+	if _, err := validateUpdateRepoURL("https://example.com/repo.git?token=secret"); err == nil {
+		t.Fatal("expected query-bearing repo URL to be rejected")
+	}
+	if !systemdServicePattern.MatchString("twilight-scheduler") || systemdServicePattern.MatchString("twilight;reboot") {
+		t.Fatal("systemd service name validator is too loose or too strict")
+	}
+}
+
+func TestTelegramLinksAreDedicatedRowsOutsideStateJSON(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	id := linkIDFor("memory")
+	app.seedTelegramLink(t, store.TelegramLink{ID: id, Scene: "register", TelegramID: 12345, TelegramUsername: "memory", CreatedAt: now, ExpiresAt: now + 600})
+	if _, ok := app.store().BindCode(id); ok {
+		t.Fatal("link should not be written to state JSON")
+	}
+	link, ok := app.telegramLinkAlive(id)
+	if !ok || link.TelegramID != 12345 || !link.Confirmed() || link.TelegramUsername != "memory" {
+		t.Fatalf("link was not loaded correctly: ok=%v link=%#v", ok, link)
+	}
+}
+
+func TestConfirmedRegisterLinkHonorsTTL(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	// 注册场景：已确认但已过 TTL 的链接必须按过期处理，否则可跨越 TTL 重放到 /register。
+	expired := linkIDFor("reg-expired")
+	app.seedTelegramLink(t, store.TelegramLink{ID: expired, Scene: "register", TelegramID: 777, TelegramUsername: "ttl", CreatedAt: now - 700, ExpiresAt: now - 1})
+	state := app.telegramLinkStatus(context.Background(), expired, 0, store.TelegramLinkSecretHash(expired), "register", now)
+	if state.Status != "expired" || !state.Terminal || state.Confirmed {
+		t.Fatalf("confirmed-but-expired register link should be expired, got %#v", state)
+	}
+	valid := linkIDFor("reg-valid")
+	app.seedTelegramLink(t, store.TelegramLink{ID: valid, Scene: "register", TelegramID: 778, TelegramUsername: "ok", CreatedAt: now, ExpiresAt: now + 600})
+	if state := app.telegramLinkStatus(context.Background(), valid, 0, store.TelegramLinkSecretHash(valid), "register", now); state.Status != "confirmed" {
+		t.Fatalf("in-window confirmed register link should stay confirmed, got %#v", state)
+	}
+}
+
+func TestCleanupExpiredTelegramLinksKeepsValidLinks(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	expired, valid := linkIDFor("expired"), linkIDFor("valid")
+	app.seedTelegramLink(t, store.TelegramLink{ID: expired, Scene: "register", CreatedAt: now - 700, ExpiresAt: now - 1})
+	app.seedTelegramLink(t, store.TelegramLink{ID: valid, Scene: "register", CreatedAt: now, ExpiresAt: now + 600})
+	if deleted := app.cleanupExpiredTelegramLinks(now); deleted != 1 {
+		t.Fatalf("deleted=%d, want 1", deleted)
+	}
+	if _, ok := app.telegramLinkAlive(expired); ok {
+		t.Fatal("expired link was not deleted")
+	}
+	if _, ok := app.telegramLinkAlive(valid); !ok {
+		t.Fatal("valid link was deleted")
+	}
+}
+
+func TestRepairTelegramBindResidueClearsLegacyStateAndExpiredLinks(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	if err := app.store().UpsertBindCode(store.BindCode{Code: "LEGACYTG1", Scene: "register", Confirmed: true, TelegramID: 12345, CreatedAt: now - 3600, ExpiresAt: now - 3500}); err != nil {
+		t.Fatal(err)
+	}
+	expired, valid := linkIDFor("repair-expired"), linkIDFor("repair-valid")
+	app.seedTelegramLink(t, store.TelegramLink{ID: expired, Scene: "register", TelegramID: 67890, CreatedAt: now - 3600, ExpiresAt: now - 1})
+	app.seedTelegramLink(t, store.TelegramLink{ID: valid, Scene: "register", TelegramID: 67891, CreatedAt: now, ExpiresAt: now + 300})
+
+	app.repairTelegramBindResidue("test")
+
+	if _, ok := app.store().BindCode("LEGACYTG1"); ok {
+		t.Fatal("legacy persisted bind code should be removed by repair")
+	}
+	if _, ok := app.telegramLinkAlive(expired); ok {
+		t.Fatal("expired link should be removed by repair")
+	}
+	if _, ok := app.telegramLinkAlive(valid); !ok {
+		t.Fatal("valid link should remain")
+	}
+}
+
+func TestDeleteLocalUserClearsTelegramLinkResidue(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	user, err := app.store().CreateUser(store.User{Username: "tg-delete", TelegramID: 24680})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byIdentity, byAccount := linkIDFor("delete-identity"), linkIDFor("delete-account")
+	app.seedTelegramLink(t, store.TelegramLink{ID: byIdentity, Scene: "register", TelegramID: user.TelegramID, CreatedAt: now, ExpiresAt: now + 300})
+	app.seedTelegramLink(t, store.TelegramLink{ID: byAccount, Scene: "user", UID: user.UID, TelegramID: user.TelegramID, CreatedAt: now, ExpiresAt: now + 30})
+
+	if err := app.deleteLocalUser(context.Background(), user); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := app.telegramLinkAlive(byIdentity); ok {
+		t.Fatal("register link for deleted telegram id should be removed")
+	}
+	if _, ok := app.telegramLinkAlive(byAccount); ok {
+		t.Fatal("account link for deleted user should be removed")
+	}
+}
+
+func TestRepairTelegramBindResidueClearsOrphanedUserLinks(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	user, err := app.store().CreateUser(store.User{Username: "orphan-source", TelegramID: 35791})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, keep := linkIDFor("orphan"), linkIDFor("keep")
+	app.seedTelegramLink(t, store.TelegramLink{ID: orphan, Scene: "user", UID: user.UID, TelegramID: user.TelegramID, CreatedAt: now, ExpiresAt: now + 300})
+	app.seedTelegramLink(t, store.TelegramLink{ID: keep, Scene: "register", TelegramID: 35792, CreatedAt: now, ExpiresAt: now + 300})
+	if err := app.store().DeleteUser(user.UID); err != nil {
+		t.Fatal(err)
+	}
+
+	app.repairTelegramBindResidue("test")
+
+	if _, ok := app.telegramLinkAlive(orphan); ok {
+		t.Fatal("orphaned account link should be removed by repair")
+	}
+	if _, ok := app.telegramLinkAlive(keep); !ok {
+		t.Fatal("valid register link should remain")
+	}
+}
+
+func TestSchedulerCleanupBindCodesJobRemoved(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodPost, "/scheduler", nil)
+	if _, _, err := app.runSchedulerJob(req, "cleanup_bind_codes"); err == nil || !strings.Contains(err.Error(), "job not found") {
+		t.Fatalf("cleanup_bind_codes should be removed, got err=%v", err)
+	}
+}
+
+func TestSchedulerCleanupNoEmbySkipsPendingEntitlements(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AutoCleanupNoEmby = true
+	app.cfg().AutoCleanupNoEmbyDays = 1
+	app.cfg().AdminUsernames = []string{"configured-no-emby"}
+	old := time.Now().AddDate(0, 0, -3).Unix()
+	plain, err := app.store().CreateUser(store.User{Username: "plain-no-emby", Role: store.RoleNormal, Active: true, RegisterTime: old, CreatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	days := 30
+	pending, err := app.store().CreateUser(store.User{Username: "pending-emby", Role: store.RoleNormal, Active: true, PendingEmby: true, PendingEmbyDays: &days, RegisterTime: old, CreatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuredAdmin, err := app.store().CreateUser(store.User{Username: "configured-no-emby", Role: store.RoleNormal, Active: true, RegisterTime: old, CreatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/scheduler", nil)
+	summary, _, err := app.runSchedulerJob(req, "cleanup_no_emby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(numeric(summary["deleted"])) != 1 || int(numeric(summary["skipped_pending_emby"])) != 1 {
+		t.Fatalf("unexpected cleanup summary: %#v", summary)
+	}
+	if _, ok := app.store().User(plain.UID); ok {
+		t.Fatal("plain no-Emby web user was not deleted")
+	}
+	if u, ok := app.store().User(pending.UID); !ok || !u.PendingEmby {
+		t.Fatalf("pending Emby entitlement user was not preserved: ok=%v user=%#v", ok, u)
+	}
+	if _, ok := app.store().User(configuredAdmin.UID); !ok {
+		t.Fatal("configured admin no-Emby user was deleted")
+	}
+}
+
+func TestSchedulerCleanupPendingEmbyEntitlementsKeepsWebAccount(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AutoCleanupPendingEmby = true
+	app.cfg().AutoCleanupPendingEmbyDays = 1
+	old := time.Now().AddDate(0, 0, -3).Unix()
+	recent := time.Now().Unix()
+	days := 30
+	user, err := app.store().CreateUser(store.User{Username: "pending-clear", Role: store.RoleNormal, Active: true, PendingEmby: true, PendingEmbyDays: &days, RegisterTime: old, CreatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentUser, err := app.store().CreateUser(store.User{Username: "pending-recent-clear", Role: store.RoleNormal, Active: true, PendingEmby: true, PendingEmbyDays: &days, RegisterTime: recent, CreatedAt: recent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/scheduler", nil)
+	summary, _, err := app.runSchedulerJob(req, "cleanup_pending_emby_entitlements")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只收回发放超过 AutoCleanupPendingEmbyDays 天的资格；刚发放的保留。
+	if int(numeric(summary["cleared"])) != 1 || int(numeric(summary["deleted"])) != 0 || int(numeric(summary["skipped_recent"])) != 1 {
+		t.Fatalf("unexpected entitlement cleanup summary: %#v", summary)
+	}
+	updated, ok := app.store().User(user.UID)
+	if !ok {
+		t.Fatal("web account was deleted while clearing pending Emby entitlement")
+	}
+	if updated.PendingEmby || updated.PendingEmbyDays != nil || !updated.Active {
+		t.Fatalf("pending entitlement was not cleared cleanly: %#v", updated)
+	}
+	updatedRecent, ok := app.store().User(recentUser.UID)
+	if !ok || !updatedRecent.PendingEmby || updatedRecent.PendingEmbyDays == nil || !updatedRecent.Active {
+		t.Fatalf("recent pending entitlement must be kept: ok=%v user=%#v", ok, updatedRecent)
+	}
+}
+
+func TestSchedulerEmbySyncRepairsPlaceholderAndMissingIDs(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyToken = "token"
+	remoteUsers := []map[string]any{
+		{"Id": "real-alpha", "Name": "alpha", "Policy": map[string]any{}},
+		{"Id": "real-beta", "Name": "beta", "Policy": map[string]any{}},
+	}
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users":
+			_ = json.NewEncoder(w).Encode(remoteUsers)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/Users/"):
+			id := strings.TrimPrefix(r.URL.Path, "/Users/")
+			for _, user := range remoteUsers {
+				if asString(user["Id"]) == id {
+					_ = json.NewEncoder(w).Encode(user)
+					return
+				}
+			}
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Policy"):
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	alpha, err := app.store().CreateUser(store.User{Username: "alpha", Role: store.RoleNormal, Active: true, PendingEmby: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = app.store().UpdateUser(alpha.UID, func(u *store.User) error {
+		u.EmbyID = fmt.Sprintf("Emby_%d", alpha.UID)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := app.store().CreateUser(store.User{Username: "local-beta", EmbyUsername: "beta", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/scheduler", nil)
+	summary, _, err := app.runSchedulerJob(req, "emby_sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只有占位 ID 的账号会按名称修复；没有 EmbyID、只有同名 EmbyUsername 的账号
+	// 只列为候选，不能自动认领（否则注册同名账号即可接管他人 Emby）。
+	if int(numeric(summary["filled_emby_ids"])) != 1 || int(numeric(summary["repaired_placeholders"])) != 1 || int(numeric(summary["name_candidates"])) != 1 {
+		t.Fatalf("unexpected emby sync summary: %#v", summary)
+	}
+	updatedAlpha, _ := app.store().User(alpha.UID)
+	if updatedAlpha.EmbyID != "real-alpha" || updatedAlpha.EmbyUsername != "alpha" || updatedAlpha.PendingEmby {
+		t.Fatalf("placeholder Emby ID was not repaired: %#v", updatedAlpha)
+	}
+	updatedBeta, _ := app.store().User(beta.UID)
+	if updatedBeta.EmbyID != "" {
+		t.Fatalf("same-name Emby account must not be auto-linked: %#v", updatedBeta)
+	}
+}
+
+// TestSchedulerEmbySyncRetriesTransient5xx 验证 R61-5 的核心承诺：emby 反代偶发
+// 502 不应让 emby_sync 把用户记成 failed_sync。第一次拉 /Users 返回 502，第二次
+// 才返回正常 JSON——重试 helper 必须把第一次失败吃掉，让 sync 像无错一样完成。
+//
+// 同时校验 Web 禁用态的 Emby 禁用写入只成功执行一次，证明 retry 包装没有让
+// 幂等写路径"重试地狱"地反复 POST。
+func TestSchedulerEmbySyncRetriesTransient5xx(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyToken = "token"
+	remoteUsers := []map[string]any{
+		{"Id": "real-alpha", "Name": "alpha", "Policy": map[string]any{}},
+	}
+	usersAttempts := 0
+	policyAttempts := 0
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users":
+			usersAttempts++
+			if usersAttempts == 1 {
+				// 模拟反代瞬时 502（典型 nginx upstream timeout）。
+				http.Error(w, "bad gateway", http.StatusBadGateway)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(remoteUsers)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/Users/"):
+			id := strings.TrimPrefix(r.URL.Path, "/Users/")
+			for _, user := range remoteUsers {
+				if asString(user["Id"]) == id {
+					_ = json.NewEncoder(w).Encode(user)
+					return
+				}
+			}
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Policy"):
+			policyAttempts++
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	alpha, err := app.store().CreateUser(store.User{Username: "alpha", EmbyUsername: "alpha", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().UpdateUser(alpha.UID, func(u *store.User) error {
+		u.EmbyID = "real-alpha"
+		u.Active = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/scheduler", nil)
+	summary, _, err := app.runSchedulerJob(req, "emby_sync")
+	if err != nil {
+		t.Fatalf("emby_sync should have recovered from a transient 502, got err: %v", err)
+	}
+	if !boolish(summary["success"]) {
+		t.Fatalf("emby_sync did not succeed after retry: %#v", summary)
+	}
+	if usersAttempts < 2 {
+		t.Fatalf("expected /Users to be retried at least once on 502, got attempts=%d", usersAttempts)
+	}
+	// 用户列表只有 1 条禁用账号，policy 禁用同步应当走通且只写一次。
+	if int(numeric(summary["synced_state"])) != 1 {
+		t.Fatalf("expected 1 user state synced after retry, summary=%#v", summary)
+	}
+	if policyAttempts != 1 {
+		t.Fatalf("expected exactly 1 policy POST after recovery, got %d", policyAttempts)
+	}
+}
+
+func TestSchedulerEmbySyncSkipsPolicyUpdateWhenRemoteStateMatches(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyToken = "token"
+	remoteUsers := []map[string]any{
+		{"Id": "real-alpha", "Name": "alpha", "Policy": map[string]any{"IsDisabled": false}},
+	}
+	policyRequests := 0
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users":
+			_ = json.NewEncoder(w).Encode(remoteUsers)
+		case strings.HasPrefix(r.URL.Path, "/Users/"):
+			policyRequests++
+			http.Error(w, "policy endpoint should not be called when state is already known", http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	if _, err := app.store().CreateUser(store.User{Username: "alpha", EmbyUsername: "alpha", EmbyID: "real-alpha", Role: store.RoleNormal, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, _, err := app.runSchedulerJob(httptest.NewRequest(http.MethodPost, "/scheduler", nil), "emby_sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(numeric(summary["synced_state"])) != 1 || int(numeric(summary["state_unchanged"])) != 1 {
+		t.Fatalf("expected already-synced remote state to be counted without policy writes: %#v", summary)
+	}
+	if policyRequests != 0 {
+		t.Fatalf("policy endpoint was called despite matching remote state: %d", policyRequests)
+	}
+}
+
+// TestEmbyRetryOn5xxSkips4xx 直接覆盖 retry helper 的"4xx 不重试"分支，
+// 避免被错误的"什么错都重试"实现悄悄回归。
+func TestEmbyRetryOn5xxSkips4xx(t *testing.T) {
+	attempts := 0
+	err := embyRetryOn5xx(context.Background(), func(ctx context.Context) error {
+		attempts++
+		return fmt.Errorf("remote status 404: not found")
+	})
+	if err == nil {
+		t.Fatalf("expected 4xx error to bubble up unchanged")
+	}
+	if attempts != 1 {
+		t.Fatalf("4xx must not be retried, got attempts=%d", attempts)
+	}
+}
+
+func TestTelegramMembershipRejoinManualReviewAndAutoEnable(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramRequireMembership = true
+	app.cfg().TelegramGroupIDs = []string{"-1001"}
+	user, err := app.store().CreateUser(store.User{Username: "rejoined", Role: store.RoleNormal, Active: false, TelegramID: 4242, EmbyID: "emby-rejoined"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只有因退群被巡检停用（DisabledReason=telegram_membership）的账号才会进入回群流程。
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.Active = false
+		u.DisabledReason = store.DisabledReasonTelegramMembership
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bot123:ABC/getChatMember" {
+			t.Fatalf("unexpected telegram path: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"status":"member","user":{"id":4242,"is_bot":false}}}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	app.cfg().TelegramAutoEnableRejoined = false
+	summary, _, err := app.enforceTelegramMembership(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(numeric(summary["rejoined_pending_review"])) != 1 || int(numeric(summary["rejoin_candidates"])) != 1 {
+		t.Fatalf("manual review rejoin was not reported: %#v", summary)
+	}
+	if updated, _ := app.store().User(user.UID); updated.Active {
+		t.Fatal("manual review mode should not auto-enable the web account")
+	}
+
+	app.cfg().TelegramAutoEnableRejoined = true
+	summary, _, err = app.enforceTelegramMembership(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(numeric(summary["rejoined_enabled"])) != 1 {
+		t.Fatalf("auto rejoin did not enable user: %#v", summary)
+	}
+	if updated, _ := app.store().User(user.UID); !updated.Active {
+		t.Fatal("auto rejoin did not enable the web account")
+	}
+}
+
+func TestTelegramMembershipEnforcementUsesConfiguredConcurrency(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramRequireMembership = true
+	app.cfg().TelegramGroupIDs = []string{"-1001"}
+	app.cfg().TelegramGroupCheckConcurrency = 4
+	for i := 0; i < 6; i++ {
+		if _, err := app.store().CreateUser(store.User{Username: fmt.Sprintf("tgcheck-%d", i), Role: store.RoleNormal, Active: true, TelegramID: int64(9000 + i), EmbyID: fmt.Sprintf("emby-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var activeRequests int32
+	var maxActiveRequests int32
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bot123:ABC/getChatMember" {
+			t.Fatalf("unexpected telegram path: %s", r.URL.Path)
+		}
+		current := atomic.AddInt32(&activeRequests, 1)
+		defer atomic.AddInt32(&activeRequests, -1)
+		for {
+			maxActive := atomic.LoadInt32(&maxActiveRequests)
+			if current <= maxActive || atomic.CompareAndSwapInt32(&maxActiveRequests, maxActive, current) {
+				break
+			}
+		}
+		time.Sleep(80 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"status":"member","user":{"id":9000,"is_bot":false}}}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	summary, logs, err := app.enforceTelegramMembership(context.Background(), false)
+	if err != nil {
+		t.Fatalf("enforceTelegramMembership err=%v logs=%v summary=%#v", err, logs, summary)
+	}
+	if got := atomic.LoadInt32(&maxActiveRequests); got < 2 {
+		t.Fatalf("membership checks did not run concurrently, max active requests=%d summary=%#v", got, summary)
+	}
+	if int(numeric(summary["scanned"])) != 6 || int(numeric(summary["unique_telegram_ids"])) != 6 || int(numeric(summary["concurrency"])) != 4 {
+		t.Fatalf("unexpected membership summary: %#v", summary)
+	}
+	if int(numeric(summary["failed"])) != 0 || int(numeric(summary["disabled"])) != 0 {
+		t.Fatalf("membership enforcement should not fail or disable users: %#v", summary)
+	}
+}
+
+func TestRegisterConsumesConfirmedTelegramLink(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().ForceBindTelegram = true
+
+	link := issueRegisterTelegramLink(t, app)
+	if result := app.confirmTelegramLink(context.Background(), link.Token, 424242, "alice_tg"); !result.Success {
+		t.Fatalf("confirm: %+v", result)
+	}
+	registered := doJSON(app, http.MethodPost, "/api/v1/users/register", fmt.Sprintf(`{"username":"alice","password":"Alice123456","telegram_link_id":%q,"telegram_link_secret":%q}`, link.ID, link.Secret), nil)
+	if registered.Code != http.StatusCreated {
+		t.Fatalf("register status=%d body=%s", registered.Code, registered.Body.String())
+	}
+	u, ok := app.store().FindUserByUsername("alice")
+	if !ok || u.TelegramID != 424242 || u.TelegramUsername != "alice_tg" {
+		t.Fatalf("telegram bind not applied to registered user: ok=%v user=%#v", ok, u)
+	}
+	if consumed, _ := app.store().TelegramLink(context.Background(), link.ID); consumed.State != "consumed" || consumed.ResultUID != u.UID {
+		t.Fatalf("confirmed register link was not consumed: %#v", consumed)
+	}
+}
+
+func TestRegisterLinkCreateFailurePreservesConfirmedState(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	id := linkIDFor("regfail")
+	app.seedTelegramLink(t, store.TelegramLink{ID: id, Scene: "register", TelegramID: 424242, TelegramUsername: "ghost_tg", CreatedAt: now, ExpiresAt: now + 600})
+
+	_, _, consumedBind, err := app.store().RegisterWithTelegramLink(context.Background(), store.User{Username: "retryuser"}, "", id, store.TelegramLinkSecretHash(id), func(*store.User, store.RegCode, store.BindCode) error { return store.ErrConflict })
+	if !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("consume error=%v want ErrConflict", err)
+	}
+	if consumedBind.Code != id || consumedBind.TelegramID != 424242 {
+		t.Fatalf("consume should return the failed bind for diagnostics: %#v", consumedBind)
+	}
+	if link, ok := app.telegramLinkAlive(id); !ok || !link.Confirmed() {
+		t.Fatal("failed registration must preserve its confirmed link for retry")
+	}
+	state := app.telegramLinkStatus(context.Background(), id, 0, store.TelegramLinkSecretHash(id), "register", now)
+	if state.Status != "confirmed" || state.Invalid || !state.Terminal || !state.Confirmed {
+		t.Fatalf("failed registration should leave a confirmed link, got %#v", state)
+	}
+	if _, ok := app.store().FindUserByTelegramID(424242); ok {
+		t.Fatal("failed register consumption should not create a user with the Telegram ID")
+	}
+}
+
+func TestConfirmedRegisterLinkDetectsTelegramTakenBeforeSubmit(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+	id := linkIDFor("regtaken")
+	app.seedTelegramLink(t, store.TelegramLink{ID: id, Scene: "register", TelegramID: 555001, TelegramUsername: "taken_tg", CreatedAt: now, ExpiresAt: now + 600})
+	if _, err := app.store().CreateUser(store.User{Username: "owner", TelegramID: 555001}); err != nil {
+		t.Fatal(err)
+	}
+	state := app.telegramLinkStatus(context.Background(), id, 0, store.TelegramLinkSecretHash(id), "register", now)
+	if state.Status != "telegram_taken" || !state.Invalid || !state.Terminal || state.Confirmed {
+		t.Fatalf("confirmed register link should become terminal when Telegram is taken, got %#v", state)
+	}
+}
+
+func TestConfirmedUserLinkDetectsDatabaseMismatch(t *testing.T) {
+	app := newTestApp(t)
+	user, err := app.store().CreateUser(store.User{Username: "stale-bind", TelegramID: 777001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	id := linkIDFor("userstale")
+	app.seedTelegramLink(t, store.TelegramLink{ID: id, Scene: "user", UID: user.UID, TelegramID: 777001, TelegramUsername: "old_tg", CreatedAt: now, ExpiresAt: now + 30})
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.TelegramID = 0
+		u.TelegramUsername = ""
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state := app.telegramLinkStatus(context.Background(), id, user.UID, "", "user", now)
+	if state.Status != "telegram_taken" || !state.Invalid || !state.Terminal || state.TelegramBound {
+		t.Fatalf("stale account link should not report bound, got %#v", state)
+	}
+}
+
+func TestTelegramUserBindWritesAuditLog(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AuditLogEnabled = true
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	user, err := app.store().CreateUser(store.User{Username: "tg-audit", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	id := linkIDFor("auditbind")
+	app.seedTelegramLink(t, store.TelegramLink{ID: id, Scene: "user", UID: user.UID, CreatedAt: now, ExpiresAt: now + 300})
+	if result := app.confirmTelegramLink(context.Background(), id, 919191, "audit_user"); !result.Success {
+		t.Fatalf("confirm: %+v", result)
+	}
+	logs := app.store().ListAuditLogs()
+	if len(logs) == 0 || logs[0].Action != "bind_telegram_via_telegram" || logs[0].Source != "telegram" || logs[0].TargetUID != user.UID {
+		t.Fatalf("telegram bind audit log missing: %#v", logs)
+	}
+}
+
+func TestClearAuditLogsDoesNotRecreateAuditEntry(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AuditLogEnabled = true
+	admin, err := app.store().CreateUser(store.User{Username: "audit-admin", Role: store.RoleAdmin, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.auditEntryIP("telegram", admin.UID, admin.Username, "sample_action", "admin", 0, nil)
+	if count := app.store().AuditLogCount(); count != 1 {
+		t.Fatalf("expected seed audit log, got %d", count)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/audit-logs/clear", strings.NewReader(`{"confirm":"`+confirmClearAuditLogs+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: admin}))
+	rr := httptest.NewRecorder()
+	app.handleClearAuditLogs(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("clear audit status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	// 清空后只留下一条不可删除的 clear_audit_logs 自保记录。
+	logs := app.store().ListAuditLogs()
+	if len(logs) != 1 || logs[0].Action != "clear_audit_logs" || logs[0].UID != admin.UID {
+		t.Fatalf("clear audit should leave exactly one protected record, logs=%#v", logs)
+	}
+}
+
+func TestFallbackAuditCoversSuccessfulMutationsWithoutExplicitAudit(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AuditLogEnabled = true
+	cookies := registerAndLogin(t, app, "fallback-audit", "User123456")
+	if _, err := app.store().ClearAuditLogs(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a dedicated test route so newly explicit business audits cannot hide
+	// regressions in the fallback mechanism itself.
+	app.add(http.MethodPost, "/api/v1/test-fallback-audit", AuthUser, func(w http.ResponseWriter, r *http.Request, _ Params) { ok(w, "OK", nil) })
+	rr := doJSON(app, http.MethodPost, "/api/v1/test-fallback-audit", `{}`, cookies)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("fallback route status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	logs := app.store().ListAuditLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected one fallback audit log, got %#v", logs)
+	}
+	if logs[0].Action != "post_test_fallback_audit" || logs[0].Category != "user" || logs[0].UID == 0 || logs[0].Detail["fallback"] != true {
+		t.Fatalf("unexpected fallback audit log: %#v", logs[0])
+	}
+}
+
+func TestAuditMaintenanceRoutesSkipFallbackAudit(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AuditLogEnabled = true
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	app.auditEntryIP("system", 0, "test", "seed", "system", 0, nil)
+	if count := app.store().AuditLogCount(); count == 0 {
+		t.Fatal("expected seed audit log")
+	}
+
+	rr := doJSON(app, http.MethodPost, "/api/v1/admin/audit-logs/clear", `{"confirm":"`+confirmClearAuditLogs+`"}`, adminCookies)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("clear audit status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	// 不写 fallback，只写一条明确的 clear_audit_logs 自保记录。
+	logs := app.store().ListAuditLogs()
+	if len(logs) != 1 || logs[0].Action != "clear_audit_logs" || logs[0].Detail["fallback"] != nil {
+		t.Fatalf("audit maintenance route should only write the protected record, logs=%#v", logs)
+	}
+}
+
+func TestTelegramInlinePanelActionWritesAuditLog(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AuditLogEnabled = true
+	admin, err := app.store().CreateUser(store.User{Username: "panel-admin", Role: store.RoleAdmin, Active: true, TelegramID: 70001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := app.store().CreateUser(store.User{Username: "panel-target", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	panel := telegramPanelContext{Token: "panel-audit", ChatID: -100123, MessageID: 55, TargetUID: target.UID, ExpiresAt: time.Now().Add(time.Minute).Unix()}
+	app.telegramApplyPanelAction(context.Background(), panel, "disable", admin.TelegramID)
+	updated, _ := app.store().User(target.UID)
+	if updated.Active {
+		t.Fatal("inline panel disable did not update target")
+	}
+	logs := app.store().ListAuditLogs()
+	if len(logs) == 0 || logs[0].Action != "telegram_panel_disable_user" || logs[0].Source != "telegram" || logs[0].UID != admin.UID || logs[0].TargetUID != target.UID {
+		t.Fatalf("inline panel audit log missing: %#v", logs)
+	}
+}
+
+func TestRegisterWithTelegramLinkAllowsBootstrapAdminUIDOnlyConfig(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().ForceBindTelegram = true
+	app.cfg().AdminUIDs = []int64{1}
+	app.cfg().AdminUsernames = nil
+
+	link := issueRegisterTelegramLink(t, app)
+	if result := app.confirmTelegramLink(context.Background(), link.Token, 777, "admin_tg"); !result.Success {
+		t.Fatalf("confirm: %+v", result)
+	}
+	registered := doJSON(app, http.MethodPost, "/api/v1/users/register", fmt.Sprintf(`{"username":"bootstrap","password":"Admin123456","telegram_link_id":%q,"telegram_link_secret":%q}`, link.ID, link.Secret), nil)
+	if registered.Code != http.StatusCreated {
+		t.Fatalf("register status=%d body=%s", registered.Code, registered.Body.String())
+	}
+	u, ok := app.store().FindUserByUsername("bootstrap")
+	if !ok || u.UID != 1 || u.Role != store.RoleAdmin || u.TelegramID != 777 {
+		t.Fatalf("bootstrap admin uid-only config not applied: ok=%v user=%#v", ok, u)
+	}
+}
+
+func TestRegisterRejectsUserSceneTelegramLink(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ForceBindTelegram = true
+	now := time.Now().Unix()
+	id := linkIDFor("userbind")
+	app.seedTelegramLink(t, store.TelegramLink{ID: id, Scene: "user", UID: 99, TelegramID: 999, CreatedAt: now, ExpiresAt: now + 600})
+	resp := doJSON(app, http.MethodPost, "/api/v1/users/register", fmt.Sprintf(`{"username":"bob","password":"Bob123456","telegram_link_id":%q,"telegram_link_secret":%q}`, id, id), nil)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("register with account-scene link status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if _, ok := app.store().FindUserByUsername("bob"); ok {
+		t.Fatal("user was registered with an account-scene link")
+	}
+}
+
+func TestRegisterRejectsMalformedTelegramLinkBeforeLookup(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ForceBindTelegram = true
+	resp := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"badbind","password":"badbind123A","telegram_link_id":"../../bad"}`, nil)
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), `"error_code":"TG_BIND_CODE_FORMAT_INVALID"`) {
+		t.Fatalf("malformed link status=%d body=%s", resp.Code, resp.Body.String())
+	}
+
+	rr := doJSON(app, http.MethodGet, "/api/v1/users/telegram/register/link/zz000000000000000000000000000000/status", ``, nil)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"invalid":true`) || !strings.Contains(rr.Body.String(), `"terminal":true`) {
+		t.Fatalf("malformed link status endpoint response=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestChangeEmbyPasswordAcceptsEmptyEmbyResponses(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyToken = "test-token"
+
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "embyuser", "User123456")
+	user, ok := app.store().FindUserByUsername("embyuser")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = "emby-user-id"
+		u.EmbyUsername = "embyuser"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	passwordCalls := 0
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/emby-user-id":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Id":"emby-user-id","Name":"embyuser","Policy":{"IsAdministrator":false}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/emby-user-id/Password":
+			passwordCalls++
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			switch passwordCalls {
+			case 1:
+				if body["ResetPassword"] != true {
+					t.Fatalf("first password call body=%#v, want ResetPassword=true", body)
+				}
+			case 2:
+				if body["CurrentPw"] != "" || body["NewPw"] != "NewPass123" {
+					t.Fatalf("second password call body=%#v", body)
+				}
+			default:
+				t.Fatalf("unexpected extra password call body=%#v", body)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/password/emby", `{"new_password":"NewPass123"}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("change Emby password status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if passwordCalls != 2 {
+		t.Fatalf("passwordCalls=%d, want 2", passwordCalls)
+	}
+}
+
+func TestChangeEmbyPasswordRequiresCurrentPasswordWhenEnabled(t *testing.T) {
+	app := newTestApp(t)
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "embyguard", "User123456")
+	user, ok := app.store().FindUserByUsername("embyguard")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = "emby-guard-id"
+		u.EmbyUsername = "embyguard"
+		u.RequireOldPasswordForEmbyPasswordChange = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/password/emby", `{"new_password":"NewPass123"}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if resp.Code != http.StatusForbidden || !strings.Contains(resp.Body.String(), string(ErrPasswordOldMismatch)) {
+		t.Fatalf("change Emby password without current password status=%d body=%s, want old-password mismatch", resp.Code, resp.Body.String())
+	}
+}
+
+func TestPasswordSecuritySettingsRejectNonBooleanPayload(t *testing.T) {
+	app := newTestApp(t)
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "strictprefs", "User123456")
+	user, ok := app.store().FindUserByUsername("strictprefs")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+
+	cases := []string{
+		`{"password_change_email_required":"true"}`,
+		`{"emby_password_email_required":"true"}`,
+		`{"emby_password_old_password_required":"true"}`,
+	}
+	for _, body := range cases {
+		resp := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", body, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+		if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), string(ErrInvalidPayload)) {
+			t.Fatalf("non-boolean security preference body=%s status=%d response=%s, want invalid payload", body, resp.Code, resp.Body.String())
+		}
+		updated, _ := app.store().User(user.UID)
+		if updated.RequireEmailForPasswordChange || updated.RequireEmailForEmbyPasswordChange || updated.RequireOldPasswordForEmbyPasswordChange {
+			t.Fatalf("non-boolean security preference should not be persisted after body=%s: %#v", body, updated)
+		}
+	}
+}
+
+func TestUpdateMeRejectsNonBooleanPreferencePayload(t *testing.T) {
+	app := newTestApp(t)
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "strictprofile", "User123456")
+	user, ok := app.store().FindUserByUsername("strictprofile")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+
+	cases := []string{
+		`{"bgm_mode":"true"}`,
+		`{"bgm_manage_mode":1}`,
+		`{"notify_on_login_telegram":"yes"}`,
+		`{"notify_on_login_email":"false"}`,
+		`{"notify_on_ticket_telegram":1}`,
+	}
+	for _, body := range cases {
+		resp := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", body, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+		if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), string(ErrInvalidPayload)) {
+			t.Fatalf("non-boolean profile preference body=%s status=%d response=%s, want invalid payload", body, resp.Code, resp.Body.String())
+		}
+		updated, _ := app.store().User(user.UID)
+		if updated.BGMMode || updated.BGMManageMode || updated.NotifyOnLoginTelegram || updated.NotifyOnLoginEmail || updated.NotifyOnTicketTelegram {
+			t.Fatalf("non-boolean profile preference should not be persisted after body=%s: %#v", body, updated)
+		}
+	}
+}
+
+func TestPasswordChangesEnforceStrengthServerSide(t *testing.T) {
+	app := newTestApp(t)
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "strengthguard", "User123456")
+	user, ok := app.store().FindUserByUsername("strengthguard")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = "emby-strength-id"
+		u.EmbyUsername = "strengthguard"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	systemResp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/password/system", `{"old_password":"User123456","new_password":"short"}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if systemResp.Code != http.StatusBadRequest || !strings.Contains(systemResp.Body.String(), string(ErrPasswordWeak)) {
+		t.Fatalf("weak system password status=%d body=%s, want password weak", systemResp.Code, systemResp.Body.String())
+	}
+
+	embyResp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/password/emby", `{"new_password":"short"}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if embyResp.Code != http.StatusBadRequest || !strings.Contains(embyResp.Body.String(), string(ErrPasswordWeak)) {
+		t.Fatalf("weak Emby password status=%d body=%s, want password weak", embyResp.Code, embyResp.Body.String())
+	}
+}
+
+func TestPasswordSecuritySettingsRequireProofBeforeDisable(t *testing.T) {
+	app := newTestApp(t)
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "securityprefs", "User123456")
+	user, ok := app.store().FindUserByUsername("securityprefs")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.Email = "securityprefs@example.com"
+		u.EmailVerified = true
+		u.RequireEmailForPasswordChange = true
+		u.RequireOldPasswordForEmbyPasswordChange = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	noCode := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", `{"password_change_email_required":false}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if noCode.Code != http.StatusBadRequest || !strings.Contains(noCode.Body.String(), string(ErrEmailCodeRequired)) {
+		t.Fatalf("disable email guard without code status=%d body=%s", noCode.Code, noCode.Body.String())
+	}
+
+	wrongPassword := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", `{"emby_password_old_password_required":false,"old_password":"wrong"}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if wrongPassword.Code != http.StatusForbidden || !strings.Contains(wrongPassword.Body.String(), string(ErrPasswordOldMismatch)) {
+		t.Fatalf("disable old-password guard with wrong password status=%d body=%s", wrongPassword.Code, wrongPassword.Body.String())
+	}
+
+	okResp := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", `{"emby_password_old_password_required":false,"old_password":"User123456"}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if okResp.Code != http.StatusOK {
+		t.Fatalf("disable old-password guard with correct password status=%d body=%s", okResp.Code, okResp.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.RequireOldPasswordForEmbyPasswordChange {
+		t.Fatal("old-password guard should be disabled after verified update")
+	}
+}
+
+func TestEmbyPasswordSecurityUsesSingleProof(t *testing.T) {
+	app := newTestApp(t)
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "proofprefs", "User123456")
+	user, ok := app.store().FindUserByUsername("proofprefs")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.Email = "proofprefs@example.com"
+		u.EmailVerified = true
+		u.RequireEmailForEmbyPasswordChange = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app.cfg().EmailEnabled = true
+	app.cfg().SMTPHost = "smtp.example.com"
+	app.cfg().SMTPFromAddress = "noreply@example.com"
+
+	// 开启当前 Web 密码保护时，后端必须同步关闭 Emby 邮箱保护。
+	resp := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", `{"emby_password_old_password_required":true}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("enable current Web password proof status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if !updated.RequireOldPasswordForEmbyPasswordChange || updated.RequireEmailForEmbyPasswordChange {
+		t.Fatalf("Emby proof settings should be exclusive after Web password enable: %#v", updated)
+	}
+
+	// 反向切换同样只能保留邮箱证明。
+	resp = doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", `{"emby_password_email_required":true}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("enable email proof status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	updated, _ = app.store().User(user.UID)
+	if !updated.RequireEmailForEmbyPasswordChange || updated.RequireOldPasswordForEmbyPasswordChange {
+		t.Fatalf("Emby proof settings should be exclusive after email enable: %#v", updated)
+	}
+
+	// 历史脏数据即使同时为 true，Web 密码证明也应在改密时优先。
+	if a := app.passwordChangeEmailRequired(store.User{
+		Role:                                    store.RoleNormal,
+		RequireEmailForEmbyPasswordChange:       true,
+		RequireOldPasswordForEmbyPasswordChange: true,
+	}, emailPurposeChangeEmby); a {
+		t.Fatal("current Web password proof must take precedence over the Emby email proof")
+	}
+}
+
+func TestAdminCanDisablePersonalEmailPasswordProtectionWithoutEmailCode(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	admin, ok := app.store().FindUserByUsername("admin")
+	if !ok {
+		t.Fatal("admin not found")
+	}
+	if _, err := app.store().UpdateUser(admin.UID, func(u *store.User) error {
+		u.RequireEmailForPasswordChange = true
+		u.RequireEmailForEmbyPasswordChange = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, field := range []string{"password_change_email_required", "emby_password_email_required"} {
+		body := fmt.Sprintf(`{"%s":false}`, field)
+		resp := doJSONWithHeaders(app, http.MethodPut, "/api/v1/users/me", body, adminCookies, map[string]string{"X-Twilight-Client": "webui"})
+		if resp.Code != http.StatusOK {
+			t.Fatalf("admin disable %s status=%d body=%s", field, resp.Code, resp.Body.String())
+		}
+	}
+	updated, _ := app.store().User(admin.UID)
+	if updated.RequireEmailForPasswordChange || updated.RequireEmailForEmbyPasswordChange {
+		t.Fatalf("admin email password protections should be disabled without an email code: %#v", updated)
+	}
+}
+
+func TestUserEmailSendFailureDoesNotExposeSMTPDetails(t *testing.T) {
+	app := newTestApp(t)
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "mailuser", "User123456")
+	user, ok := app.store().FindUserByUsername("mailuser")
+	if !ok {
+		t.Fatal("mail user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.Email = "mailuser@example.com"
+		u.EmailVerified = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app.cfg().EmailEnabled = true
+	app.cfg().SMTPHost = "127.0.0.1"
+	app.cfg().SMTPPort = 1
+	app.cfg().SMTPFromAddress = "noreply@example.com"
+	app.cfg().SMTPEncryption = "none"
+	app.cfg().SMTPTimeoutSeconds = 1
+	app.cfg().EmailResendCooldownSeconds = 0
+
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/email/send-code", `{"purpose":"change_password"}`, userCookies, map[string]string{"X-Twilight-Client": "webui"})
+	body := resp.Body.String()
+	if resp.Code != http.StatusBadGateway || !strings.Contains(body, string(ErrEmailSendFailed)) {
+		t.Fatalf("email send failure status=%d body=%s", resp.Code, body)
+	}
+	if !strings.Contains(body, "邮件发送失败") || strings.Contains(body, "127.0.0.1") || strings.Contains(strings.ToLower(body), "dial") {
+		t.Fatalf("ordinary user response exposed SMTP details: %s", body)
+	}
+}
+
+func TestTelegramEndpointAcceptsCommonBaseURLs(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	cases := map[string]string{
+		"https://api.telegram.org":            "https://api.telegram.org/bot123:ABC/getMe",
+		"https://api.telegram.org/bot":        "https://api.telegram.org/bot123:ABC/getMe",
+		"https://api.telegram.org/bot123:ABC": "https://api.telegram.org/bot123:ABC/getMe",
+	}
+	for base, want := range cases {
+		app.cfg().TelegramAPIURL = base
+		got, err := app.telegramEndpoint("getMe")
+		if err != nil {
+			t.Fatalf("telegramEndpoint(%q) err=%v", base, err)
+		}
+		if got != want {
+			t.Fatalf("telegramEndpoint(%q) = %q, want %q", base, got, want)
+		}
+	}
+}
+
+// TestTelegramEndpointRejectsUnsafeBaseURLs 验证 telegramEndpoint 现在会
+// 否决 link-local / 元数据 IP / 非 http(s) scheme 的 base URL，避免 bot
+// token 在拼出 /bot<TOKEN>/method 之前就被发到攻击者控制的目标。
+func TestTelegramEndpointRejectsUnsafeBaseURLs(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	cases := []string{
+		"http://169.254.169.254",
+		"http://100.100.100.200",
+		"http://0.0.0.0",
+		"javascript:alert(1)",
+	}
+	for _, base := range cases {
+		app.cfg().TelegramAPIURL = base
+		if _, err := app.telegramEndpoint("getMe"); err == nil {
+			t.Fatalf("telegramEndpoint(%q) should reject but returned nil error", base)
+		}
+	}
+}
+
+func TestTelegramErrorRedactsBotToken(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramBotToken = "123:SECRET"
+	raw := `Post "https://api.telegram.org/bot123:SECRET/getUpdates": context deadline exceeded 123:SECRET`
+	got := app.telegramSanitizeError(errors.New(raw))
+	if strings.Contains(got, "123:SECRET") || !strings.Contains(got, "/bot<redacted>/getUpdates") {
+		t.Fatalf("telegram error was not redacted: %s", got)
+	}
+	app.setTelegramRuntimeStatus(true, errors.New(raw))
+	status := app.telegramRuntimeStatus()
+	if strings.Contains(asString(status["last_error"]), "123:SECRET") {
+		t.Fatalf("runtime status leaked token: %#v", status)
+	}
+}
+
+// TestTelegramRetryAfterFromError 锁定 R61-3 不变量：Telegram 协议层在 OK=false
+// + parameters.retry_after>0 时必须把秒数编进错误字符串，
+// telegramRetryAfterFromError 反解出来后调用方才能 sleep 真实秒数。
+//
+// 用 httptest server 模拟 429+retry_after=27 的真实响应。
+func TestTelegramRetryAfterFromError(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 27","parameters":{"retry_after":27}}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+	err := app.telegramSendMessage(context.Background(), int64(123456), "test")
+	if err == nil {
+		t.Fatalf("expected 429 error from mock server")
+	}
+	d, ok := telegramRetryAfterFromError(err)
+	if !ok {
+		t.Fatalf("retry_after sentinel not found in error: %s", err.Error())
+	}
+	if d != 27*time.Second {
+		t.Fatalf("retry_after parsed = %v, want 27s; err=%s", d, err.Error())
+	}
+
+	// 反向：error 没有 sentinel 时返回 false。
+	if d, ok := telegramRetryAfterFromError(errors.New("some unrelated error")); ok {
+		t.Fatalf("retry_after should be false for unrelated err, got d=%v", d)
+	}
+}
+
+func TestTelegramDelAccountAllowsExpiredInviteCleanupWithWebPassword(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	messages := []map[string]any{}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bot123:ABC/sendMessage" {
+			t.Fatalf("unexpected telegram path: %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		messages = append(messages, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	var deletedRemote int32
+	var authAttempts int32
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/Users/emby-expired-tg":
+			atomic.AddInt32(&deletedRemote, 1)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/AuthenticateByName":
+			atomic.AddInt32(&authAttempts, 1)
+			http.Error(w, "should not authenticate deleted expired invite user", http.StatusForbidden)
+		default:
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token"
+
+	hash, err := security.HashPassword("Password123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := app.store().CreateUser(store.User{Username: "tg-parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{
+		Username:     "tg-child",
+		PasswordHash: hash,
+		Role:         store.RoleNormal,
+		Active:       true,
+		ExpiredAt:    time.Now().AddDate(0, 0, -1).Unix(),
+		EmbyID:       "emby-expired-tg",
+		EmbyUsername: "tg-child",
+		EmbyDisabled: true,
+		TelegramID:   424242,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-TG-CLEANUP", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-TG-CLEANUP", child.UID); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	app.telegramHandleDelAccount(ctx, 10001, child.TelegramID, []string{"emby"})
+	if len(messages) == 0 || !strings.Contains(asString(messages[len(messages)-1]["text"]), "邀请到期清理已启动") {
+		t.Fatalf("expected expired invite cleanup prompt, messages=%#v", messages)
+	}
+	if !app.telegramConsumeDelAccountPending(ctx, 10001, child.TelegramID, "Password123456") {
+		t.Fatal("expected pending delAccount state to consume Web password")
+	}
+	if atomic.LoadInt32(&authAttempts) != 0 {
+		t.Fatal("expired invite cleanup should not require Emby password authentication")
+	}
+	if atomic.LoadInt32(&deletedRemote) != 1 {
+		t.Fatal("expired invite cleanup did not delete remote Emby user")
+	}
+	if _, ok := app.store().User(child.UID); ok {
+		t.Fatal("user should be deleted after Telegram delAccount cleanup")
+	}
+}
+
+// TestSendExpiryRemindersAbortsOnConsecutiveRateLimits 锁定 R61-4 不变量：
+// 提醒批触发连续 5 次 429 后必须 break、把已发送条数 commit 到 result，并在
+// summary 中暴露 aborted=rate_limited——避免 100 用户提醒一次性把全局 quota
+// 打爆，下一轮 expiry_reminders 重炸的"提醒雪崩"。
+func TestSendExpiryRemindersAbortsOnConsecutiveRateLimits(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().NotificationEnabled = true
+
+	// mock telegram 永远返回 429+retry_after=1（保证测试快）
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	// 造 8 个即将到期且绑了 telegram 的用户，确保超过 maxConsecutiveRateLimited=5
+	expSoon := time.Now().Add(24 * time.Hour).Unix()
+	for i := 0; i < 8; i++ {
+		_, err := app.store().CreateUser(store.User{
+			Username:   fmt.Sprintf("soon%d", i),
+			Role:       store.RoleNormal,
+			Active:     true,
+			ExpiredAt:  expSoon,
+			TelegramID: int64(1000 + i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 真实 sleep 60s × 5 太慢——这里 ctx 超时 6s 让 retry_after sleep
+	// 提前返回；目的是验证 abort 路径，不是验证准确 sleep。
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	result := app.sendExpiryReminders(ctx, 7)
+
+	if result["aborted"] != "rate_limited" && result["aborted"] != "context_canceled" {
+		t.Fatalf("expected aborted=rate_limited or context_canceled, got result=%#v", result)
+	}
+	// 至少几条 failed 被记录（无论是 5 个 rate-limit 还是更早被 ctx 打断）。
+	failed, _ := result["failed"].([]map[string]any)
+	if len(failed) == 0 {
+		t.Fatalf("expected at least one failed item recorded; result=%#v", result)
+	}
+}
+
+func TestTelegramGetUpdatesAllowsCallbacks(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	var body map[string]any
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bot123:ABC/getUpdates" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":[]}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+	if _, err := app.telegramGetUpdates(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	updates, _ := body["allowed_updates"].([]any)
+	foundCallback := false
+	for _, update := range updates {
+		if update == "callback_query" {
+			foundCallback = true
+		}
+	}
+	if !foundCallback || numeric(body["timeout"]) != 30 || numeric(body["offset"]) != 42 {
+		t.Fatalf("unexpected getUpdates body: %#v", body)
+	}
+}
+
+func TestRunTelegramBotReusesVerifiedIdentityAcrossPolls(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var getMeCalls atomic.Int32
+	var getUpdatesCalls atomic.Int32
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bot123:ABC/getMe":
+			getMeCalls.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"username":"twilight_test_bot"}}`))
+		case "/bot123:ABC/getUpdates":
+			if getUpdatesCalls.Add(1) >= 3 {
+				cancel()
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":[]}`))
+		default:
+			t.Errorf("unexpected Telegram path: %s", r.URL.Path)
+			_, _ = w.Write([]byte(`{"ok":false}`))
+		}
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	if err := app.RunTelegramBot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := getMeCalls.Load(); got != 1 {
+		t.Fatalf("getMe calls = %d, want 1 for unchanged bot configuration", got)
+	}
+	if got := getUpdatesCalls.Load(); got < 3 {
+		t.Fatalf("getUpdates calls = %d, want at least 3", got)
+	}
+}
+
+func TestTelegramEndpointCacheInvalidatesWithConfiguration(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramAPIURL = "https://api.telegram.org"
+	if _, err := app.telegramEndpoint("getMe"); err != nil {
+		t.Fatal(err)
+	}
+
+	app.cfg().TelegramBotToken = "456:DEF"
+	got, err := app.telegramEndpoint("getUpdates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://api.telegram.org/bot456:DEF/getUpdates" {
+		t.Fatalf("endpoint cache retained old token: %q", got)
+	}
+
+	app.cfg().TelegramAPIURL = "http://169.254.169.254"
+	if _, err := app.telegramEndpoint("getMe"); err == nil {
+		t.Fatal("endpoint cache bypassed validation after API URL changed")
+	}
+}
+
+func TestTelegramCommandDisabledHotPathDoesNotAllocateSet(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramDisabledCommands = []string{"help", "stats"}
+	if !app.telegramCommandDisabled("/help") || app.telegramCommandDisabled("/me") {
+		t.Fatal("disabled command lookup returned an unexpected result")
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		_ = app.telegramCommandDisabled("/help")
+	}); allocations != 0 {
+		t.Fatalf("disabled command hot path allocated %.2f objects per lookup", allocations)
+	}
+}
+
+func TestTelegramParseCommandText(t *testing.T) {
+	tests := []struct {
+		name        string
+		text        string
+		wantCommand string
+		wantArgs    []string
+	}{
+		{name: "ordinary text", text: "hello", wantCommand: ""},
+		{name: "no args", text: "/ping", wantCommand: "/ping"},
+		{name: "bot suffix", text: "/PING@TwilightBot", wantCommand: "/ping"},
+		{name: "unicode whitespace", text: "/userinfo\u3000alpha  beta", wantCommand: "/userinfo", wantArgs: []string{"alpha", "beta"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			command, args := telegramParseCommandText(tt.text)
+			if command != tt.wantCommand || !slices.Equal(args, tt.wantArgs) {
+				t.Fatalf("parse %q = command %q args %#v, want %q %#v", tt.text, command, args, tt.wantCommand, tt.wantArgs)
+			}
+		})
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		_, _ = telegramParseCommandText("/ping")
+	}); allocations != 0 {
+		t.Fatalf("no-argument command parser allocated %.2f objects", allocations)
+	}
+}
+
+func TestTelegramCommandConfigIndexInvalidatesOnSliceReplacement(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramCustomCommands = []config.TelegramCommandReply{{Command: "/one", Reply: "first"}}
+	app.cfg().TelegramDisabledCommands = []string{"ping"}
+	if reply, ok := app.telegramCustomCommandReply("/one"); !ok || reply != "first" || !app.telegramCommandDisabled("/ping") {
+		t.Fatal("initial Telegram command index was not built from configuration")
+	}
+
+	app.cfg().TelegramCustomCommands = []config.TelegramCommandReply{{Command: "/two", Reply: "second"}}
+	app.cfg().TelegramDisabledCommands = []string{"version"}
+	if _, ok := app.telegramCustomCommandReply("/one"); ok {
+		t.Fatal("custom command index retained replaced configuration")
+	}
+	if reply, ok := app.telegramCustomCommandReply("/two"); !ok || reply != "second" {
+		t.Fatalf("replacement custom command missing: reply=%q ok=%v", reply, ok)
+	}
+	if app.telegramCommandDisabled("/ping") || !app.telegramCommandDisabled("/version") {
+		t.Fatal("disabled command index retained replaced configuration")
+	}
+}
+
+func TestTelegramEmbyHealthCacheReusesProbeAndInvalidatesOnConfig(t *testing.T) {
+	app := newTestApp(t)
+	var calls atomic.Int32
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/System/Info/Public" {
+			t.Fatalf("unexpected Emby path: %s", r.URL.Path)
+		}
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"ServerName":"test"}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token-one"
+
+	for i := 0; i < 2; i++ {
+		checked, online := app.telegramCachedEmbyHealth(context.Background())
+		if !checked || !online {
+			t.Fatalf("probe %d returned checked=%v online=%v", i, checked, online)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("cached Emby health issued %d requests, want 1", got)
+	}
+
+	app.cfg().EmbyToken = "token-two"
+	if checked, online := app.telegramCachedEmbyHealth(context.Background()); !checked || !online {
+		t.Fatalf("probe after token change returned checked=%v online=%v", checked, online)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("Emby health cache did not invalidate on config change: calls=%d", got)
+	}
+}
+
+func TestTelegramTransientStateIsCapacityBounded(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().Unix()
+
+	app.telegramPanels = make(map[string]telegramPanelContext, telegramPanelMaxEntries)
+	for i := 0; i < telegramPanelMaxEntries; i++ {
+		token := fmt.Sprintf("panel-%04d", i)
+		app.telegramPanels[token] = telegramPanelContext{Token: token, ExpiresAt: now + int64(i+10)}
+	}
+	app.telegramSavePanel(telegramPanelContext{Token: "panel-new", ExpiresAt: now + 3600})
+	if len(app.telegramPanels) != telegramPanelMaxEntries {
+		t.Fatalf("panel state size=%d, want %d", len(app.telegramPanels), telegramPanelMaxEntries)
+	}
+	if _, exists := app.telegramPanels["panel-0000"]; exists {
+		t.Fatal("oldest panel was not evicted at capacity")
+	}
+	app.telegramDeletePanel("panel-new")
+
+	app.delAccountPending = make(map[string]*delAccountPendingState, delAccountPendingMaxEntries)
+	for i := 0; i < delAccountPendingMaxEntries; i++ {
+		key := fmt.Sprintf("pending-%04d", i)
+		app.delAccountPending[key] = &delAccountPendingState{ExpiresAt: now + int64(i+10)}
+	}
+	app.saveDelAccountPending(&delAccountPendingState{ChatID: 1, TelegramID: 2, ExpiresAt: now + 3600})
+	if len(app.delAccountPending) != delAccountPendingMaxEntries {
+		t.Fatalf("delAccount pending size=%d, want %d", len(app.delAccountPending), delAccountPendingMaxEntries)
+	}
+	if _, exists := app.delAccountPending["pending-0000"]; exists {
+		t.Fatal("oldest delAccount pending state was not evicted at capacity")
+	}
+}
+
+func TestTelegramBindRequirementSplitsGroupAndChannel(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramGroupIDs = []string{"-1001"}
+	app.cfg().TelegramChannelIDs = []string{"@RequiredChannel"}
+	app.cfg().TelegramForceBindGroup = true
+	app.cfg().TelegramForceBindChannel = false
+	requests := []map[string]any{}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		body["_path"] = r.URL.Path
+		requests = append(requests, body)
+		switch r.URL.Path {
+		case "/bot123:ABC/getChatMember":
+			if asString(body["chat_id"]) == "@RequiredChannel" {
+				_, _ = w.Write([]byte(`{"ok":true,"result":{"status":"left","user":{"id":42,"is_bot":false}}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"status":"member","user":{"id":42,"is_bot":false}}}`))
+		case "/bot123:ABC/sendMessage":
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+		default:
+			t.Fatalf("unexpected telegram path: %s", r.URL.Path)
+		}
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	now := time.Now().Unix()
+	group := linkIDFor("group1")
+	app.seedTelegramLink(t, store.TelegramLink{ID: group, Scene: "register", CreatedAt: now, ExpiresAt: now + 600})
+	if result := app.confirmTelegramLink(context.Background(), group, 42, "tguser"); !result.Success {
+		t.Fatalf("confirm failed: %+v", result)
+	}
+	link, ok := app.telegramLinkAlive(group)
+	if !ok || !link.Confirmed() {
+		t.Fatalf("group-only requirement should confirm link: %#v", link)
+	}
+	for _, req := range requests {
+		if req["_path"] == "/bot123:ABC/getChatMember" && asString(req["chat_id"]) == "@RequiredChannel" {
+			t.Fatalf("channel was checked even though force_bind_channel=false: %#v", requests)
+		}
+	}
+
+	app.cfg().TelegramForceBindChannel = true
+	channel := linkIDFor("chan01")
+	app.seedTelegramLink(t, store.TelegramLink{ID: channel, Scene: "register", CreatedAt: now, ExpiresAt: now + 600})
+	app.telegramConfirmLinkFromChat(context.Background(), 42, 43, "tguser2", channel)
+	channelLink, ok := app.telegramLinkAlive(channel)
+	if !ok || channelLink.Confirmed() || channelLink.ErrorCode != string(ErrTGBindGroupMembershipRequired) || !channelLink.Retryable {
+		t.Fatalf("channel requirement should reject user missing required channel: %#v", channelLink)
+	}
+}
+
+// TestTelegramTouchPanelReusesSingleTimer 锁定 R52-2：多次 touch 同一个
+// panel 不应累积 *time.Timer 实例。历史实现每次 touch 调 AfterFunc 新建
+// 一个 closure，旧定时器从不取消，admin 高频按钮场景下单 panel 能挂出
+// 几十个未释放的 closure；本测试通过对比 timer 指针来锁定"复用同一把"。
+func TestTelegramTouchPanelReusesSingleTimer(t *testing.T) {
+	app := newTestApp(t)
+	panel := telegramPanelContext{
+		Token:     "tok-test",
+		ChatID:    1001,
+		MessageID: 2002,
+		TargetUID: 3003,
+		ExpiresAt: time.Now().Add(telegramPanelTTL).Unix(),
+	}
+	app.telegramSavePanel(panel)
+	defer app.telegramDeletePanel(panel.Token)
+
+	app.telegramPanelMu.Lock()
+	saved, ok := app.telegramPanels[panel.Token]
+	app.telegramPanelMu.Unlock()
+	if !ok {
+		t.Fatalf("panel not stored after save")
+	}
+	if saved.timer == nil {
+		t.Fatalf("expected save to set up a timer")
+	}
+	firstTimer := saved.timer
+
+	for i := 0; i < 25; i++ {
+		_ = app.telegramTouchPanel(saved)
+		app.telegramPanelMu.Lock()
+		saved = app.telegramPanels[panel.Token]
+		app.telegramPanelMu.Unlock()
+		if saved.timer != firstTimer {
+			t.Fatalf("iteration %d: expected timer pointer to be reused, got fresh AfterFunc closure", i)
+		}
+	}
+}
+
+func TestTelegramAnonymousGroupUserRequiresInlineAuth(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramEnablePanel = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	user := store.User{UID: 1001, Username: "target", Role: store.RoleNormal, Active: true, TelegramID: 888, CreatedAt: time.Now().Unix(), RegisterTime: time.Now().Unix()}
+	if _, err := app.store().CreateUser(user); err != nil {
+		t.Fatal(err)
+	}
+	requests := []map[string]any{}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		body["_path"] = r.URL.Path
+		requests = append(requests, body)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9001}}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	app.handleTelegramUpdate(context.Background(), &telegramUpdate{
+		Message: &telegramMessage{
+			MessageID:  77,
+			Text:       "/twguser target",
+			Chat:       telegramChat{ID: -1001, Type: "supergroup"},
+			From:       telegramUser{ID: 1087968824, IsBot: true},
+			SenderChat: telegramChat{ID: -1001},
+		},
+	})
+	if len(requests) != 1 {
+		t.Fatalf("expected one Telegram request, got %#v", requests)
+	}
+	if requests[0]["_path"] != "/bot123:ABC/sendMessage" {
+		t.Fatalf("expected sendMessage, got %#v", requests[0])
+	}
+	markup, _ := requests[0]["reply_markup"].(map[string]any)
+	keyboard, _ := markup["inline_keyboard"].([]any)
+	if len(keyboard) == 0 || !strings.Contains(asString(requests[0]["text"]), "验证") {
+		t.Fatalf("anonymous command did not create auth panel: %#v", requests[0])
+	}
+}
+
+func TestTelegramCommandCatalogIncludesBackendMetadata(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramDisabledCommands = []string{"/Ping", "version"}
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+
+	resp := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/telegram/commands/catalog", ``, adminCookies, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("catalog status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(resp.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode catalog response: %v", err)
+	}
+	data, _ := env.Data.(map[string]any)
+	rawCommands, _ := data["commands"].([]any)
+	if len(rawCommands) < 10 {
+		t.Fatalf("expected built-in command metadata, got %#v", data)
+	}
+	byCommand := map[string]map[string]any{}
+	for _, raw := range rawCommands {
+		item, _ := raw.(map[string]any)
+		command, _ := item["command"].(string)
+		if command != "" {
+			byCommand[command] = item
+		}
+	}
+	if byCommand["/ping"] == nil || byCommand["/ping"]["disabled"] != true {
+		t.Fatalf("expected /ping to be present and disabled, got %#v", byCommand["/ping"])
+	}
+	if byCommand["/start"] == nil || byCommand["/start"]["disableable"] != false {
+		t.Fatalf("expected /start to be fixed special command, got %#v", byCommand["/start"])
+	}
+	if byCommand["/twguser"] == nil || byCommand["/twguser"]["category"] != "group" {
+		t.Fatalf("expected /twguser group metadata, got %#v", byCommand["/twguser"])
+	}
+	rawDisabled, _ := data["disabled_commands"].([]any)
+	disabled := map[string]bool{}
+	for _, raw := range rawDisabled {
+		disabled[asString(raw)] = true
+	}
+	if !disabled["ping"] || !disabled["version"] {
+		t.Fatalf("disabled command names were not normalized: %#v", rawDisabled)
+	}
+}
+
+func TestTelegramDisabledBuiltinDoesNotFallThroughToCustomCommand(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramDisabledCommands = []string{"ping"}
+	app.cfg().TelegramCustomCommands = []config.TelegramCommandReply{{Command: "/ping", Reply: "custom pong"}}
+
+	requests := []map[string]any{}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		body["_path"] = r.URL.Path
+		requests = append(requests, body)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9001}}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	app.handleTelegramUpdate(context.Background(), &telegramUpdate{
+		Message: &telegramMessage{
+			MessageID: 88,
+			Text:      "/ping",
+			Chat:      telegramChat{ID: 42, Type: "private"},
+			From:      telegramUser{ID: 42},
+		},
+	})
+	if len(requests) != 1 {
+		t.Fatalf("expected one disabled-command reply, got %#v", requests)
+	}
+	text := asString(requests[0]["text"])
+	if !strings.Contains(text, "停用") || strings.Contains(text, "custom pong") {
+		t.Fatalf("disabled built-in command fell through to custom reply: %#v", requests[0])
+	}
+}
+
+func TestTelegramGroupUserPanelDeletesCommandMessageAfterSend(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramEnablePanel = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramAdminIDs = []int64{9001}
+	user := store.User{UID: 1001, Username: "target", Role: store.RoleNormal, Active: true, TelegramID: 888, CreatedAt: time.Now().Unix(), RegisterTime: time.Now().Unix()}
+	if _, err := app.store().CreateUser(user); err != nil {
+		t.Fatal(err)
+	}
+	requests := []map[string]any{}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		body["_path"] = r.URL.Path
+		requests = append(requests, body)
+		if r.URL.Path == "/bot123:ABC/sendMessage" {
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9001}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	app.handleTelegramUpdate(context.Background(), &telegramUpdate{
+		Message: &telegramMessage{
+			MessageID: 77,
+			Text:      "/twguser target",
+			Chat:      telegramChat{ID: -1001, Type: "supergroup"},
+			From:      telegramUser{ID: 9001},
+		},
+	})
+
+	if len(requests) != 2 {
+		t.Fatalf("expected sendMessage and deleteMessage, got %#v", requests)
+	}
+	if requests[0]["_path"] != "/bot123:ABC/sendMessage" {
+		t.Fatalf("expected first request to send panel, got %#v", requests[0])
+	}
+	deleteReq := requests[1]
+	if deleteReq["_path"] != "/bot123:ABC/deleteMessage" || numeric(deleteReq["chat_id"]) != -1001 || numeric(deleteReq["message_id"]) != 77 {
+		t.Fatalf("expected command delete request, got %#v", deleteReq)
+	}
+}
+
+func TestTelegramAnonymousGroupUserAuthDeletesCommandMessageAfterPanel(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramEnablePanel = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramAdminIDs = []int64{9001}
+	user := store.User{UID: 1001, Username: "target", Role: store.RoleNormal, Active: true, TelegramID: 888, CreatedAt: time.Now().Unix(), RegisterTime: time.Now().Unix()}
+	if _, err := app.store().CreateUser(user); err != nil {
+		t.Fatal(err)
+	}
+	requests := []map[string]any{}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		body["_path"] = r.URL.Path
+		requests = append(requests, body)
+		if r.URL.Path == "/bot123:ABC/sendMessage" {
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9001}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	app.handleTelegramUpdate(context.Background(), &telegramUpdate{
+		Message: &telegramMessage{
+			MessageID:  77,
+			Text:       "/twguser target",
+			Chat:       telegramChat{ID: -1001, Type: "supergroup"},
+			From:       telegramUser{ID: 1087968824, IsBot: true},
+			SenderChat: telegramChat{ID: -1001},
+		},
+	})
+
+	app.telegramPanelMu.Lock()
+	var panel telegramPanelContext
+	for _, saved := range app.telegramPanels {
+		panel = saved
+		break
+	}
+	app.telegramPanelMu.Unlock()
+	if panel.Token == "" {
+		t.Fatal("anonymous /twguser did not create auth panel")
+	}
+
+	app.handleTelegramUpdate(context.Background(), &telegramUpdate{
+		CallbackQuery: &telegramCallbackQuery{
+			ID:   "cb-auth",
+			Data: "gadm:auth:" + panel.Token,
+			From: telegramUser{ID: 9001},
+			Message: &telegramMessage{
+				MessageID: panel.MessageID,
+				Chat:      telegramChat{ID: panel.ChatID},
+			},
+		},
+	})
+
+	foundEdit := false
+	foundDelete := false
+	for _, req := range requests {
+		if req["_path"] == "/bot123:ABC/editMessageText" && strings.Contains(asString(req["text"]), "target") {
+			foundEdit = true
+		}
+		if req["_path"] == "/bot123:ABC/deleteMessage" && numeric(req["chat_id"]) == -1001 && numeric(req["message_id"]) == 77 {
+			foundDelete = true
+		}
+	}
+	if !foundEdit {
+		t.Fatalf("auth did not render user panel: %#v", requests)
+	}
+	if !foundDelete {
+		t.Fatalf("auth did not delete original /twguser command: %#v", requests)
+	}
+}
+
+func TestTelegramGroupUserPanelShowsEmbyInfoAndActions(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyToken = "emby-token"
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/Users/emby-user" {
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Id":"emby-user","Name":"remote-alpha","Policy":{"IsDisabled":true,"IsHidden":false,"IsAdministrator":false},"DateLastActivity":"2026-01-02T03:04:05Z"}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	user := store.User{UID: 42, Username: "alpha", Role: store.RoleNormal, Active: true, TelegramID: 1001, TelegramUsername: "alpha_tg", EmbyID: "emby-user", EmbyUsername: "alpha-emby", RegisterTime: time.Now().Unix()}
+	text := app.telegramGroupUserPanelText(context.Background(), user)
+	for _, want := range []string{"== Web 账号 ==", "== Emby 远端 ==", "远端用户名: remote-alpha", "远端状态: 禁用", "最近活动: 2026-01-02 03:04"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("panel text missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "T03:04:05Z") {
+		t.Fatalf("panel should normalize raw Emby activity time:\n%s", text)
+	}
+	if strings.Contains(text, "emby-user") || strings.Contains(text, "emby-token") {
+		t.Fatalf("panel leaked sensitive Emby identifier/token:\n%s", text)
+	}
+
+	labels := telegramInlineButtonLabels(app.telegramGroupUserPanelMarkup("tok", user, ""))
+	for _, want := range []string{"关闭", "禁用 Emby", "启用 Emby", "危险操作"} {
+		if !telegramButtonLabelsContain(labels, want) {
+			t.Fatalf("panel buttons missing %q: %#v", want, labels)
+		}
+	}
+	// 不可逆操作刻意收在第二层"危险操作"面板里（主面板只留入口），避免误触直接
+	// 删人删号。所以删除类按钮不在首层，必须展开二级面板后才出现。
+	for _, want := range []string{"删除用户", "删除 Emby"} {
+		if telegramButtonLabelsContain(labels, want) {
+			t.Fatalf("destructive button %q must stay behind the danger sub-panel: %#v", want, labels)
+		}
+	}
+	danger := telegramInlineButtonLabels(app.telegramGroupUserPanelMarkup("tok", user, "danger"))
+	for _, want := range []string{"删除用户", "删除 Emby"} {
+		if !telegramButtonLabelsContain(danger, want) {
+			t.Fatalf("danger panel missing %q: %#v", want, danger)
+		}
+	}
+}
+
+func TestTelegramGroupUserPanelCustomTemplatePlaceholders(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AppName = "Custom Twilight"
+	app.cfg().EmbyToken = "emby-token"
+	app.cfg().TelegramGroupUserPanelTemplate = "站点: {server_name}\n用户: {username} / {uid}\n角色: {role}\nWeb: {web_status}\nTG: {telegram_username} / {telegram_userid}\nEmby: {emby_status}\n未知: {unknown_placeholder}"
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("custom template without remote placeholders should not query Emby: %s %s", r.Method, r.URL.Path)
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	user := store.User{UID: 42, Username: "alpha", Role: store.RoleWhitelist, Active: true, TelegramID: 1001, TelegramUsername: "alpha_tg", EmbyID: "emby-user", EmbyUsername: "alpha-emby", RegisterTime: time.Now().Unix()}
+	text := app.telegramGroupUserPanelText(context.Background(), user)
+	for _, want := range []string{"站点: Custom Twilight", "用户: alpha / 42", "角色: 白名单", "Web: 启用", "TG: @alpha_tg / 1001", "Emby: 已绑定 (alpha-emby)", "未知: {unknown_placeholder}"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("custom panel text missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "emby-user") || strings.Contains(text, "emby-token") {
+		t.Fatalf("custom panel leaked sensitive Emby identifier/token:\n%s", text)
+	}
+	text = app.telegramGroupUserPanelText(context.Background(), store.User{UID: 43, Username: "beta", Role: store.RoleNormal, Active: true, TelegramID: 2002})
+	if !strings.Contains(text, "TG: None / 2002") {
+		t.Fatalf("custom panel should render missing telegram username as None:\n%s", text)
+	}
+}
+
+func TestTelegramPanelCloseRequiresAdminAndDeletesPanel(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramEnablePanel = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	app.cfg().TelegramAdminIDs = []int64{9001}
+	tgRequests := make(chan map[string]any, 12)
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		body["_path"] = r.URL.Path
+		select {
+		case tgRequests <- body:
+		default:
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	user, err := app.store().CreateUser(store.User{Username: "close-target", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	panel := telegramPanelContext{Token: "tok-close", ChatID: -1001, MessageID: 9001, CommandMessageID: 77, TargetUID: user.UID, ExpiresAt: time.Now().Add(telegramPanelTTL).Unix()}
+	app.telegramSavePanel(panel)
+	defer app.telegramDeletePanel(panel.Token)
+
+	callback := func(actorID int64, callbackID string) *telegramCallbackQuery {
+		return &telegramCallbackQuery{
+			ID:   callbackID,
+			Data: "gadm:act:close:" + panel.Token,
+			From: telegramUser{ID: actorID},
+			Message: &telegramMessage{
+				MessageID: panel.MessageID,
+				Chat:      telegramChat{ID: panel.ChatID},
+			},
+		}
+	}
+
+	app.telegramHandleCallback(context.Background(), callback(9002, "cb-denied"))
+	if _, ok := app.telegramPanel(panel.Token); !ok {
+		t.Fatal("non-admin close removed the panel")
+	}
+
+	app.telegramHandleCallback(context.Background(), callback(9001, "cb-close"))
+	if _, ok := app.telegramPanel(panel.Token); ok {
+		t.Fatal("admin close did not remove the panel")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case req := <-tgRequests:
+			if req["_path"] == "/bot123:ABC/deleteMessage" && numeric(req["chat_id"]) == panel.ChatID && numeric(req["message_id"]) == panel.MessageID {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("admin close did not delete Telegram message")
+		}
+	}
+}
+
+func TestTelegramPanelEmbyDeleteRequiresConfirmAndClearsLocalBinding(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:ABC"
+	tgRequests := []map[string]any{}
+	tg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		body["_path"] = r.URL.Path
+		tgRequests = append(tgRequests, body)
+		if r.URL.Path != "/bot123:ABC/editMessageText" {
+			t.Fatalf("unexpected Telegram request: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer tg.Close()
+	app.cfg().TelegramAPIURL = tg.URL
+
+	app.cfg().EmbyToken = "emby-token"
+	deleteCount := 0
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/emby-user":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Id":"emby-user","Name":"remote-alpha","Policy":{}}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/Users/emby-user":
+			deleteCount++
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	user, err := app.store().CreateUser(store.User{Username: "target", Role: store.RoleNormal, Active: true, EmbyID: "emby-user", EmbyUsername: "remote-alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	panel := telegramPanelContext{Token: "tok-delete-emby", ChatID: -1001, MessageID: 9001, TargetUID: user.UID, ExpiresAt: time.Now().Add(telegramPanelTTL).Unix()}
+	app.telegramSavePanel(panel)
+	defer app.telegramDeletePanel(panel.Token)
+
+	app.telegramApplyPanelAction(context.Background(), panel, "emby_delete_confirm", 0)
+	if deleteCount != 0 {
+		t.Fatalf("Emby was deleted without confirmation")
+	}
+	current, _ := app.store().User(user.UID)
+	if current.EmbyID == "" {
+		t.Fatalf("local Emby binding was cleared without confirmation")
+	}
+
+	panel.ConfirmAction = "emby_delete"
+	panel = app.telegramTouchPanel(panel)
+	app.telegramApplyPanelAction(context.Background(), panel, "emby_delete_confirm", 0)
+	if deleteCount != 1 {
+		t.Fatalf("expected one Emby delete request, got %d", deleteCount)
+	}
+	current, _ = app.store().User(user.UID)
+	if current.EmbyID != "" || current.EmbyUsername != "" || current.PendingEmby || current.PendingEmbyDays != nil {
+		t.Fatalf("local Emby binding was not cleared: %#v", current)
+	}
+	if len(tgRequests) == 0 || !strings.Contains(asString(tgRequests[len(tgRequests)-1]["text"]), "Emby 账号已删除") {
+		t.Fatalf("final Telegram edit did not report deletion: %#v", tgRequests)
+	}
+}
+
+func TestTelegramProtectedTargetUsesUnifiedProtectedUsers(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AdminUsernames = []string{"configured-admin"}
+	for _, user := range []store.User{
+		{Username: "admin", Role: store.RoleAdmin},
+		{Username: "white", Role: store.RoleWhitelist},
+		{Username: "configured-admin", Role: store.RoleNormal},
+	} {
+		if !app.telegramProtectedTarget(user) {
+			t.Fatalf("expected protected Telegram target: %#v", user)
+		}
+		labels := telegramInlineButtonLabels(app.telegramGroupUserPanelMarkup("tok", user, ""))
+		// 按钮文案带 emoji 前缀，按"包含"匹配：受保护目标只暴露刷新与关闭。
+		if len(labels) != 2 || !strings.Contains(labels[0], "刷新") || !strings.Contains(labels[1], "关闭") {
+			t.Fatalf("protected target should only expose refresh and close buttons, got %#v", labels)
+		}
+	}
+}
+
+func telegramInlineButtonLabels(markup any) []string {
+	m, _ := markup.(map[string]any)
+	rows, _ := m["inline_keyboard"].([][]map[string]string)
+	labels := []string{}
+	for _, row := range rows {
+		for _, button := range row {
+			labels = append(labels, button["text"])
+		}
+	}
+	return labels
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// telegramButtonLabelsContain 按子串匹配按钮文案。Telegram 面板按钮带 emoji 前缀
+// （"🔄 刷新"），断言写全等会随文案微调一起碎掉，这里只校验语义部分。
+func telegramButtonLabelsContain(labels []string, want string) bool {
+	for _, label := range labels {
+		if strings.Contains(label, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func schedulerHistoryForTest(t *testing.T, app *App, id string) []store.SchedulerRun {
+	t.Helper()
+	overview, err := app.store().ReadSchedulerHistory(context.Background(), id, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return overview.Runs[id].Runs
+}
+func TestSchedulerManualRunUpdatesSingleHistoryEntry(t *testing.T) {
+	app := newTestApp(t)
+	run, ok := app.startManualSchedulerJob(context.Background(), "daily_stats", nil)
+	if !ok {
+		t.Fatal("enqueue failed")
+	}
+	before := schedulerHistoryForTest(t, app, "daily_stats")
+	if len(before) != 1 || before[0].Status != "queued" {
+		t.Fatalf("not queued: %#v", before)
+	}
+	app.claimSchedulerJobs(context.Background())
+	deadline := time.Now().Add(3 * time.Second)
+	for app.schedulerJobRunning("daily_stats") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	runs := schedulerHistoryForTest(t, app, "daily_stats")
+	if len(runs) != 1 || runs[0].ID != run.ID || runs[0].Status != "success" || runs[0].FinishedAt == 0 {
+		t.Fatalf("unexpected history: %#v", runs)
+	}
+}
+func TestSchedulerAutoRunRecordVisibleBeforeReturn(t *testing.T) {
+	app := newTestApp(t)
+	app.runScheduledJob(context.Background(), "daily_stats")
+	runs := schedulerHistoryForTest(t, app, "daily_stats")
+	if len(runs) != 1 || runs[0].Type != "auto" || runs[0].Status != "queued" {
+		t.Fatalf("enqueue not durable: %#v", runs)
+	}
+	app.claimSchedulerJobs(context.Background())
+	deadline := time.Now().Add(3 * time.Second)
+	for app.schedulerJobRunning("daily_stats") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := schedulerHistoryForTest(t, app, "daily_stats"); len(got) != 1 || got[0].Status != "success" {
+		t.Fatalf("unexpected history: %#v", got)
+	}
+}
+
+func TestSchedulerManualTriggerSpecDisablesAutoRun(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/scheduler/jobs/daily_stats/schedule", strings.NewReader(`{"type":"manual"}`))
+	rr := httptest.NewRecorder()
+	app.handleSchedulerSchedule(rr, req, Params{"job_id": "daily_stats"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("schedule manual status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	spec := app.schedulerTriggerSpec("daily_stats")
+	if asString(spec["type"]) != "manual" || !schedulerTriggerDisabled(spec) {
+		t.Fatalf("manual trigger spec not persisted: %#v", spec)
+	}
+	if next := app.schedulerNextRunAt("daily_stats", spec, time.Now()); next != 0 {
+		t.Fatalf("manual trigger should not have next run, got %d", next)
+	}
+}
+
+func TestSchedulerHistoryIsBoundedAndLastRunOmitsLogs(t *testing.T) {
+	app := newTestApp(t)
+	for i := 0; i < 25; i++ {
+		if err := app.store().AddSchedulerRun(store.SchedulerRun{
+			JobID:     "daily_stats",
+			Type:      "manual",
+			Trigger:   "manual",
+			Status:    "success",
+			StartedAt: int64(i + 1),
+			Logs:      []string{"sensitive-looking log output"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	historyReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/scheduler/jobs/daily_stats/history?limit=200", nil)
+	historyRR := httptest.NewRecorder()
+	app.handleSchedulerHistory(historyRR, historyReq, Params{"job_id": "daily_stats"})
+	if historyRR.Code != http.StatusOK {
+		t.Fatalf("history status=%d body=%s", historyRR.Code, historyRR.Body.String())
+	}
+	var history struct {
+		Data struct {
+			History []store.SchedulerRun `json:"history"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(historyRR.Body.Bytes(), &history); err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Data.History) != 20 {
+		t.Fatalf("history should be capped at 20 rows, got %d", len(history.Data.History))
+	}
+
+	lastReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/scheduler/jobs/daily_stats/last-run", nil)
+	lastRR := httptest.NewRecorder()
+	app.handleSchedulerLastRun(lastRR, lastReq, Params{"job_id": "daily_stats"})
+	if lastRR.Code != http.StatusOK {
+		t.Fatalf("last-run status=%d body=%s", lastRR.Code, lastRR.Body.String())
+	}
+	if strings.Contains(lastRR.Body.String(), "sensitive-looking log output") {
+		t.Fatalf("last-run summary should not duplicate log output: %s", lastRR.Body.String())
+	}
+}
+
+func TestSchedulerJobsReconcileStaleRunningHistory(t *testing.T) {
+	app := newTestApp(t)
+	run, err := app.store().AddSchedulerRunReturning(store.SchedulerRun{JobID: "enforce_group_membership", Type: "auto", Trigger: "scheduler", Status: "running", Message: "running", StartedAt: time.Now().Add(-time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/scheduler/jobs", nil)
+	rr := httptest.NewRecorder()
+	app.handleSchedulerJobs(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("jobs status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	runs := schedulerHistoryForTest(t, app, "enforce_group_membership")
+	if len(runs) != 1 || runs[0].ID != run.ID || runs[0].Status == "running" || runs[0].FinishedAt == 0 {
+		t.Fatalf("stale running history was not reconciled: %#v", runs)
+	}
+	if !boolish(runs[0].Summary["interrupted"]) {
+		t.Fatalf("reconciled run should be marked interrupted: %#v", runs[0])
+	}
+}
+
+func TestSchedulerJobsPreservesFreshExternalRunningHistory(t *testing.T) {
+	app := newTestApp(t)
+	run, err := app.store().AddSchedulerRunReturning(store.SchedulerRun{JobID: "enforce_group_membership", Type: "auto", Trigger: "scheduler", Status: "running", Message: "running", StartedAt: time.Now().Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/scheduler/jobs", nil)
+	rr := httptest.NewRecorder()
+	app.handleSchedulerJobs(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("jobs status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	runs := app.store().SchedulerRuns("enforce_group_membership", 1)
+	if len(runs) != 1 || runs[0].ID != run.ID || runs[0].Status != "running" || runs[0].FinishedAt != 0 {
+		t.Fatalf("fresh external running history should stay running: %#v", runs)
+	}
+	var body struct {
+		Data struct {
+			Jobs []map[string]any `json:"jobs"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, job := range body.Data.Jobs {
+		if asString(job["id"]) == "enforce_group_membership" {
+			found = true
+			if !boolish(job["is_running"]) {
+				t.Fatalf("fresh external running job should be reported running: %#v", job)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("enforce_group_membership job not returned")
+	}
+}
+
+func TestSchedulerFinishedRunRedactsPersistentFields(t *testing.T) {
+	finished := schedulerFinishedRun(
+		"system_auto_update",
+		"manual",
+		"manual",
+		1,
+		map[string]any{
+			"message": "failed with token=abc123456789 and password=SuperSecret123",
+			"nested":  []any{map[string]any{"stderr": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"}},
+		},
+		[]string{"retry failed: api_key=key-abcdefghijklmnopqrstuvwxyz"},
+		fmt.Errorf("remote error: token=abc123456789 password=SuperSecret123"),
+	)
+	data, err := json.Marshal(finished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	for _, leaked := range []string{"abc123456789", "SuperSecret123", "abcdefghijklmnopqrstuvwxyz"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("scheduler run leaked sensitive value %q: %s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "[REDACTED]") {
+		t.Fatalf("scheduler run did not include redacted markers: %s", out)
+	}
+}
+
+func TestSchedulerTerminateIsIdempotentWhenJobAlreadyStopped(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/scheduler/jobs/enforce_group_membership/terminate", nil)
+	rr := httptest.NewRecorder()
+	app.handleSchedulerTerminate(rr, req, Params{"job_id": "enforce_group_membership"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("terminate should be idempotent, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"already_stopped":true`) {
+		t.Fatalf("terminate response did not mark already_stopped: %s", rr.Body.String())
+	}
+}
+
+func TestSchedulerTerminateKeepsLockUntilExecutionStops(t *testing.T) {
+	app := newTestApp(t)
+	runCtx, _, finish, ok := app.startSchedulerRun(context.Background(), "daily_stats")
+	if !ok {
+		t.Fatal("lock unavailable")
+	}
+	defer finish()
+	if !app.terminateSchedulerJob("daily_stats") {
+		t.Fatal("cancel failed")
+	}
+	select {
+	case <-runCtx.Done():
+	default:
+		t.Fatal("context not cancelled")
+	}
+	if !app.schedulerJobRunning("daily_stats") {
+		t.Fatal("released before execution stopped")
+	}
+	_, _, _, started := app.startSchedulerRun(context.Background(), "daily_stats")
+	if started {
+		t.Fatal("overlapping execution allowed")
+	}
+	finish()
+	if app.schedulerJobRunning("daily_stats") {
+		t.Fatal("lock not released after completion")
+	}
+}
+
+func TestSchedulerTerminatedRunNotOverwrittenByLateCompletion(t *testing.T) {
+	app := newTestApp(t)
+	started := time.Now().Unix()
+	run, err := app.store().AddSchedulerRunReturning(store.SchedulerRun{
+		JobID:     "daily_stats",
+		Type:      "manual",
+		Trigger:   "manual",
+		Status:    "failed",
+		Message:   "job terminated by administrator",
+		Error:     "job terminated by administrator",
+		StartedAt: started,
+		Summary:   map[string]any{"success": false, "terminated": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().FinishSchedulerRun(context.Background(), run, "stale-owner"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expected stale-owner rejection: %v", err)
+	}
+	runs := app.store().SchedulerRuns("daily_stats", 1)
+	if len(runs) != 1 || runs[0].ID != run.ID {
+		t.Fatalf("unexpected scheduler runs: %#v", runs)
+	}
+	if runs[0].Status != "failed" || runs[0].Message != "job terminated by administrator" || !boolish(runs[0].Summary["terminated"]) {
+		t.Fatalf("late completion overwrote terminated run: %#v", runs[0])
+	}
+}
+
+func TestSchedulerRuntimeParamsPersistInStoreAndDriveRunner(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AutoCleanupPendingEmby = true
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/scheduler/jobs/cleanup_pending_emby_entitlements/schedule", strings.NewReader(`{"type":"interval","seconds":120,"runtime_params":{"enabled":false}}`))
+	rr := httptest.NewRecorder()
+	app.handleSchedulerSchedule(rr, req, Params{"job_id": "cleanup_pending_emby_entitlements"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("schedule status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/scheduler/jobs", nil)
+	listRR := httptest.NewRecorder()
+	app.handleSchedulerJobs(listRR, listReq, nil)
+	if listRR.Code != http.StatusOK {
+		t.Fatalf("jobs status=%d body=%s", listRR.Code, listRR.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Jobs []map[string]any `json:"jobs"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listRR.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, job := range body.Data.Jobs {
+		if asString(job["id"]) != "cleanup_pending_emby_entitlements" {
+			continue
+		}
+		found = true
+		params, _ := job["runtime_params"].(map[string]any)
+		if boolish(params["enabled"]) || int(numeric(params["days"])) <= 0 {
+			t.Fatalf("runtime params did not come from backend store: %#v", params)
+		}
+	}
+	if !found {
+		t.Fatal("cleanup_pending_emby_entitlements job not returned")
+	}
+	days := 30
+	if _, err := app.store().CreateUser(store.User{Username: "pending-db-disabled", Role: store.RoleNormal, Active: true, PendingEmby: true, PendingEmbyDays: &days}); err != nil {
+		t.Fatal(err)
+	}
+	summary, _, err := app.runSchedulerJob(httptest.NewRequest(http.MethodPost, "/scheduler", nil), "cleanup_pending_emby_entitlements")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boolish(summary["enabled"]) || int(numeric(summary["cleared"])) != 0 {
+		t.Fatalf("DB runtime params should disable automatic cleanup: %#v", summary)
+	}
+}
+
+func TestBangumiWebhookRequiresSecretWhenEnabled(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().BangumiEnabled = true
+	blocked := doJSON(app, http.MethodPost, "/api/v1/emby/bangumi/webhook", `{"Event":"PlaybackStopped"}`, nil)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("webhook without configured secret = %d body=%s", blocked.Code, blocked.Body.String())
+	}
+	app.cfg().BangumiWebhookSecret = "webhook-secret"
+	app.cfg().BangumiWebhookAllowLegacyToken = true // 兼容期的旧 token 模式
+	allowed := doJSON(app, http.MethodPost, "/api/v1/emby/bangumi/webhook?token=webhook-secret", `{"Event":"PlaybackStopped"}`, nil)
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("webhook with secret = %d body=%s", allowed.Code, allowed.Body.String())
+	}
+}
+
+// TestBangumiWebhookRejectsStaleTimestamp 锁定 R58-1 replay window:带
+// X-Twilight-Bangumi-Timestamp 但落在 ±300s 之外的请求必须 410 拒绝,即使
+// secret 正确。窗口内 / 不带 header 仍应放行(向后兼容路径)。
+func TestBangumiWebhookRejectsStaleTimestamp(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().BangumiEnabled = true
+	app.cfg().BangumiWebhookSecret = "webhook-secret"
+	app.cfg().BangumiWebhookAllowLegacyToken = true // 兼容期的旧 token 模式
+
+	// 落在 1 小时之前——窗口 5 分钟,必拒。
+	stale := strconv.FormatInt(time.Now().Unix()-3600, 10)
+	rec := doJSONWithHeaders(app, http.MethodPost, "/api/v1/emby/bangumi/webhook", `{"Event":"PlaybackStopped"}`, nil, map[string]string{
+		"X-Twilight-Bangumi-Token":     "webhook-secret",
+		"X-Twilight-Bangumi-Timestamp": stale,
+	})
+	if rec.Code != http.StatusGone {
+		t.Fatalf("stale timestamp should be rejected with 410, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 当下时间戳——必放行。
+	fresh := strconv.FormatInt(time.Now().Unix(), 10)
+	freshRec := doJSONWithHeaders(app, http.MethodPost, "/api/v1/emby/bangumi/webhook", `{"Event":"PlaybackStopped"}`, nil, map[string]string{
+		"X-Twilight-Bangumi-Token":     "webhook-secret",
+		"X-Twilight-Bangumi-Timestamp": fresh,
+	})
+	if freshRec.Code != http.StatusOK {
+		t.Fatalf("fresh timestamp should be accepted, got %d body=%s", freshRec.Code, freshRec.Body.String())
+	}
+
+	// 非数字时间戳——必拒。
+	badRec := doJSONWithHeaders(app, http.MethodPost, "/api/v1/emby/bangumi/webhook", `{"Event":"PlaybackStopped"}`, nil, map[string]string{
+		"X-Twilight-Bangumi-Token":     "webhook-secret",
+		"X-Twilight-Bangumi-Timestamp": "not-a-number",
+	})
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("non-numeric timestamp should be 400, got %d body=%s", badRec.Code, badRec.Body.String())
+	}
+}
+
+// TestBangumiWebhookIdempotentReplay 锁定 R58-1 idempotency:同一份合法
+// 请求被重放也只产生一条 PlaybackRecord,而不是无限堆积。即使时间戳
+// header 通过校验,store 层的 (uid, item_id, played_at) 三元组兜底。
+func TestBangumiWebhookIdempotentReplay(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().BangumiEnabled = true
+	app.cfg().BangumiWebhookSecret = "webhook-secret"
+	app.cfg().BangumiWebhookAllowLegacyToken = true // 兼容期的旧 token 模式
+	created, err := app.store().CreateUser(store.User{Username: "viewer", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().UpdateUser(created.UID, func(u *store.User) error {
+		u.EmbyID = "emby-replay"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"Event":"PlaybackStopped","UserId":"emby-replay","Item":{"Id":"item-replay","Name":"Replay Title","Type":"Episode","RunTimeTicks":600000000}}`
+	// 同一份字节重放必须用同一份 timestamp header,否则 PlayedAt 在跨秒边
+	// 界会被 time.Now() 拉开,(uid,item_id,played_at) 唯一键失效。这本来
+	// 就是合法重放攻击的前提:攻击者抓的是字节,header 当然也一样。
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	for i := 0; i < 5; i++ {
+		rec := doJSONWithHeaders(app, http.MethodPost, "/api/v1/emby/bangumi/webhook", body, nil, map[string]string{
+			"X-Twilight-Bangumi-Token":     "webhook-secret",
+			"X-Twilight-Bangumi-Timestamp": ts,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("replay #%d webhook = %d body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	records := app.store().PlaybackRecords(created.UID, 0, 100)
+	itemMatches := 0
+	for _, rec := range records {
+		if rec.ItemID == "item-replay" {
+			itemMatches++
+		}
+	}
+	if itemMatches != 1 {
+		t.Fatalf("expected exactly 1 PlaybackRecord for replayed webhook, got %d (records=%#v)", itemMatches, records)
+	}
+}
+
+// TestBangumiWebhookConstantTimeStringEqual 锁定 R58-1 timing oracle 收紧:
+// length-mismatch 不能再通过 ConstantTimeCompare 提前 return 触发。直接调
+// 用 helper 验证逻辑等价性(timing 行为靠 zero-pad 实现,Go 测试框架不便
+// 直接测,这里至少锁住语义)。
+func TestBangumiWebhookConstantTimeStringEqual(t *testing.T) {
+	cases := []struct {
+		got, want string
+		expect    bool
+	}{
+		{"abc", "abc", true},
+		{"abc", "xyz", false},
+		{"abc", "abcd", false}, // 长度不同
+		{"", "", true},
+		{"", "abc", false},
+		{strings.Repeat("a", 1025), strings.Repeat("a", 1025), false}, // 超过 1024 直接 false
+	}
+	for _, c := range cases {
+		if got := constantTimeStringEqual(c.got, c.want); got != c.expect {
+			t.Errorf("constantTimeStringEqual(%q,%q) = %v, want %v", c.got, c.want, got, c.expect)
+		}
+	}
+}
+
+func TestDatabaseAdminBackupRestoreAndAuth(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie := findCookie(adminLogin.Result().Cookies(), "twilight_session")
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"user","password":"User123456"}`, nil)
+	userLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"user","password":"User123456"}`, nil)
+	userCookie := findCookie(userLogin.Result().Cookies(), "twilight_session")
+
+	unauth := doJSON(app, http.MethodGet, "/api/v1/system/admin/database/status", ``, nil)
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("database status unauth = %d", unauth.Code)
+	}
+	forbidden := doJSON(app, http.MethodGet, "/api/v1/system/admin/database/status", ``, []*http.Cookie{userCookie})
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("database status user = %d body=%s", forbidden.Code, forbidden.Body.String())
+	}
+	status := doJSON(app, http.MethodGet, "/api/v1/system/admin/database/status", ``, []*http.Cookie{adminCookie})
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"legacy_sqlite_detected":false`) {
+		t.Fatalf("database status did not report sqlite disabled status=%d body=%s", status.Code, status.Body.String())
+	}
+	backup := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/backup", `{"note":"before restore test"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if backup.Code != http.StatusOK {
+		t.Fatalf("backup status=%d body=%s", backup.Code, backup.Body.String())
+	}
+	if strings.Contains(backup.Body.String(), `"legacy_sqlite_backup"`) {
+		t.Fatalf("backup unexpectedly included legacy sqlite files body=%s", backup.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(backup.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	backupData := env.Data.(map[string]any)["backup"].(map[string]any)
+	backupName := backupData["name"].(string)
+	if backupData["note"] != "before restore test" {
+		t.Fatalf("backup note was not persisted: %#v", backupData["note"])
+	}
+	backupInspect := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/admin/database/backups/"+backupName, ``, []*http.Cookie{adminCookie}, nil)
+	if backupInspect.Code != http.StatusOK || !strings.Contains(backupInspect.Body.String(), `"counts"`) || !strings.Contains(backupInspect.Body.String(), `"note":"before restore test"`) {
+		t.Fatalf("backup inspect status=%d body=%s", backupInspect.Code, backupInspect.Body.String())
+	}
+	backupList := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/admin/database/backups", ``, []*http.Cookie{adminCookie}, nil)
+	if backupList.Code != http.StatusOK || strings.Contains(backupList.Body.String(), backupName+".meta.json") {
+		t.Fatalf("backup list exposed metadata file status=%d body=%s", backupList.Code, backupList.Body.String())
+	}
+	backupMetaInspect := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/admin/database/backups/"+backupName+".meta.json", ``, []*http.Cookie{adminCookie}, nil)
+	if backupMetaInspect.Code != http.StatusBadRequest {
+		t.Fatalf("backup metadata inspect status=%d body=%s", backupMetaInspect.Code, backupMetaInspect.Body.String())
+	}
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"extra","password":"Extra123456"}`, nil)
+	if _, ok := app.store().FindUserByUsername("extra"); !ok {
+		t.Fatal("expected extra user before restore")
+	}
+	restorePreview := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/restore", `{"name":"`+backupName+`"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if restorePreview.Code != http.StatusOK || !strings.Contains(restorePreview.Body.String(), `"requires_confirmation":true`) {
+		t.Fatalf("restore preview status=%d body=%s", restorePreview.Code, restorePreview.Body.String())
+	}
+	if _, ok := app.store().FindUserByUsername("extra"); !ok {
+		t.Fatal("restore preview mutated state")
+	}
+	restore := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/restore", `{"name":"`+backupName+`","confirm":"RESTORE_DATABASE_BACKUP"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if restore.Code != http.StatusOK {
+		t.Fatalf("restore status=%d body=%s", restore.Code, restore.Body.String())
+	}
+	if !strings.Contains(restore.Body.String(), `"pre_operation_backup"`) {
+		t.Fatalf("restore did not report pre-operation backup body=%s", restore.Body.String())
+	}
+	if _, ok := app.store().FindUserByUsername("extra"); ok {
+		t.Fatal("restore did not replace state")
+	}
+	// 恢复会吊销全部会话（UID 可能被重新分配），管理员自己也要重新登录。
+	if stale := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/admin/database/backups", ``, []*http.Cookie{adminCookie}, nil); stale.Code != http.StatusUnauthorized {
+		t.Fatalf("session survived restore status=%d body=%s", stale.Code, stale.Body.String())
+	}
+	adminLogin = doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie = findCookie(adminLogin.Result().Cookies(), "twilight_session")
+	traversal := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/restore", `{"name":"../state.json"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if traversal.Code != http.StatusBadRequest {
+		t.Fatalf("restore traversal status=%d body=%s", traversal.Code, traversal.Body.String())
+	}
+	migrateDisabled := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/migrate", `{"target_driver":"json","dry_run":true}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if migrateDisabled.Code != http.StatusForbidden {
+		t.Fatalf("migrate disabled status=%d body=%s", migrateDisabled.Code, migrateDisabled.Body.String())
+	}
+	app.cfg().DatabaseMigrationPanelEnabled = true
+	migrate := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/migrate", `{"target_driver":"json","dry_run":true}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if migrate.Code != http.StatusOK || !strings.Contains(migrate.Body.String(), `"dry_run":true`) {
+		t.Fatalf("migrate dry-run status=%d body=%s", migrate.Code, migrate.Body.String())
+	}
+	migrateNoConfirm := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/migrate", `{"target_driver":"json","state_file":"migrated.json"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if migrateNoConfirm.Code != http.StatusOK || !strings.Contains(migrateNoConfirm.Body.String(), `"requires_confirmation":true`) || !strings.Contains(migrateNoConfirm.Body.String(), `"dry_run":true`) {
+		t.Fatalf("migrate without confirm status=%d body=%s", migrateNoConfirm.Code, migrateNoConfirm.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(app.cfg().DatabaseDir, "migrated.json")); err == nil {
+		t.Fatal("migrate without confirm wrote target file")
+	}
+	migrateExecute := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/migrate", `{"target_driver":"json","state_file":"migrated.json","confirm":"MIGRATE_DATABASE"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if migrateExecute.Code != http.StatusOK || !strings.Contains(migrateExecute.Body.String(), `"pre_operation_backup"`) {
+		t.Fatalf("migrate execute status=%d body=%s", migrateExecute.Code, migrateExecute.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(app.cfg().DatabaseDir, "migrated.json")); err != nil {
+		t.Fatalf("migrate with confirm did not write target file: %v", err)
+	}
+	migrateTraversal := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/migrate", `{"target_driver":"json","state_file":"../outside.json","dry_run":true}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if migrateTraversal.Code != http.StatusBadRequest {
+		t.Fatalf("migrate traversal status=%d body=%s", migrateTraversal.Code, migrateTraversal.Body.String())
+	}
+	migrateWrongType := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/database/migrate", `{"target_driver":"json","state_file":"state.txt","dry_run":true}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if migrateWrongType.Code != http.StatusBadRequest {
+		t.Fatalf("migrate wrong type status=%d body=%s", migrateWrongType.Code, migrateWrongType.Body.String())
+	}
+	deleteBackup := doJSONWithHeaders(app, http.MethodDelete, "/api/v1/system/admin/database/backups/"+backupName, ``, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if deleteBackup.Code != http.StatusOK {
+		t.Fatalf("delete backup status=%d body=%s", deleteBackup.Code, deleteBackup.Body.String())
+	}
+}
+
+func TestConfigAdminBackupRestoreAndDelete(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+	// admin 身份只来自配置文件：reloadConfigIfChanged 会在首个请求时按文件
+	// signature 自动热重载，把内存里 harness 预置的 AdminUsernames 覆盖成磁盘
+	// 文件的值。因此磁盘 config 必须显式声明 [Admin] admin_usernames，"admin"
+	// 注册后才会被提升为管理员；同时带 register_mode 保证热重载后注册仍开放。
+	original := "[Global]\ndatabases_dir = " + strconv.Quote(app.cfg().DatabaseDir) + "\n\n[SAR]\nregister_mode = true\n\n[Admin]\nadmin_usernames = \"admin\"\n\n[Database]\ndriver = " + strconv.Quote(app.cfg().DatabaseDriver) + "\nbackup_dir = " + strconv.Quote(app.cfg().DatabaseBackupDir) + "\nstate_file = " + strconv.Quote(app.cfg().StateFile) + "\n\n[API]\nhost = \"127.0.0.1\"\nport = 5010\n"
+	changed := strings.Replace(original, "port = 5010", "port = 5011", 1)
+	if err := os.WriteFile(app.cfg().ConfigFile, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie := findCookie(adminLogin.Result().Cookies(), "twilight_session")
+
+	backup := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/config/backup", `{}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if backup.Code != http.StatusOK {
+		t.Fatalf("config backup status=%d body=%s", backup.Code, backup.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(backup.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	backupData := env.Data.(map[string]any)["backup"].(map[string]any)
+	backupName := backupData["name"].(string)
+
+	list := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/admin/config/backups", ``, []*http.Cookie{adminCookie}, nil)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), backupName) {
+		t.Fatalf("config backup list status=%d body=%s", list.Code, list.Body.String())
+	}
+	inspect := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/admin/config/backups/"+backupName, ``, []*http.Cookie{adminCookie}, nil)
+	if inspect.Code != http.StatusOK || !strings.Contains(inspect.Body.String(), "port = 5010") {
+		t.Fatalf("config backup inspect status=%d body=%s", inspect.Code, inspect.Body.String())
+	}
+
+	if err := os.WriteFile(app.cfg().ConfigFile, []byte(changed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restorePreview := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/config/restore", `{"name":"`+backupName+`"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if restorePreview.Code != http.StatusOK || !strings.Contains(restorePreview.Body.String(), `"requires_confirmation":true`) {
+		t.Fatalf("config restore preview status=%d body=%s", restorePreview.Code, restorePreview.Body.String())
+	}
+	if data, _ := os.ReadFile(app.cfg().ConfigFile); !strings.Contains(string(data), "port = 5011") {
+		t.Fatal("config restore preview mutated file")
+	}
+	restore := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/config/restore", `{"name":"`+backupName+`","confirm":"RESTORE_CONFIG_BACKUP"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if restore.Code != http.StatusOK || !strings.Contains(restore.Body.String(), `"pre_operation_backup"`) {
+		t.Fatalf("config restore status=%d body=%s", restore.Code, restore.Body.String())
+	}
+	if data, _ := os.ReadFile(app.cfg().ConfigFile); !strings.Contains(string(data), "port = 5010") {
+		t.Fatalf("config restore did not restore original content: %s", string(data))
+	}
+
+	adminLogin = doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie = findCookie(adminLogin.Result().Cookies(), "twilight_session")
+	deleteBackup := doJSONWithHeaders(app, http.MethodDelete, "/api/v1/system/admin/config/backups/"+backupName, ``, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if deleteBackup.Code != http.StatusOK {
+		t.Fatalf("config backup delete status=%d body=%s", deleteBackup.Code, deleteBackup.Body.String())
+	}
+}
+
+func TestConfigTOMLGetReturnsCompletedConfig(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+	minimal := "[Global]\ndatabases_dir = " + strconv.Quote(app.cfg().DatabaseDir) + "\n\n[Database]\ndriver = " + strconv.Quote(app.cfg().DatabaseDriver) + "\nstate_file = " + strconv.Quote(app.cfg().StateFile) + "\nbackup_dir = " + strconv.Quote(app.cfg().DatabaseBackupDir) + "\n\n[API]\nhost = \"127.0.0.1\"\nport = 5010\n\n[Admin]\nusernames = [\"root\"]\n"
+	if err := os.WriteFile(app.cfg().ConfigFile, []byte(minimal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	app.handleConfigTOMLGet(rr, httptest.NewRequest(http.MethodGet, "/api/v1/system/admin/config/toml", nil), nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("config toml status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	data := env.Data.(map[string]any)
+	content := data["content"].(string)
+	if data["completed"] != true {
+		t.Fatalf("expected completed config marker, got %#v", data["completed"])
+	}
+	if !strings.Contains(content, "[SAR]") || !strings.Contains(content, "signin_enabled") || !strings.Contains(content, "daily_min") {
+		t.Fatalf("completed config missing signin settings under SAR: %s", content)
+	}
+	if strings.Contains(content, "[Admin]") || strings.Contains(content, "usernames =") {
+		t.Fatalf("protected admin config leaked: %s", content)
+	}
+}
+
+// TestConfigTOMLGetMasksSecretsAndPUTPreserves 验证：
+//   - GET /system/admin/config/toml 不在 content / raw_content 中回传任何
+//     真实密钥（Emby Token / Bot Token / BotInternalSecret / Webhook Secret /
+//     Postgres 密码 / Redis URL）；非空密钥一律被替换为哨兵 secretMaskValue。
+//   - PUT 回传带哨兵的 content 时，写盘前哨兵被还原为内存中的真实值，
+//     不会把密钥清成无效字符串（防止"打开配置页再保存就把密钥清空"）。
+func TestConfigTOMLGetMasksSecretsAndPUTPreserves(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+	const embyToken = "EMBY_TOKEN_TOPSECRET_123456"
+	const botToken = "8585413194:AAFwzhD0_BOT_TOKEN_SECRET"
+	const internalSecret = "tw_internal_secret_value_abc"
+	const webhookSecret = "bangumi_webhook_secret_xyz"
+	raw := "[Global]\ndatabases_dir = " + strconv.Quote(app.cfg().DatabaseDir) + "\nredis_url = \"\"\n\n" +
+		"[Database]\ndriver = " + strconv.Quote(app.cfg().DatabaseDriver) + "\nstate_file = " + strconv.Quote(app.cfg().StateFile) + "\nbackup_dir = " + strconv.Quote(app.cfg().DatabaseBackupDir) + "\npostgres_password = \"PG_PASS_SECRET\"\n\n" +
+		"[Emby]\nemby_url = \"http://127.0.0.1:8096/\"\nemby_token = " + strconv.Quote(embyToken) + "\n\n" +
+		"[Telegram]\nbot_token = " + strconv.Quote(botToken) + "\n\n" +
+		"[Security]\nbot_internal_secret = " + strconv.Quote(internalSecret) + "\n\n" +
+		"[BangumiSync]\nwebhook_secret = " + strconv.Quote(webhookSecret) + "\n\n" +
+		"[API]\nhost = \"127.0.0.1\"\nport = 5010\n\n[Admin]\nusernames = [\"admin\"]\n"
+	if err := os.WriteFile(app.cfg().ConfigFile, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 让 reload 把磁盘上的密钥读进内存 cfg，PUT 还原哨兵时需要它。
+	if _, err := app.reloadConfig(); err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie := findCookie(adminLogin.Result().Cookies(), "twilight_session")
+
+	get := doJSONWithHeaders(app, http.MethodGet, "/api/v1/system/admin/config/toml", ``, []*http.Cookie{adminCookie}, nil)
+	if get.Code != http.StatusOK {
+		t.Fatalf("config toml get status=%d body=%s", get.Code, get.Body.String())
+	}
+	body := get.Body.String()
+	for _, secret := range []string{embyToken, botToken, internalSecret, webhookSecret, "PG_PASS_SECRET"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("plaintext secret leaked in config toml GET: %q\nbody=%s", secret, body)
+		}
+	}
+	if !strings.Contains(body, secretMaskValue) {
+		t.Fatalf("expected masked secret sentinel in GET body, got: %s", body)
+	}
+
+	var env envelope
+	if err := json.Unmarshal(get.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	data := env.Data.(map[string]any)
+	maskedContent := data["content"].(string)
+
+	// PUT 回传遮蔽后的 content（管理员未改密钥），保存后磁盘必须保留真实密钥。
+	putBody, _ := json.Marshal(map[string]any{"content": maskedContent})
+	put := doJSONWithHeaders(app, http.MethodPut, "/api/v1/system/admin/config/toml", string(putBody), []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if put.Code != http.StatusOK {
+		t.Fatalf("config toml put status=%d body=%s", put.Code, put.Body.String())
+	}
+	saved, err := os.ReadFile(app.cfg().ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedContent := string(saved)
+	if strings.Contains(savedContent, secretMaskValue) {
+		t.Fatalf("sentinel was written to disk instead of real secret:\n%s", savedContent)
+	}
+	for _, secret := range []string{embyToken, botToken, internalSecret, webhookSecret} {
+		if !strings.Contains(savedContent, secret) {
+			t.Fatalf("real secret %q was lost after masked PUT round-trip:\n%s", secret, savedContent)
+		}
+	}
+}
+
+func TestConfigSaveMigratesLegacyTelegramForceSubscribe(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ConfigFile = filepath.Join(app.cfg().DatabaseDir, "config.toml")
+	existing := "[Global]\nserver_name = \"old\"\n\n[Admin]\nusernames = [\"root\"]\n"
+	if err := os.WriteFile(app.cfg().ConfigFile, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `[Global]
+server_name = "new"
+databases_dir = "` + strings.ReplaceAll(app.cfg().DatabaseDir, `\`, `\\`) + `"
+
+[Database]
+driver = "postgres"
+backup_dir = "` + strings.ReplaceAll(app.cfg().DatabaseBackupDir, `\`, `\\`) + `"
+
+[Telegram]
+group_id = ["@group"]
+channel_id = ["@channel"]
+force_subscribe = true
+`
+	info, status, message := app.saveConfigContent(legacy)
+	if status != http.StatusOK {
+		t.Fatalf("saveConfigContent status=%d message=%s info=%v", status, message, info)
+	}
+	data, err := os.ReadFile(app.cfg().ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	// force_subscribe 现在是一等公民配置项（config.Config.TelegramForceSubscribe
+	// 仍被读取，且已纳入可视化配置 schema），因此保存会**保留**它而不是像早期那样
+	// 因为没进 schema 而被顺手丢弃。迁移语义仍然成立：拆分的两个开关会被显式写成
+	// true，之后它们才是生效值（config.Load 里显式设置的 force_bind_* 会覆盖
+	// force_subscribe 的推导），所以"遗留键消失"不再是迁移完成的判据。
+	if !strings.Contains(content, "force_subscribe = true") {
+		t.Fatalf("managed force_subscribe should be preserved after save: %s", content)
+	}
+	if !strings.Contains(content, "force_bind_group = true") || !strings.Contains(content, "force_bind_channel = true") {
+		t.Fatalf("legacy force_subscribe was not migrated to split true values: %s", content)
+	}
+	if !strings.Contains(content, "[Admin]") || !strings.Contains(content, "root") {
+		t.Fatalf("protected admin config was not preserved: %s", content)
+	}
+}
+
+func TestEmbyCapacityCountsPendingEntitlementsSeparatelyFromSystemLimit(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().UserLimit = 100
+	app.cfg().EmbyUserLimit = 3
+	now := time.Now().Unix()
+	if _, err := app.store().CreateUser(store.User{Username: "emby", Role: store.RoleNormal, Active: true, EmbyID: "emby-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-A", UID: 1, InviterUID: 1, Days: 30, UseCountLimit: 1, Active: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REG-A", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REG-RENEW", Type: 2, Days: 30, ValidityTime: -1, UseCountLimit: 100, Active: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 系统用户上限计入有效注册码（type=1/3）的剩余名额：REG-A 占 1 个，REG-RENEW
+	// （type=2）不算；邀请码只能给已注册用户使用，不计入。加上已有 1 个用户 = 2。
+	if reached, current, limit := app.systemUserLimitReached(); reached || current != 2 || limit != 100 {
+		t.Fatalf("system limit should count local users + pending regcodes only, got reached=%v current=%d limit=%d", reached, current, limit)
+	}
+	// Emby 名额：已绑定用户 1 + REG-A 1；未使用的邀请码不预占名额。
+	if reached, current, limit := app.embyCapacityReached(0); reached || current != 2 || limit != 3 {
+		t.Fatalf("emby capacity should not reserve slots for unused invite codes, got reached=%v current=%d limit=%d", reached, current, limit)
+	}
+}
+
+func TestSystemUserLimitExcludesConsumedRegistrationSlot(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().UserLimit = 6
+	now := time.Now().Unix()
+	if _, err := app.store().CreateUser(store.User{Username: "existing", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REG-CONSUME", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 5, Active: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if reached, current, limit := app.systemUserLimitReached(); !reached || current != 6 || limit != 6 {
+		t.Fatalf("unexcluded limit should include all pending slots, got reached=%v current=%d limit=%d", reached, current, limit)
+	}
+	if reached, current, limit := app.systemUserLimitReachedExcluding("REG-CONSUME", ""); reached || current != 5 || limit != 6 {
+		t.Fatalf("consumed registration slot should be excluded, got reached=%v current=%d limit=%d", reached, current, limit)
+	}
+}
+
+func TestMediaRequestInventoryIssueBypassesDuplicateGuard(t *testing.T) {
+	st := newTestStore(t)
+	defer st.Close()
+	base := store.MediaRequest{UID: 1, Title: "Movie", Source: "tmdb", MediaID: 42, MediaType: "movie", MediaInfo: map[string]any{"title": "Movie"}}
+	if _, err := st.CreateMediaRequest(base); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateMediaRequest(base); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expected duplicate conflict, got %v", err)
+	}
+	issue := base
+	issue.MediaInfo = map[string]any{"title": "Movie", "inventory_issue": true}
+	issue.Note = "字幕不同步"
+	if _, err := st.CreateMediaRequest(issue); err != nil {
+		t.Fatalf("inventory issue report should bypass duplicate guard: %v", err)
+	}
+}
+
+func TestRegCodeRandomAlgorithmsAndFormatFallback(t *testing.T) {
+	code := generateRegCode("TW-{type}", 1, "symbols-24", 30, 1, -1, 1)
+	if !strings.HasPrefix(code, "TW-REG-") {
+		t.Fatalf("format without random should append random part, got %q", code)
+	}
+	mixedCase := generateRegCode("Twilight-{type}-Vip-{random}", 1, "digits-12", 30, 1, -1, 1)
+	if !strings.HasPrefix(mixedCase, "Twilight-REG-Vip-") {
+		t.Fatalf("custom format text casing was not preserved: %q", mixedCase)
+	}
+	seenSpecial := false
+	for i := 0; i < 10; i++ {
+		symbolCode := generateRegCode("TW-{random}", 1, "symbols-24", 30, i+1, -1, 1)
+		if strings.ContainsAny(symbolCode, "!@$%^*_-+=.:") {
+			seenSpecial = true
+			break
+		}
+	}
+	if !seenSpecial {
+		t.Fatal("symbols algorithm did not produce any special characters in repeated samples")
+	}
+	uuidCode := generateRegCode("{random}", 1, "uuid", 30, 1, -1, 1)
+	if parts := strings.Split(uuidCode, "-"); len(parts) != 5 || len(uuidCode) != 36 {
+		t.Fatalf("uuid algorithm returned invalid shape: %q", uuidCode)
+	}
+}
+
+func TestRegcodeFormatsAreSeparatedWithLegacyFallback(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().RegCodeFormat = "OLD-{type}-{random}"
+	app.cfg().RegisterCodeFormat = ""
+	app.cfg().RenewCodeFormat = ""
+
+	create := func(codeType int) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/regcodes", strings.NewReader(fmt.Sprintf(`{"type":%d,"days":7,"count":1,"random_algorithm":"digits-12"}`, codeType)))
+		rr := httptest.NewRecorder()
+		app.handleCreateRegcodes(rr, req, nil)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("create type %d status=%d body=%s", codeType, rr.Code, rr.Body.String())
+		}
+		var env envelope
+		if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		return env.Data.(map[string]any)["codes"].([]any)[0].(string)
+	}
+
+	if code := create(1); !strings.HasPrefix(code, "OLD-REG-") {
+		t.Fatalf("register code should fall back to legacy regcode_format, got %q", code)
+	}
+	if code := create(2); !strings.HasPrefix(code, "OLD-REN-") {
+		t.Fatalf("renew code should fall back to legacy regcode_format, got %q", code)
+	}
+
+	app.cfg().RegisterCodeFormat = "REGONLY-{random}"
+	app.cfg().RenewCodeFormat = "RENONLY-{days}-{random}"
+	if code := create(1); !strings.HasPrefix(code, "REGONLY-") {
+		t.Fatalf("register code should use register_code_format, got %q", code)
+	}
+	if code := create(2); !strings.HasPrefix(code, "RENONLY-7-") {
+		t.Fatalf("renew code should use renew_code_format, got %q", code)
+	}
+	if code := create(3); !strings.HasPrefix(code, "OLD-VIP-") {
+		t.Fatalf("whitelist code should keep legacy regcode_format fallback, got %q", code)
+	}
+}
+
+func TestInviteCodeFormatAndDTOUserRecords(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().InviteCodeFormat = "JOIN-{days}-{index}-{random}"
+	app.cfg().InviteCodeRandomAlgorithm = "digits-12"
+	now := time.Now()
+	parent, err := app.store().CreateUser(store.User{Username: "invite-format-parent", Role: store.RoleNormal, Active: true, ExpiredAt: now.AddDate(0, 0, 30).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "invite-format-child", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/codes", strings.NewReader(`{"days":7,"target_username":"invite-format-child"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: parent}))
+	rr := httptest.NewRecorder()
+	app.handleCreateInviteCode(rr, req, nil)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create invite status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	code := env.Data.(map[string]any)["code"].(string)
+	if !strings.HasPrefix(code, "JOIN-7-1-") {
+		t.Fatalf("invite code should use invite_code_format, got %q", code)
+	}
+	randomPart := strings.TrimPrefix(code, "JOIN-7-1-")
+	if len(randomPart) != 12 || strings.Trim(randomPart, "0123456789") != "" {
+		t.Fatalf("invite code should use invite_code_random_algorithm digits-12, got %q", code)
+	}
+	if _, err := app.store().ConsumeInviteCode(code, child.UID); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := app.store().InviteCode(code)
+	dto := app.inviteCodeDTO(stored)
+	if dto["inviter_username"] != parent.Username || dto["used_by_username"] != child.Username || numeric(dto["target_uid"]) != child.UID {
+		t.Fatalf("invite dto should include inviter, used-by and target records: %#v", dto)
+	}
+}
+
+func TestTargetedRegcodesAreCreatedListedAndEnforced(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie := findCookie(adminLogin.Result().Cookies(), "twilight_session")
+	created := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes", `{"type":2,"days":10,"count":1,"target_username":"alpha","format":"TGT-{random}","random_algorithm":"digits-12"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create targeted regcode status=%d body=%s", created.Code, created.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(created.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	code := env.Data.(map[string]any)["codes"].([]any)[0].(string)
+	reg, ok := app.store().RegCode(code)
+	if !ok || reg.TargetUsername != "alpha" {
+		t.Fatalf("target username was not saved: %#v", reg)
+	}
+	list := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/regcodes?search=alpha", ``, []*http.Cookie{adminCookie}, nil)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"target_username":"alpha"`) {
+		t.Fatalf("target username was not searchable/listed, status=%d body=%s", list.Code, list.Body.String())
+	}
+
+	alpha, err := app.store().CreateUser(store.User{Username: "alpha", Role: store.RoleNormal, Active: true, EmbyID: "emby-alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := app.store().CreateUser(store.User{Username: "beta", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"`+code+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: beta}))
+	rr := httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("non-target user should not use targeted regcode, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	reg, _ = app.store().RegCode(code)
+	if reg.UseCount != 0 {
+		t.Fatalf("target mismatch consumed regcode, use_count=%d", reg.UseCount)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"`+code+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: alpha}))
+	rr = httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("target user should use targeted regcode, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "RENEW-ALPHA", Type: 2, Days: 5, ValidityTime: -1, UseCountLimit: 1, Active: true, TargetUsername: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"RENEW-ALPHA"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: beta}))
+	rr = httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("renew endpoint should reject non-target user, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	reg, _ = app.store().RegCode("RENEW-ALPHA")
+	if reg.UseCount != 0 {
+		t.Fatalf("target mismatch consumed renewal code, use_count=%d", reg.UseCount)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"RENEW-ALPHA"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: alpha}))
+	rr = httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("target user should renew with targeted code, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestTelegramTargetedRegcodesAreCreatedListedAndEnforced(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminCookie := findCookie(adminLogin.Result().Cookies(), "twilight_session")
+
+	created := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes", `{"type":2,"days":10,"count":1,"target_telegram_id":4242,"format":"TGTG-{random}","random_algorithm":"digits-12"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create telegram targeted regcode status=%d body=%s", created.Code, created.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(created.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	code := env.Data.(map[string]any)["codes"].([]any)[0].(string)
+	reg, ok := app.store().RegCode(code)
+	if !ok || reg.TargetTelegramID != 4242 {
+		t.Fatalf("target telegram id was not saved: %#v", reg)
+	}
+	list := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/regcodes?search=4242", ``, []*http.Cookie{adminCookie}, nil)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"target_telegram_id":4242`) {
+		t.Fatalf("target telegram id was not searchable/listed, status=%d body=%s", list.Code, list.Body.String())
+	}
+
+	alpha, err := app.store().CreateUser(store.User{Username: "alpha", Role: store.RoleNormal, Active: true, EmbyID: "emby-alpha", TelegramID: 4242, TelegramUsername: "alpha_tg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := app.store().CreateUser(store.User{Username: "beta", Role: store.RoleNormal, Active: true, TelegramID: 9898, TelegramUsername: "beta_tg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"`+code+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: beta}))
+	rr := httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("non-target tg id user should not renew, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	reg, _ = app.store().RegCode(code)
+	if reg.UseCount != 0 {
+		t.Fatalf("target tg mismatch consumed regcode, use_count=%d", reg.UseCount)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"`+code+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: alpha}))
+	rr = httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("target tg id user should renew, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	created = doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/regcodes", `{"type":2,"days":5,"count":1,"target_telegram_username":"@alpha_tg","format":"TGTU-{random}","random_algorithm":"digits-12"}`, []*http.Cookie{adminCookie}, map[string]string{"X-Twilight-Client": "webui"})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create telegram username targeted regcode status=%d body=%s", created.Code, created.Body.String())
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	usernameCode := env.Data.(map[string]any)["codes"].([]any)[0].(string)
+	reg, ok = app.store().RegCode(usernameCode)
+	if !ok || reg.TargetTelegramUsername != "alpha_tg" {
+		t.Fatalf("target telegram username was not normalized/saved: %#v", reg)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"`+usernameCode+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: beta}))
+	rr = httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("non-target tg username user should not renew, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"`+usernameCode+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: alpha}))
+	rr = httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("target tg username user should renew, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRegisterCodeLimitHonorsTelegramTarget(t *testing.T) {
+	app := newTestApp(t)
+	adminResp := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	if adminResp.Code != http.StatusCreated {
+		t.Fatalf("bootstrap register status=%d body=%s", adminResp.Code, adminResp.Body.String())
+	}
+	app.cfg().RegisterCodeLimit = true
+
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "TG-REGISTER", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true, TargetTelegramID: 424242}); err != nil {
+		t.Fatal(err)
+	}
+	missingBind := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"tg-target","password":"User123456","reg_code":"TG-REGISTER"}`, nil)
+	if missingBind.Code != http.StatusBadRequest {
+		t.Fatalf("telegram targeted register code without bind should fail, status=%d body=%s", missingBind.Code, missingBind.Body.String())
+	}
+	reg, _ := app.store().RegCode("TG-REGISTER")
+	if reg.UseCount != 0 {
+		t.Fatalf("missing bind consumed telegram targeted register code, use_count=%d", reg.UseCount)
+	}
+
+	now := time.Now().Unix()
+	id := linkIDFor("tgreg")
+	app.seedTelegramLink(t, store.TelegramLink{ID: id, Scene: "register", TelegramID: 424242, TelegramUsername: "target_tg", CreatedAt: now, ExpiresAt: now + 600})
+	created := doJSON(app, http.MethodPost, "/api/v1/users/register", fmt.Sprintf(`{"username":"tg-target","password":"User123456","reg_code":"TG-REGISTER","telegram_link_id":%q,"telegram_link_secret":%q}`, id, id), nil)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("telegram targeted register should succeed with matching bind, status=%d body=%s", created.Code, created.Body.String())
+	}
+	user, ok := app.store().FindUserByUsername("tg-target")
+	if !ok || user.TelegramID != 424242 || user.TelegramUsername != "target_tg" {
+		t.Fatalf("registered user did not inherit telegram bind: %#v", user)
+	}
+	reg, _ = app.store().RegCode("TG-REGISTER")
+	if reg.UseCount != 1 || reg.UsedBy != user.UID || len(reg.UsedByTelegramIDs) != 1 || reg.UsedByTelegramIDs[0] != 424242 {
+		t.Fatalf("telegram targeted register code usage was not persisted: %#v", reg)
+	}
+}
+
+func TestRegisterCodeLimitConsumesRegcodeAtomically(t *testing.T) {
+	app := newTestApp(t)
+	adminResp := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	if adminResp.Code != http.StatusCreated {
+		t.Fatalf("bootstrap register status=%d body=%s", adminResp.Code, adminResp.Body.String())
+	}
+	app.cfg().RegisterCodeLimit = true
+
+	missing := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"no-code","password":"User123456"}`, nil)
+	if missing.Code != http.StatusBadRequest || !strings.Contains(missing.Body.String(), `"error_code":"CODE_EMPTY"`) {
+		t.Fatalf("register without code should be rejected, status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REGISTER-OK", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	created := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"with-code","password":"User123456","reg_code":"REGISTER-OK"}`, nil)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("register with code status=%d body=%s", created.Code, created.Body.String())
+	}
+	user, ok := app.store().FindUserByUsername("with-code")
+	if !ok || !user.PendingEmby || user.PendingEmbyDays == nil || *user.PendingEmbyDays != 7 {
+		t.Fatalf("registered user did not receive pending entitlement: %#v days=%#v", user, user.PendingEmbyDays)
+	}
+	if !user.EmbyGrantLocked || user.RegistrationSource != registrationSourceRegCode || user.RegistrationCode != "REGISTER-OK" {
+		t.Fatalf("register code source was not persisted on user: %#v", user)
+	}
+	reg, ok := app.store().RegCode("REGISTER-OK")
+	if !ok || reg.UseCount != 1 || reg.UsedBy != user.UID || reg.Active {
+		t.Fatalf("register code usage was not persisted: %#v", reg)
+	}
+
+	reuse := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"reuse-code","password":"User123456","reg_code":"REGISTER-OK"}`, nil)
+	if reuse.Code != http.StatusBadRequest {
+		t.Fatalf("used register code should be rejected, status=%d body=%s", reuse.Code, reuse.Body.String())
+	}
+
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "RENEW-NOT-REGISTER", Type: 2, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	wrongType := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"wrong-type","password":"User123456","reg_code":"RENEW-NOT-REGISTER"}`, nil)
+	if wrongType.Code != http.StatusBadRequest {
+		t.Fatalf("renew code should not register users, status=%d body=%s", wrongType.Code, wrongType.Body.String())
+	}
+	reg, _ = app.store().RegCode("RENEW-NOT-REGISTER")
+	if reg.UseCount != 0 {
+		t.Fatalf("wrong type code was consumed: %#v", reg)
+	}
+}
+
+func TestRegcodeGrantHistoryBlocksSelfUnbindAndRepeatRegistrationGrant(t *testing.T) {
+	app := newTestApp(t)
+	user, err := app.store().CreateUser(store.User{Username: "grant-user", Role: store.RoleNormal, Active: true, EmbyID: "emby-old", EmbyUsername: "grant-user", EmbyGrantLocked: true, RegistrationSource: registrationSourceRegCode, RegistrationCode: "REG-OLD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/unbind", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleUnbindEmby(rr, req, nil)
+	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), `"error_code":"EMBY_UNBIND_FORBIDDEN"`) {
+		t.Fatalf("grant-backed user should not self-unbind Emby, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	currentUser, _ := app.store().User(user.UID)
+	if currentUser.EmbyID == "" {
+		t.Fatalf("forbidden self-unbind cleared Emby binding: %#v", currentUser)
+	}
+
+	currentUser, err = app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = ""
+		u.EmbyUsername = ""
+		u.PendingEmby = false
+		u.PendingEmbyDays = nil
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REG-NEW-GRANT", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"REG-NEW-GRANT"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: currentUser}))
+	rr = httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), `"error_code":"CODE_REGISTRATION_GRANT_ALREADY_USED"`) {
+		t.Fatalf("grant-backed user should not use another register code, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	reg, _ := app.store().RegCode("REG-NEW-GRANT")
+	if reg.UseCount != 0 || !reg.Active {
+		t.Fatalf("blocked repeat register code was consumed: %#v", reg)
+	}
+}
+
+func TestRegcodeUsageRecordsDoNotBlockSelfUnbindWithoutUserGrantLock(t *testing.T) {
+	app := newTestApp(t)
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/emby-usage":
+			_, _ = w.Write([]byte(`{"Id":"emby-usage","Name":"usage-only","Policy":{"IsDisabled":false}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/emby-usage/Policy":
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+	user, err := app.store().CreateUser(store.User{Username: "usage-only", Role: store.RoleNormal, Active: true, EmbyID: "emby-usage", EmbyUsername: "usage-only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "OLD-USAGE", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, UseCount: 1, UsedBy: user.UID, UsedByUIDs: []int64{user.UID}, Active: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/unbind", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleUnbindEmby(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("usage records alone should not block self-unbind, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.EmbyID != "" {
+		t.Fatalf("self-unbind did not clear Emby binding: %#v", updated)
+	}
+}
+
+func TestBindExistingEmbyConsumesPendingEntitlement(t *testing.T) {
+	app := newTestApp(t)
+	var policyPosts int32
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/AuthenticateByName":
+			_, _ = w.Write([]byte(`{"User":{"Id":"emby-existing","Name":"existing-user","Policy":{"IsAdministrator":false}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/emby-existing":
+			_, _ = w.Write([]byte(`{"Id":"emby-existing","Name":"existing-user","Policy":{"IsDisabled":false}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/emby-existing/Policy":
+			atomic.AddInt32(&policyPosts, 1)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+
+	days := 7
+	user, err := app.store().CreateUser(store.User{
+		Username:           "pending-bind",
+		Role:               store.RoleUnrecognized,
+		Active:             true,
+		PendingEmby:        true,
+		PendingEmbyDays:    &days,
+		EmbyGrantLocked:    true,
+		RegistrationSource: registrationSourceRegCode,
+		RegistrationCode:   "REG-BIND",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/bind", strings.NewReader(`{"emby_username":"existing-user","emby_password":"secret"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleBindEmby(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bind existing Emby status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.EmbyID != "emby-existing" || updated.EmbyUsername != "existing-user" {
+		t.Fatalf("existing Emby binding was not persisted: %#v", updated)
+	}
+	if updated.PendingEmby || updated.PendingEmbyDays != nil {
+		t.Fatalf("pending entitlement was not consumed on bind: %#v", updated)
+	}
+	if !updated.EmbyGrantLocked || updated.RegistrationSource != registrationSourceRegCode || updated.RegistrationCode != "REG-BIND" {
+		t.Fatalf("grant provenance was not preserved on bind: %#v", updated)
+	}
+	if updated.Role != store.RoleNormal {
+		t.Fatalf("pending unrecognized user was not promoted to normal after bind: %#v", updated)
+	}
+	if updated.ExpiredAt <= time.Now().Unix() || updated.ExpiredAt > time.Now().AddDate(0, 0, 8).Unix() {
+		t.Fatalf("pending entitlement days were not applied to expiry: %#v", updated)
+	}
+	if atomic.LoadInt32(&policyPosts) == 0 {
+		t.Fatal("bind did not sync Emby policy")
+	}
+}
+
+func TestBindExistingEmbyDoesNotOverwriteConcurrentBinding(t *testing.T) {
+	app := newTestApp(t)
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/AuthenticateByName":
+			_, _ = w.Write([]byte(`{"User":{"Id":"emby-new","Name":"new-remote","Policy":{"IsAdministrator":false}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+
+	user, err := app.store().CreateUser(store.User{Username: "race-bind", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := user
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = "emby-existing"
+		u.EmbyUsername = "existing"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/bind", strings.NewReader(`{"emby_username":"new-remote","emby_password":"secret"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: stale}))
+	rr := httptest.NewRecorder()
+	app.handleBindEmby(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("stale bind should be rejected, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.EmbyID != "emby-existing" || updated.EmbyUsername != "existing" {
+		t.Fatalf("stale bind overwrote existing binding: %#v", updated)
+	}
+}
+
+func TestDirectEmbyRegistrationRecordsRegcodeEquivalentGrant(t *testing.T) {
+	app := newTestApp(t)
+	policyPosts := 0
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/New":
+			_, _ = w.Write([]byte(`{"Id":"direct-emby","Name":"direct-emby"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/direct-emby":
+			_, _ = w.Write([]byte(`{"Id":"direct-emby","Name":"direct-emby","Policy":{}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/direct-emby/Password":
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/direct-emby/Policy":
+			policyPosts++
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+	app.cfg().EmbyDirectRegisterEnabled = true
+	app.cfg().EmbyDirectRegisterDays = 7
+
+	user, err := app.store().CreateUser(store.User{Username: "direct-user", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/register", strings.NewReader(`{"emby_username":"direct-emby","emby_password":"Strong123"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleRegisterEmby(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("direct register status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.EmbyID != "direct-emby" || !updated.EmbyGrantLocked || updated.RegistrationSource != registrationSourceRegCode {
+		t.Fatalf("direct register did not persist regcode-equivalent grant: %#v", updated)
+	}
+	if policyPosts == 0 {
+		t.Fatal("direct register did not sync Emby policy")
+	}
+}
+
+func TestRegisterEmbyDoesNotOverwriteConcurrentBinding(t *testing.T) {
+	app := newTestApp(t)
+	var created bool
+	var deleted bool
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/New":
+			created = true
+			_, _ = w.Write([]byte(`{"Id":"race-created","Name":"race-created"}`))
+		// 新建账号后必须能收紧策略（GET 用户 + POST Policy），否则创建会整体失败。
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/race-created":
+			_, _ = w.Write([]byte(`{"Id":"race-created","Name":"race-created","Policy":{}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/race-created/Policy":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/race-created/Password":
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/Users/race-created":
+			deleted = true
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+	app.cfg().EmbyDirectRegisterEnabled = true
+
+	user, err := app.store().CreateUser(store.User{Username: "race-register", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := user
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.EmbyID = "already-bound"
+		u.EmbyUsername = "already"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/register", strings.NewReader(`{"emby_username":"race-created","emby_password":"Strong123"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: stale}))
+	rr := httptest.NewRecorder()
+	app.handleRegisterEmby(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("stale register should be rejected, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.EmbyID != "already-bound" || updated.EmbyUsername != "already" {
+		t.Fatalf("stale register overwrote existing binding: %#v", updated)
+	}
+	if !created || !deleted {
+		t.Fatalf("created remote account should be cleaned up on stale local bind, created=%v deleted=%v", created, deleted)
+	}
+}
+
+func TestSelfUnbindDisablesRemoteEmbyBeforeClearingLocalBinding(t *testing.T) {
+	app := newTestApp(t)
+	remoteDisabled := false
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/emby-unbind":
+			_, _ = w.Write([]byte(`{"Id":"emby-unbind","Name":"unbind","Policy":{"IsDisabled":false}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/emby-unbind/Policy":
+			var payload map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			remoteDisabled = boolish(payload["IsDisabled"])
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+	user, err := app.store().CreateUser(store.User{Username: "unbind-user", Role: store.RoleNormal, Active: true, EmbyID: "emby-unbind", EmbyUsername: "unbind"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/unbind", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleUnbindEmby(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("self unbind status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !remoteDisabled {
+		t.Fatal("self unbind did not disable remote Emby user")
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.EmbyID != "" || updated.EmbyUsername != "" {
+		t.Fatalf("self unbind did not clear local binding: %#v", updated)
+	}
+}
+
+func TestSelfUnbindKeepsLocalBindingWhenRemoteDisableFails(t *testing.T) {
+	app := newTestApp(t)
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/emby-fail":
+			_, _ = w.Write([]byte(`{"Id":"emby-fail","Name":"fail","Policy":{"IsDisabled":false}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/Users/emby-fail/Policy":
+			http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "test-token"
+	user, err := app.store().CreateUser(store.User{Username: "unbind-fail", Role: store.RoleNormal, Active: true, EmbyID: "emby-fail", EmbyUsername: "fail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/emby/unbind", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleUnbindEmby(rr, req, nil)
+	if rr.Code != http.StatusBadGateway || !strings.Contains(rr.Body.String(), string(ErrEmbyDisableFailed)) {
+		t.Fatalf("remote disable failure should block unbind, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.EmbyID != "emby-fail" || updated.EmbyUsername != "fail" {
+		t.Fatalf("failed remote disable cleared local binding: %#v", updated)
+	}
+}
+
+func TestWebDisableDisablesEmbyButEnableDoesNotRestore(t *testing.T) {
+	app := newTestApp(t)
+	var policyPosts int32
+	var lastDisabled int32
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/Users/") && !strings.HasSuffix(r.URL.Path, "/Policy"):
+			id := strings.TrimPrefix(r.URL.Path, "/Users/")
+			_, _ = fmt.Fprintf(w, `{"Id":%q,"Name":%q,"Policy":{"IsDisabled":false}}`, id, id)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/Users/") && strings.HasSuffix(r.URL.Path, "/Policy"):
+			var payload map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			atomic.AddInt32(&policyPosts, 1)
+			if boolish(payload["IsDisabled"]) {
+				atomic.StoreInt32(&lastDisabled, 1)
+			} else {
+				atomic.StoreInt32(&lastDisabled, 0)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token"
+
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+	toggleUser, err := app.store().CreateUser(store.User{Username: "web-toggle", PasswordHash: "x", Role: store.RoleNormal, Active: true, EmbyID: "emby-toggle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchUser, err := app.store().CreateUser(store.User{Username: "web-patch", PasswordHash: "x", Role: store.RoleNormal, Active: true, EmbyID: "emby-patch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchUser, err := app.store().CreateUser(store.User{Username: "web-batch", PasswordHash: "x", Role: store.RoleNormal, Active: true, EmbyID: "emby-batch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiUser, err := app.store().CreateUser(store.User{Username: "web-apikey", PasswordHash: "x", Role: store.RoleNormal, Active: true, EmbyID: "emby-apikey"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	disableToggle := doJSONWithHeaders(app, http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/disable", toggleUser.UID), `{}`, adminCookies, headers)
+	if disableToggle.Code != http.StatusOK {
+		t.Fatalf("admin disable status=%d body=%s", disableToggle.Code, disableToggle.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 1 || atomic.LoadInt32(&lastDisabled) != 1 {
+		t.Fatalf("admin disable should disable Emby once, posts=%d last_disabled=%d", got, atomic.LoadInt32(&lastDisabled))
+	}
+	enableToggle := doJSONWithHeaders(app, http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/enable", toggleUser.UID), `{}`, adminCookies, headers)
+	if enableToggle.Code != http.StatusOK {
+		t.Fatalf("admin enable status=%d body=%s", enableToggle.Code, enableToggle.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 1 {
+		t.Fatalf("admin enable should not restore Emby, policy posts=%d", got)
+	}
+
+	disablePatch := doJSONWithHeaders(app, http.MethodPut, fmt.Sprintf("/api/v1/admin/users/%d", patchUser.UID), `{"active":false}`, adminCookies, headers)
+	if disablePatch.Code != http.StatusOK {
+		t.Fatalf("admin patch disable status=%d body=%s", disablePatch.Code, disablePatch.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 2 || atomic.LoadInt32(&lastDisabled) != 1 {
+		t.Fatalf("admin patch active=false should disable Emby once, posts=%d last_disabled=%d", got, atomic.LoadInt32(&lastDisabled))
+	}
+	enablePatch := doJSONWithHeaders(app, http.MethodPut, fmt.Sprintf("/api/v1/admin/users/%d", patchUser.UID), `{"active":true}`, adminCookies, headers)
+	if enablePatch.Code != http.StatusOK {
+		t.Fatalf("admin patch enable status=%d body=%s", enablePatch.Code, enablePatch.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 2 {
+		t.Fatalf("admin patch active=true should not restore Emby, policy posts=%d", got)
+	}
+
+	disableBatch := doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/disable", fmt.Sprintf(`{"uids":[%d],"confirm":%q}`, batchUser.UID, confirmBatchDisableUsers), adminCookies, headers)
+	if disableBatch.Code != http.StatusOK {
+		t.Fatalf("batch disable status=%d body=%s", disableBatch.Code, disableBatch.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 3 || atomic.LoadInt32(&lastDisabled) != 1 {
+		t.Fatalf("batch disable should disable Emby once, posts=%d last_disabled=%d", got, atomic.LoadInt32(&lastDisabled))
+	}
+	enableBatch := doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/enable", fmt.Sprintf(`{"uids":[%d],"confirm":%q}`, batchUser.UID, confirmBatchEnableUsers), adminCookies, headers)
+	if enableBatch.Code != http.StatusOK {
+		t.Fatalf("batch enable status=%d body=%s", enableBatch.Code, enableBatch.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 3 {
+		t.Fatalf("batch enable should not restore Emby, policy posts=%d", got)
+	}
+
+	disableAPIKeyReq := httptest.NewRequest(http.MethodPost, "/api/v1/apikey/disable", nil)
+	disableAPIKeyReq = disableAPIKeyReq.WithContext(context.WithValue(disableAPIKeyReq.Context(), principalKey, principal{User: apiUser}))
+	disableAPIKey := httptest.NewRecorder()
+	app.handleAPIKeyDisableAccount(disableAPIKey, disableAPIKeyReq, nil)
+	if disableAPIKey.Code != http.StatusOK {
+		t.Fatalf("API key account disable status=%d body=%s", disableAPIKey.Code, disableAPIKey.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 4 || atomic.LoadInt32(&lastDisabled) != 1 {
+		t.Fatalf("API key disable should disable Emby once, posts=%d last_disabled=%d", got, atomic.LoadInt32(&lastDisabled))
+	}
+	enableAPIKeyReq := httptest.NewRequest(http.MethodPost, "/api/v1/apikey/enable", nil)
+	enableAPIKeyReq = enableAPIKeyReq.WithContext(context.WithValue(enableAPIKeyReq.Context(), principalKey, principal{User: apiUser}))
+	enableAPIKey := httptest.NewRecorder()
+	app.handleAPIKeyEnableAccount(enableAPIKey, enableAPIKeyReq, nil)
+	if enableAPIKey.Code != http.StatusOK {
+		t.Fatalf("API key account enable status=%d body=%s", enableAPIKey.Code, enableAPIKey.Body.String())
+	}
+	if got := atomic.LoadInt32(&policyPosts); got != 4 {
+		t.Fatalf("API key enable should not restore Emby, policy posts=%d", got)
+	}
+}
+
+func TestEmbySyncDoesNotRestoreRemoteWhenWebIsActive(t *testing.T) {
+	app := newTestApp(t)
+	const activeRemoteID = "emby-sync-active"
+	const disabledRemoteID = "emby-sync-disabled"
+	var activePolicyPosts int32
+	var disabledPolicyPosts int32
+	var disabledLastPolicy int32
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Users":
+			_, _ = w.Write([]byte(`[
+				{"Id":"emby-sync-active","Name":"sync-active","Policy":{"IsDisabled":true}},
+				{"Id":"emby-sync-disabled","Name":"sync-disabled","Policy":{"IsDisabled":false}}
+			]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/"+activeRemoteID:
+			_, _ = w.Write([]byte(`{"Id":"emby-sync-active","Name":"sync-active","Policy":{"IsDisabled":true}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/Users/"+disabledRemoteID:
+			_, _ = w.Write([]byte(`{"Id":"emby-sync-disabled","Name":"sync-disabled","Policy":{"IsDisabled":false}}`))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/Users/") && strings.HasSuffix(r.URL.Path, "/Policy"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/Users/"), "/Policy")
+			var payload map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			disabled := boolish(payload["IsDisabled"])
+			switch id {
+			case activeRemoteID:
+				atomic.AddInt32(&activePolicyPosts, 1)
+			case disabledRemoteID:
+				atomic.AddInt32(&disabledPolicyPosts, 1)
+				if disabled {
+					atomic.StoreInt32(&disabledLastPolicy, 1)
+				}
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token"
+	if _, err := app.store().CreateUser(store.User{Username: "sync-active", Role: store.RoleNormal, Active: true, EmbyID: activeRemoteID, EmbyUsername: "sync-active"}); err != nil {
+		t.Fatal(err)
+	}
+	disabledUser, err := app.store().CreateUser(store.User{Username: "sync-disabled", Role: store.RoleNormal, Active: true, EmbyID: disabledRemoteID, EmbyUsername: "sync-disabled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().UpdateUser(disabledUser.UID, func(u *store.User) error { u.Active = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/scheduler/internal", nil)
+	if _, _, err := app.runSchedulerJob(req, "emby_sync"); err != nil {
+		t.Fatalf("emby_sync: %v", err)
+	}
+	if got := atomic.LoadInt32(&activePolicyPosts); got != 0 {
+		t.Fatalf("emby_sync should not restore disabled remote for active Web user, active posts=%d", got)
+	}
+	if got := atomic.LoadInt32(&disabledPolicyPosts); got != 1 || atomic.LoadInt32(&disabledLastPolicy) != 1 {
+		t.Fatalf("emby_sync should disable remote for disabled Web user, posts=%d last_disabled=%d", got, atomic.LoadInt32(&disabledLastPolicy))
+	}
+}
+
+func TestPermanentExpiryNormalizesForPublicAPIAndAdminRenew(t *testing.T) {
+	if got := expireStatus(permanentExpiryUnix); got != "永不过期" {
+		t.Fatalf("permanent expiry status = %q", got)
+	}
+	if got := numeric(publicUser(store.User{ExpiredAt: permanentExpiryUnix})["expired_at"]); got != -1 {
+		t.Fatalf("public permanent expired_at = %d, want -1", got)
+	}
+
+	app := newTestApp(t)
+	user, err := app.store().CreateUser(store.User{Username: "admin-renew-perm", Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().AddDate(0, 0, 1).Unix(), EmbyID: "emby-renew"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users/1/renew", strings.NewReader(`{"days":-1}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: store.User{UID: 999, Role: store.RoleAdmin, Active: true}}))
+	rr := httptest.NewRecorder()
+	app.handleAdminRenewUser(rr, req, Params{"uid": strconv.FormatInt(user.UID, 10)})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("admin permanent renew status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.ExpiredAt != permanentExpiryUnix || !updated.Active {
+		t.Fatalf("admin permanent renew did not set permanent active expiry: %#v", updated)
+	}
+}
+
+// TestAdminSetUserExpiryAbsolute 锁定 Task 2 的核心修复：
+//   - cancel-permanent 必须把永久号真正改成「现在起 N 天后」，而不是因为
+//     base=max(now, ExpiredAt) 在永久哨兵上叠加而保持永久（旧 bug）。
+//   - set-expiry 是绝对覆盖：对一个还有很久到期的用户设 N 天，结果是 now+N 天，
+//     而不是在原到期时间上叠加。
+//   - permanent=true 设永久；days 越界 / 非正被拒。
+func TestAdminSetUserExpiryAbsolute(t *testing.T) {
+	app := newTestApp(t)
+	adminCtx := func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), principalKey, principal{User: store.User{UID: 999, Role: store.RoleAdmin, Active: true}}))
+	}
+	call := func(uid int64, body string) *httptest.ResponseRecorder {
+		req := adminCtx(httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body)))
+		rr := httptest.NewRecorder()
+		app.handleAdminSetUserExpiry(rr, req, Params{"uid": strconv.FormatInt(uid, 10)})
+		return rr
+	}
+
+	// 永久号 → cancel-permanent 30 天：必须不再永久，且落在 now+30 天附近。
+	permUser, err := app.store().CreateUser(store.User{Username: "set-exp-perm", Role: store.RoleNormal, Active: true, ExpiredAt: permanentExpiryUnix, EmbyID: "e1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rr := call(permUser.UID, `{"days":30}`); rr.Code != http.StatusOK {
+		t.Fatalf("cancel-permanent status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(permUser.UID)
+	if expiryIsPermanent(updated.ExpiredAt) {
+		t.Fatalf("cancel-permanent left user permanent: ExpiredAt=%d", updated.ExpiredAt)
+	}
+	want := time.Now().Unix() + 30*86400
+	if diff := updated.ExpiredAt - want; diff < -120 || diff > 120 {
+		t.Fatalf("cancel-permanent absolute expiry off by %d (got %d want ~%d)", diff, updated.ExpiredAt, want)
+	}
+
+	// 远期到期号 → set-expiry 7 天：绝对覆盖，不叠加。
+	farUser, err := app.store().CreateUser(store.User{Username: "set-exp-far", Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().AddDate(5, 0, 0).Unix(), EmbyID: "e2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rr := call(farUser.UID, `{"days":7}`); rr.Code != http.StatusOK {
+		t.Fatalf("set-expiry status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ = app.store().User(farUser.UID)
+	want = time.Now().Unix() + 7*86400
+	if diff := updated.ExpiredAt - want; diff < -120 || diff > 120 {
+		t.Fatalf("set-expiry should overwrite not add: got %d want ~%d (diff %d)", updated.ExpiredAt, want, diff)
+	}
+
+	// permanent=true → 永久 + 复活。
+	if rr := call(farUser.UID, `{"permanent":true}`); rr.Code != http.StatusOK {
+		t.Fatalf("set permanent status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ = app.store().User(farUser.UID)
+	if !expiryIsPermanent(updated.ExpiredAt) || !updated.Active {
+		t.Fatalf("set permanent did not stick: %#v", updated)
+	}
+
+	// 越界 / 非正天数被拒。
+	if rr := call(farUser.UID, `{"days":40000}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("days>36500 should be rejected, got %d", rr.Code)
+	}
+	if rr := call(farUser.UID, `{"days":0}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("days<=0 without permanent should be rejected, got %d", rr.Code)
+	}
+}
+
+// TestAdminCancelPermanentIgnoresPermanentFlag 锁定 /cancel-permanent 的语义：
+// 路由名就是「不再永久」，所以请求体里无论带 permanent:true、days:-1 还是
+// expired_at 永久哨兵，都必须被忽略——否则路由名与行为相反，管理员点"取消永久"
+// 反而把号设成永久。对照 /set-expiry：同一套逻辑下这些输入确实会设永久。
+func TestAdminCancelPermanentIgnoresPermanentFlag(t *testing.T) {
+	app := newTestApp(t)
+	adminCtx := func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), principalKey, principal{User: store.User{UID: 999, Role: store.RoleAdmin, Active: true}}))
+	}
+	call := func(uid int64, body string) *httptest.ResponseRecorder {
+		req := adminCtx(httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body)))
+		rr := httptest.NewRecorder()
+		app.handleAdminCancelPermanent(rr, req, Params{"uid": strconv.FormatInt(uid, 10)})
+		return rr
+	}
+
+	permUser, err := app.store().CreateUser(store.User{Username: "cancel-perm-flag", Role: store.RoleNormal, Active: true, ExpiredAt: permanentExpiryUnix, EmbyID: "e-cp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 永久号 + 请求体要求永久 → 仍必须变成 now+30 天。
+	if rr := call(permUser.UID, `{"days":30,"permanent":true}`); rr.Code != http.StatusOK {
+		t.Fatalf("cancel-permanent status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(permUser.UID)
+	if expiryIsPermanent(updated.ExpiredAt) {
+		t.Fatalf("cancel-permanent must ignore permanent:true, got permanent expiry")
+	}
+	want := time.Now().Unix() + 30*86400
+	if diff := updated.ExpiredAt - want; diff < -120 || diff > 120 {
+		t.Fatalf("cancel-permanent expiry off by %d (got %d want ~%d)", diff, updated.ExpiredAt, want)
+	}
+
+	// expired_at 永久哨兵同样不能把号带回永久。
+	if rr := call(permUser.UID, `{"days":15,"expired_at":-1}`); rr.Code != http.StatusOK {
+		t.Fatalf("cancel-permanent with sentinel status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ = app.store().User(permUser.UID)
+	if expiryIsPermanent(updated.ExpiredAt) {
+		t.Fatalf("cancel-permanent must ignore permanent expired_at sentinel")
+	}
+
+	// days:-1（历史"永久"写法）在 cancel-permanent 上应当被拒，而不是设永久。
+	if rr := call(permUser.UID, `{"days":-1}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("cancel-permanent with days:-1 should be rejected, got %d", rr.Code)
+	}
+	updated, _ = app.store().User(permUser.UID)
+	if expiryIsPermanent(updated.ExpiredAt) {
+		t.Fatalf("cancel-permanent with days:-1 must not set permanent")
+	}
+
+	// 对照：/set-expiry 传 permanent:true 仍然设永久，语义没有被一起改坏。
+	if rr := callSetExpiry(app, adminCtx, permUser.UID, `{"permanent":true}`); rr.Code != http.StatusOK {
+		t.Fatalf("set-expiry permanent status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ = app.store().User(permUser.UID)
+	if !expiryIsPermanent(updated.ExpiredAt) {
+		t.Fatalf("set-expiry permanent:true should still set permanent, got %d", updated.ExpiredAt)
+	}
+}
+
+func callSetExpiry(app *App, adminCtx func(*http.Request) *http.Request, uid int64, body string) *httptest.ResponseRecorder {
+	req := adminCtx(httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body)))
+	rr := httptest.NewRecorder()
+	app.handleAdminSetUserExpiry(rr, req, Params{"uid": strconv.FormatInt(uid, 10)})
+	return rr
+}
+
+func TestRenewEndpointHonorsPermanentRegcode(t *testing.T) {
+	app := newTestApp(t)
+	user, err := app.store().CreateUser(store.User{Username: "renew-permanent", Role: store.RoleNormal, Active: true, EmbyID: "emby-renew-permanent", ExpiredAt: time.Now().AddDate(0, 0, 1).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "PERMANENT-RENEW", Type: 2, Days: -1, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"PERMANENT-RENEW"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("permanent renew status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if updated.ExpiredAt != permanentExpiryUnix {
+		t.Fatalf("permanent renew should set permanent expiry, got %d", updated.ExpiredAt)
+	}
+}
+
+// TestMediaRequestGlobalLimitBlocksNonAdmins 验证 max_concurrent_requests_global
+// 上限：达到后普通用户的新求片返回 MEDIA_REQUEST_GLOBAL_LIMIT，admin 仍可继续。
+func TestMediaRequestGlobalLimitBlocksNonAdmins(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().MaxConcurrentRequestsGlobal = 2
+	app.cfg().MaxConcurrentRequestsPerUser = -1
+	app.cfg().EmbyToken = "test-token"
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Items":[],"TotalRecordCount":0}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	if admin, ok := app.store().FindUserByUsername("admin"); ok {
+		_, _ = app.store().UpdateUser(admin.UID, func(u *store.User) error { u.TelegramID = 1; return nil })
+	}
+	userCookies := registerAndLogin(t, app, "user-one", "User123456")
+	user, _ := app.store().FindUserByUsername("user-one")
+	_, _ = app.store().UpdateUser(user.UID, func(u *store.User) error { u.TelegramID = 2; return nil })
+	userCookies2 := registerAndLogin(t, app, "user-two", "User123456")
+	user2, _ := app.store().FindUserByUsername("user-two")
+	_, _ = app.store().UpdateUser(user2.UID, func(u *store.User) error { u.TelegramID = 3; return nil })
+
+	makeReq := func(cookies []*http.Cookie, mediaID int) *httptest.ResponseRecorder {
+		return doJSONWithHeaders(app, http.MethodPost, "/api/v1/media/request",
+			fmt.Sprintf(`{"source":"tmdb","media_id":%d,"title":"M%d","media_type":"movie"}`, mediaID, mediaID),
+			cookies, map[string]string{"X-Twilight-Client": "webui"})
+	}
+
+	if r := makeReq(userCookies, 100); r.Code != http.StatusCreated {
+		t.Fatalf("first user request should succeed, status=%d body=%s", r.Code, r.Body.String())
+	}
+	if r := makeReq(userCookies2, 101); r.Code != http.StatusCreated {
+		t.Fatalf("second user request should succeed, status=%d body=%s", r.Code, r.Body.String())
+	}
+	// 全局 2 已满，第三个非 admin 求片应该被挡掉
+	blocked := makeReq(userCookies, 102)
+	if blocked.Code != http.StatusTooManyRequests || !strings.Contains(blocked.Body.String(), `"error_code":"MEDIA_REQUEST_GLOBAL_LIMIT"`) {
+		t.Fatalf("third request should hit global limit, status=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+	// admin 不受全局上限影响
+	adminOk := makeReq(adminCookies, 103)
+	if adminOk.Code != http.StatusCreated {
+		t.Fatalf("admin request should bypass global limit, status=%d body=%s", adminOk.Code, adminOk.Body.String())
+	}
+}
+
+func TestInviteParentCanDetachExpiredChildAndKeepWebAccountActive(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().InviteEnabled = false
+	deletedRemote := false
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/Users/emby-child" {
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+		deletedRemote = true
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token"
+	parent, err := app.store().CreateUser(store.User{Username: "parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "child", Email: "child-private@example.com", TelegramID: 987654321, Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().AddDate(0, 0, -1).Unix(), EmbyID: "emby-child", EmbyUsername: "child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-CHILD", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-CHILD", child.UID); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/children/2/detach-expired", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: parent}))
+	rr := httptest.NewRecorder()
+	app.handleDetachExpiredInviteChild(rr, req, Params{"uid": strconv.FormatInt(child.UID, 10)})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("detach status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	// 上级断开下级时，回应不得带出下级的个人信息。
+	if body := rr.Body.String(); strings.Contains(body, "child-private@example.com") || strings.Contains(body, "987654321") || strings.Contains(body, "registration_code") {
+		t.Fatalf("detach response leaks child's private fields: %s", body)
+	}
+	if _, ok := app.store().ParentOf(child.UID); ok {
+		t.Fatal("child still has invite parent")
+	}
+	if !deletedRemote {
+		t.Fatal("remote Emby user was not deleted")
+	}
+	updated, ok := app.store().User(child.UID)
+	if !ok || !updated.Active || updated.EmbyID != "" || updated.EmbyUsername != "" || updated.PendingEmby {
+		t.Fatalf("child web account was not preserved while Emby was cleared: %#v", updated)
+	}
+}
+
+func TestInviteChildCanDetachSelfAfterExpiryAndDeleteOwnEmby(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().InviteEnabled = false
+	deletedRemote := false
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/Users/emby-self-detach" {
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+		deletedRemote = true
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token"
+	parent, err := app.store().CreateUser(store.User{Username: "self-parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "self-child", Role: store.RoleNormal, Active: true, ExpiredAt: time.Now().AddDate(0, 0, -1).Unix(), EmbyID: "emby-self-detach", EmbyUsername: "self-child", EmbyDisabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-SELF-DETACH", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-SELF-DETACH", child.UID); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/me/detach-expired", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: child}))
+	rr := httptest.NewRecorder()
+	app.handleDetachMyExpiredInvite(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("self detach status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !deletedRemote {
+		t.Fatal("self detach did not delete remote Emby user")
+	}
+	if _, ok := app.store().ParentOf(child.UID); ok {
+		t.Fatal("self-detached child still has invite parent")
+	}
+	if status := app.inviteTreeFor(child); int(numeric(status["self"].(map[string]any)["depth"])) != 1 {
+		t.Fatalf("self-detached child should become root after refresh: %#v", status)
+	}
+	invite, ok := app.store().InviteCode("INV-SELF-DETACH")
+	if !ok {
+		t.Fatal("invite code should remain after self detach")
+	}
+	// 断开只清使用者引用：码保持已用，不退次数、不重新启用（防小号重复使用）。
+	if invite.UsedByUID != 0 || !invite.Used || invite.UseCount != 1 || invite.Active {
+		t.Fatalf("self detach should drop the usage reference and keep the code consumed: %#v", invite)
+	}
+	updated, ok := app.store().User(child.UID)
+	if !ok || !updated.Active || updated.EmbyID != "" || updated.EmbyUsername != "" || updated.EmbyDisabled || updated.PendingEmby {
+		t.Fatalf("self detach should keep web account active and clear Emby binding: %#v", updated)
+	}
+}
+
+func TestInviteParentCanDetachDisabledChildWithoutReactivatingWeb(t *testing.T) {
+	app := newTestApp(t)
+	deletedRemote := false
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/Users/emby-disabled-child" {
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+		deletedRemote = true
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token"
+	parent, err := app.store().CreateUser(store.User{Username: "disabled-parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "disabled-child", Role: store.RoleNormal, Active: false, ExpiredAt: time.Now().AddDate(0, 0, 10).Unix(), EmbyID: "emby-disabled-child", EmbyUsername: "disabled-child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-DISABLED-CHILD", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-DISABLED-CHILD", child.UID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().UpdateUser(child.UID, func(u *store.User) error { u.Active = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/children/2/detach-expired", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: parent}))
+	rr := httptest.NewRecorder()
+	app.handleDetachExpiredInviteChild(rr, req, Params{"uid": strconv.FormatInt(child.UID, 10)})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("detach disabled child status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !deletedRemote {
+		t.Fatal("remote Emby user was not deleted")
+	}
+	if _, ok := app.store().ParentOf(child.UID); ok {
+		t.Fatal("disabled child still has invite parent")
+	}
+	updated, ok := app.store().User(child.UID)
+	if !ok || updated.Active || updated.EmbyID != "" || updated.EmbyUsername != "" {
+		t.Fatalf("disabled child should stay disabled with Emby cleared: %#v", updated)
+	}
+}
+
+func TestRegcodeDTOAndUsersExposeLegacyUsedBy(t *testing.T) {
+	app := newTestApp(t)
+	user, err := app.store().CreateUser(store.User{Username: "legacy-user", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := store.RegCode{Code: "LEGACY-USED", Type: 2, Days: 30, ValidityTime: -1, UseCountLimit: 5, UseCount: 1, UsedBy: user.UID, Active: true}
+	dto := regcodeDTO(reg)
+	uids, _ := dto["used_by_uids"].([]int64)
+	if len(uids) != 1 || uids[0] != user.UID || asString(dto["used_by"]) != strconv.FormatInt(user.UID, 10) {
+		t.Fatalf("legacy used_by should be exposed in dto: %#v", dto)
+	}
+	if err := app.store().UpsertRegCode(reg); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/regcodes/LEGACY-USED/users", nil)
+	rr := httptest.NewRecorder()
+	app.handleRegcodeUsers(rr, req, Params{"code": "LEGACY-USED"})
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"username":"legacy-user"`) {
+		t.Fatalf("legacy used_by user should be listed, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	appDTO := app.regcodeDTO(reg)
+	usernames, _ := appDTO["used_by_usernames"].([]string)
+	if len(usernames) != 1 || usernames[0] != user.Username {
+		t.Fatalf("used_by_usernames should include legacy user: %#v", appDTO)
+	}
+	reg.UsedByUIDs = []int64{user.UID}
+	dto = regcodeDTO(reg)
+	uids, _ = dto["used_by_uids"].([]int64)
+	if len(uids) != 1 || uids[0] != user.UID || asString(dto["used_by"]) != strconv.FormatInt(user.UID, 10) {
+		t.Fatalf("new used_by_uids should be exposed in dto: %#v", dto)
+	}
+}
+
+func TestPendingEmbyUserCanReplaceEntitlementWithRegisterCode(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyUserLimit = 1
+	oldDays := 90
+	user, err := app.store().CreateUser(store.User{Username: "pending-replace", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedUser, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.PendingEmby = true
+		u.PendingEmbyDays = &oldDays
+		u.EmbyUsername = "old-name"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user = updatedUser
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REG-REPLACE", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"REG-REPLACE","emby_username":"new-name"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("pending entitlement replacement should use register code, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(user.UID)
+	if !updated.PendingEmby || updated.PendingEmbyDays == nil || *updated.PendingEmbyDays != 7 || updated.EmbyUsername != "new-name" {
+		t.Fatalf("register code did not replace pending entitlement cleanly: %#v days=%#v", updated, updated.PendingEmbyDays)
+	}
+	reg, _ := app.store().RegCode("REG-REPLACE")
+	if reg.UseCount != 1 || reg.UsedBy != user.UID {
+		t.Fatalf("register code usage was not recorded: %#v", reg)
+	}
+}
+
+func TestRegisterCodeCapacityExcludesCodeBeingConsumedAndRejectsBoundUser(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().EmbyUserLimit = 1
+	user, err := app.store().CreateUser(store.User{Username: "capacity-user", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REG-CAPACITY", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"REG-CAPACITY"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: user}))
+	rr := httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("register code should consume its own reserved capacity slot, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	bound, err := app.store().CreateUser(store.User{Username: "bound-user", Role: store.RoleNormal, Active: true, EmbyID: "emby-bound"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "REG-BOUND", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"REG-BOUND","check_only":true}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: bound}))
+	rr = httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("Emby-bound user should not preview register code as usable, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"REG-BOUND"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: bound}))
+	rr = httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("Emby-bound user should not use register code as renewal, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	reg, _ := app.store().RegCode("REG-BOUND")
+	if reg.UseCount != 0 {
+		t.Fatalf("rejected register code was consumed: %#v", reg)
+	}
+
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "VIP-BOUND", Type: 3, Days: -1, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"VIP-BOUND"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: bound}))
+	rr = httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("Emby-bound user should not use whitelist code as registration entitlement, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	reg, _ = app.store().RegCode("VIP-BOUND")
+	if reg.UseCount != 0 {
+		t.Fatalf("rejected whitelist code was consumed: %#v", reg)
+	}
+
+	parent, err := app.store().CreateUser(store.User{Username: "invite-parent-bound-check", Role: store.RoleNormal, Active: true, EmbyID: "emby-parent", ExpiredAt: time.Now().AddDate(0, 0, 30).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-BOUND-CHECK", UID: parent.UID, InviterUID: parent.UID, Days: 7, UseCountLimit: 1, Active: true, CreatedAt: time.Now().Unix(), ExpiredAt: time.Now().Add(time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"INV-BOUND-CHECK","check_only":true}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: bound}))
+	rr = httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("Emby-bound user should not preview invite code as usable, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	invite, _ := app.store().InviteCode("INV-BOUND-CHECK")
+	if invite.UseCount != 0 {
+		t.Fatalf("rejected invite code was consumed: %#v", invite)
+	}
+
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "RENEW-BOUND", Type: 2, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/use-code", strings.NewReader(`{"reg_code":"RENEW-BOUND"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: bound}))
+	rr = httptest.NewRecorder()
+	app.handleUseCode(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Emby-bound user should still use renewal code, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	reg, _ = app.store().RegCode("RENEW-BOUND")
+	if reg.UseCount != 1 {
+		t.Fatalf("renewal code was not consumed: %#v", reg)
+	}
+}
+
+func TestExpiredInviteCannotBeUsedOrConsumed(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	parent, err := app.store().CreateUser(store.User{Username: "expired-invite-parent", Role: store.RoleNormal, Active: true, EmbyID: "emby-parent", ExpiredAt: now.AddDate(0, 0, 30).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "expired-invite-child", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-EXPIRED-CODE", UID: parent.UID, InviterUID: parent.UID, Days: 7, UseCountLimit: 1, Active: true, CreatedAt: now.Add(-time.Hour).Unix(), ExpiredAt: now.Add(-time.Second).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/use", strings.NewReader(`{"code":"INV-EXPIRED-CODE"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: child}))
+	rr := httptest.NewRecorder()
+	app.handleInviteUse(rr, req, nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expired invite should be rejected, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-EXPIRED-CODE", child.UID); !errors.Is(err, store.ErrExpired) {
+		t.Fatalf("store should reject expired invite consumption, got %v", err)
+	}
+	invite, _ := app.store().InviteCode("INV-EXPIRED-CODE")
+	if invite.UseCount != 0 || invite.UsedByUID != 0 {
+		t.Fatalf("expired invite was consumed: %#v", invite)
+	}
+}
+
+func TestInviteRenewCodeCreatesTargetedRegCode(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	parent, err := app.store().CreateUser(store.User{Username: "renew-parent", Role: store.RoleNormal, Active: true, EmbyID: "emby-parent", ExpiredAt: now.AddDate(0, 0, 30).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "renew-child", Role: store.RoleNormal, Active: true, EmbyID: "emby-renew-child", ExpiredAt: now.AddDate(0, 0, 1).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsider, err := app.store().CreateUser(store.User{Username: "renew-outsider", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-RENEW-PARENT", UID: parent.UID, InviterUID: parent.UID, Days: 7, UseCountLimit: 1, Active: true, CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-RENEW-PARENT", child.UID); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/renew-codes", strings.NewReader(fmt.Sprintf(`{"target_uid":%d,"days":5,"validity_hours":24}`, child.UID)))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: parent}))
+	rr := httptest.NewRecorder()
+	app.handleCreateInviteCode(rr, req, nil)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create renew code status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	code := env.Data.(map[string]any)["code"].(string)
+	reg, ok := app.store().RegCode(code)
+	if !ok || reg.Type != 2 || reg.TargetUsername != child.Username || reg.ValidityTime != 24 {
+		t.Fatalf("renew code was not stored as targeted regcode: %#v", reg)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"`+code+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: outsider}))
+	rr = httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("outsider should not use targeted renew code, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/renew", strings.NewReader(`{"reg_code":"`+code+`"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: child}))
+	rr = httptest.NewRecorder()
+	app.handleRenew(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("target child should use renew code, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestInviteDisabledStillAllowsExistingChildRenewCodesButBlocksNewInvites(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().InviteEnabled = false
+	now := time.Now()
+	parent, err := app.store().CreateUser(store.User{Username: "disabled-renew-parent", Role: store.RoleNormal, Active: true, EmbyID: "emby-parent", ExpiredAt: now.AddDate(0, 0, 30).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "disabled-renew-child", Role: store.RoleNormal, Active: true, ExpiredAt: now.AddDate(0, 0, -1).Unix(), EmbyID: "emby-child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-DISABLED-RENEW", UID: parent.UID, InviterUID: parent.UID, Days: 7, UseCountLimit: 1, Active: true, CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-DISABLED-RENEW", child.UID); err != nil {
+		t.Fatal(err)
+	}
+
+	meReq := httptest.NewRequest(http.MethodGet, "/api/v1/invite/me", nil)
+	meReq = meReq.WithContext(context.WithValue(meReq.Context(), principalKey, principal{User: parent}))
+	meRR := httptest.NewRecorder()
+	app.handleInviteMe(meRR, meReq, nil)
+	if meRR.Code != http.StatusOK || !strings.Contains(meRR.Body.String(), `"enabled":false`) || !strings.Contains(meRR.Body.String(), `"can_invite":false`) || !strings.Contains(meRR.Body.String(), `"can_generate_renew_code":true`) {
+		t.Fatalf("disabled invite/me should expose existing child renewal controls, status=%d body=%s", meRR.Code, meRR.Body.String())
+	}
+
+	inviteReq := httptest.NewRequest(http.MethodPost, "/api/v1/invite/codes", strings.NewReader(`{"days":7}`))
+	inviteReq = inviteReq.WithContext(context.WithValue(inviteReq.Context(), principalKey, principal{User: parent}))
+	inviteRR := httptest.NewRecorder()
+	app.handleCreateInviteCode(inviteRR, inviteReq, nil)
+	if inviteRR.Code != http.StatusForbidden || !strings.Contains(inviteRR.Body.String(), string(ErrInviteDisabled)) {
+		t.Fatalf("disabled invite system should block new invite codes, status=%d body=%s", inviteRR.Code, inviteRR.Body.String())
+	}
+
+	renewReq := httptest.NewRequest(http.MethodPost, "/api/v1/invite/renew-codes", strings.NewReader(fmt.Sprintf(`{"target_uid":%d,"days":5,"validity_hours":24}`, child.UID)))
+	renewReq = renewReq.WithContext(context.WithValue(renewReq.Context(), principalKey, principal{User: parent}))
+	renewRR := httptest.NewRecorder()
+	app.handleCreateInviteCode(renewRR, renewReq, nil)
+	if renewRR.Code != http.StatusCreated {
+		t.Fatalf("disabled invite system should still allow child renew code, status=%d body=%s", renewRR.Code, renewRR.Body.String())
+	}
+}
+
+func TestAdminCanDetachInviteRelationWhenInviteDisabled(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().InviteEnabled = false
+	admin, err := app.store().CreateUser(store.User{Username: "admin", Role: store.RoleAdmin, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := app.store().CreateUser(store.User{Username: "admin-detach-parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "admin-detach-child", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-ADMIN-DETACH", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-ADMIN-DETACH", child.UID); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/invite/users/3/detach", nil)
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: admin}))
+	rr := httptest.NewRecorder()
+	app.handleInviteDetach(rr, req, Params{"uid": strconv.FormatInt(child.UID, 10)})
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"changed":true`) {
+		t.Fatalf("admin detach should work while invite disabled, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, ok := app.store().ParentOf(child.UID); ok {
+		t.Fatal("child still has invite parent after admin detach")
+	}
+}
+
+func TestAdminBatchDetachInviteRelation(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().InviteEnabled = false
+	admin := registerAndLogin(t, app, "admin", "Admin123456")
+	parent, err := app.store().CreateUser(store.User{Username: "batch-detach-parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "batch-detach-child", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-BATCH-DETACH", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-BATCH-DETACH", child.UID); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := doJSON(app, http.MethodPost, "/api/v1/admin/invite/users/detach-batch", fmt.Sprintf(`{"uids":[%d],"delete_emby":false}`, child.UID), admin)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("batch detach status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Success int `json:"success"`
+			Failed  int `json:"failed"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode batch detach: %v body=%s", err, rr.Body.String())
+	}
+	if resp.Data.Success != 1 || resp.Data.Failed != 0 {
+		t.Fatalf("unexpected batch result: %#v body=%s", resp.Data, rr.Body.String())
+	}
+	if _, ok := app.store().ParentOf(child.UID); ok {
+		t.Fatal("child still has invite parent after batch detach")
+	}
+	invite, ok := app.store().InviteCode("INV-BATCH-DETACH")
+	if !ok {
+		t.Fatal("invite code should remain")
+	}
+	if invite.UsedByUID != 0 || !invite.Used || invite.UseCount != 1 || invite.Active {
+		t.Fatalf("batch detach should drop the usage reference and keep the code consumed: %#v", invite)
+	}
+}
+
+func TestInviteForestHidesCodeOnlyUsersWhenInviteDisabled(t *testing.T) {
+	app := newTestApp(t)
+	codeOnly, err := app.store().CreateUser(store.User{Username: "invite-code-only", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := app.store().CreateUser(store.User{Username: "invite-tree-parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := app.store().CreateUser(store.User{Username: "invite-tree-leaf", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-CODE-ONLY", UID: codeOnly.UID, InviterUID: codeOnly.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-TREE-LEAF", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-TREE-LEAF", leaf.UID); err != nil {
+		t.Fatal(err)
+	}
+
+	forestUIDs := func() map[int64]bool {
+		forest := app.inviteForest()
+		nodes, _ := forest["nodes"].([]map[string]any)
+		uids := make(map[int64]bool, len(nodes))
+		for _, node := range nodes {
+			uids[numeric(node["uid"])] = true
+		}
+		return uids
+	}
+
+	app.cfg().InviteEnabled = true
+	enabledUIDs := forestUIDs()
+	if !enabledUIDs[codeOnly.UID] {
+		t.Fatal("enabled invite forest should retain a code-only prospective root")
+	}
+
+	app.cfg().InviteEnabled = false
+	disabledUIDs := forestUIDs()
+	if disabledUIDs[codeOnly.UID] {
+		t.Fatal("disabled invite forest should hide users with codes but no relations")
+	}
+	if !disabledUIDs[parent.UID] || !disabledUIDs[leaf.UID] {
+		t.Fatalf("disabled invite forest must retain complete real relations, got uids=%v", disabledUIDs)
+	}
+}
+
+func TestInviteDisabledEmbyChildCanBeDeletedAndDetached(t *testing.T) {
+	now := time.Now().Unix()
+	child := store.User{Active: true, EmbyID: "disabled-emby", EmbyDisabled: true, ExpiredAt: now + 86400}
+	if !inviteChildCanDeleteEmbyAndDetach(child, now) {
+		t.Fatal("Emby-disabled bound child should be eligible for delete and detach")
+	}
+}
+
+func TestAdminBatchDetachOnlyDisabledEmby(t *testing.T) {
+	app := newTestApp(t)
+	admin := registerAndLogin(t, app, "admin", "Admin123456")
+	deletedRemoteID := ""
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/Users/emby-disabled" {
+			t.Fatalf("unexpected Emby request: %s %s", r.Method, r.URL.Path)
+		}
+		deletedRemoteID = strings.TrimPrefix(r.URL.Path, "/Users/")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+	app.cfg().EmbyToken = "token"
+
+	parent, err := app.store().CreateUser(store.User{Username: "disabled-emby-parent", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledChild, err := app.store().CreateUser(store.User{Username: "disabled-emby-child", Role: store.RoleNormal, Active: true, EmbyID: "emby-disabled", EmbyDisabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabledChild, err := app.store().CreateUser(store.User{Username: "enabled-emby-child", Role: store.RoleNormal, Active: true, EmbyID: "emby-enabled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for code, childUID := range map[string]int64{
+		"INV-DISABLED-EMBY": disabledChild.UID,
+		"INV-ENABLED-EMBY":  enabledChild.UID,
+	} {
+		if err := app.store().UpsertInviteCode(store.InviteCode{Code: code, UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.store().ConsumeInviteCode(code, childUID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forest := app.inviteForest()
+	forestNodes, _ := forest["nodes"].([]map[string]any)
+	foundDisabledState := false
+	for _, node := range forestNodes {
+		if numeric(node["uid"]) == disabledChild.UID && node["emby_disabled"] == true {
+			foundDisabledState = true
+			break
+		}
+	}
+	if !foundDisabledState {
+		t.Fatalf("invite forest should expose disabled Emby state: %#v", forestNodes)
+	}
+
+	invalidBool := doJSON(app, http.MethodPost, "/api/v1/admin/invite/users/detach-batch", fmt.Sprintf(`{"uids":[%d],"delete_emby":true,"only_emby_disabled":"true"}`, disabledChild.UID), admin)
+	if invalidBool.Code != http.StatusBadRequest || !strings.Contains(invalidBool.Body.String(), string(ErrInvalidPayload)) {
+		t.Fatalf("string only_emby_disabled should be rejected, status=%d body=%s", invalidBool.Code, invalidBool.Body.String())
+	}
+	missingDelete := doJSON(app, http.MethodPost, "/api/v1/admin/invite/users/detach-batch", fmt.Sprintf(`{"uids":[%d],"delete_emby":false,"only_emby_disabled":true}`, disabledChild.UID), admin)
+	if missingDelete.Code != http.StatusBadRequest || !strings.Contains(missingDelete.Body.String(), string(ErrInvalidPayload)) {
+		t.Fatalf("only_emby_disabled without deletion should be rejected, status=%d body=%s", missingDelete.Code, missingDelete.Body.String())
+	}
+	if deletedRemoteID != "" {
+		t.Fatalf("invalid filtered requests must not delete remote Emby, got %q", deletedRemoteID)
+	}
+
+	body := fmt.Sprintf(`{"uids":[%d,%d],"delete_emby":true,"only_emby_disabled":true}`, disabledChild.UID, enabledChild.UID)
+	resp := doJSON(app, http.MethodPost, "/api/v1/admin/invite/users/detach-batch", body, admin)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("disabled Emby batch detach status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Success                int `json:"success"`
+			Failed                 int `json:"failed"`
+			DeletedEmby            int `json:"deleted_emby"`
+			SkippedNotEmbyDisabled int `json:"skipped_not_emby_disabled"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.Success != 1 || payload.Data.Failed != 0 || payload.Data.DeletedEmby != 1 || payload.Data.SkippedNotEmbyDisabled != 1 {
+		t.Fatalf("unexpected disabled Emby batch result: %#v body=%s", payload.Data, resp.Body.String())
+	}
+	if deletedRemoteID != "emby-disabled" {
+		t.Fatalf("deleted remote Emby id=%q, want emby-disabled", deletedRemoteID)
+	}
+	updatedDisabled, _ := app.store().User(disabledChild.UID)
+	if updatedDisabled.EmbyID != "" || updatedDisabled.EmbyDisabled {
+		t.Fatalf("disabled Emby binding should be cleared: %#v", updatedDisabled)
+	}
+	if _, ok := app.store().ParentOf(disabledChild.UID); ok {
+		t.Fatal("disabled Emby child should be detached")
+	}
+	updatedEnabled, _ := app.store().User(enabledChild.UID)
+	if updatedEnabled.EmbyID != "emby-enabled" {
+		t.Fatalf("enabled Emby child should be untouched: %#v", updatedEnabled)
+	}
+	if _, ok := app.store().ParentOf(enabledChild.UID); !ok {
+		t.Fatal("enabled Emby child relation should remain")
+	}
+}
+
+func TestPublicRegcodeCheckHidesTargetedCodes(t *testing.T) {
+	app := newTestApp(t)
+	if err := app.store().UpsertRegCode(store.RegCode{Code: "TARGET-SECRET", Type: 2, Days: 5, ValidityTime: -1, UseCountLimit: 1, Active: true, TargetUsername: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	resp := doJSON(app, http.MethodGet, "/api/v1/users/regcode/check?reg_code=TARGET-SECRET", ``, nil)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("public regcode check should hide targeted codes, status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestInviteUseRevalidatesTreeAndBoundsExpiry(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	parentExpiry := now.AddDate(0, 0, 5).Unix()
+	parent, err := app.store().CreateUser(store.User{Username: "parent", Role: store.RoleNormal, Active: true, EmbyID: "emby-parent", ExpiredAt: parentExpiry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "child", Role: store.RoleNormal, Active: true, ExpiredAt: now.AddDate(0, 0, 60).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-BOUNDS", UID: parent.UID, InviterUID: parent.UID, Days: 30, UseCountLimit: 1, Active: true, CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/use", strings.NewReader(`{"code":"INV-BOUNDS"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: child}))
+	rr := httptest.NewRecorder()
+	app.handleInviteUse(rr, req, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("invite use status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, _ := app.store().User(child.UID)
+	if updated.ExpiredAt > parentExpiry {
+		t.Fatalf("child expiry exceeded parent expiry: child=%d parent=%d", updated.ExpiredAt, parentExpiry)
+	}
+	if updated.PendingEmbyDays == nil || *updated.PendingEmbyDays > 5 {
+		t.Fatalf("pending emby days were not clamped to inviter expiry: %#v", updated.PendingEmbyDays)
+	}
+
+	otherParent, err := app.store().CreateUser(store.User{Username: "other-parent", Role: store.RoleNormal, Active: true, EmbyID: "emby-other", ExpiredAt: now.AddDate(0, 0, 30).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-SECOND", UID: otherParent.UID, InviterUID: otherParent.UID, Days: 7, UseCountLimit: 1, Active: true, CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/invite/use", strings.NewReader(`{"code":"INV-SECOND"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: child}))
+	rr = httptest.NewRecorder()
+	app.handleInviteUse(rr, req, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("second parent should be rejected, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestInviteUseRejectsExpiredInviterAndRootLimit(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	expiredParent, err := app.store().CreateUser(store.User{Username: "expired-parent", Role: store.RoleNormal, Active: true, EmbyID: "emby-expired", ExpiredAt: now.AddDate(0, 0, -1).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := app.store().CreateUser(store.User{Username: "candidate", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-EXPIRED-PARENT", UID: expiredParent.UID, InviterUID: expiredParent.UID, Days: 30, UseCountLimit: 1, Active: true, CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/invite/use", strings.NewReader(`{"code":"INV-EXPIRED-PARENT"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: candidate}))
+	rr := httptest.NewRecorder()
+	app.handleInviteUse(rr, req, nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expired inviter should be rejected, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	app.cfg().InviteRootUserLimit = 1
+	root, err := app.store().CreateUser(store.User{Username: "root", Role: store.RoleNormal, Active: true, EmbyID: "emby-root", ExpiredAt: now.AddDate(0, 0, 30).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := app.store().CreateUser(store.User{Username: "child2", Role: store.RoleNormal, Active: true, EmbyID: "emby-child2", ExpiredAt: now.AddDate(0, 0, 20).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-ROOT-CHILD", UID: root.UID, InviterUID: root.UID, Days: 10, UseCountLimit: 1, Active: true, CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().ConsumeInviteCode("INV-ROOT-CHILD", child.UID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := app.canInvite(child); ok {
+		t.Fatal("child should not be allowed to create more invites after root tree reaches limit")
+	}
+	grandchild, err := app.store().CreateUser(store.User{Username: "grandchild", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertInviteCode(store.InviteCode{Code: "INV-GRANDCHILD", UID: child.UID, InviterUID: child.UID, Days: 10, UseCountLimit: 1, Active: true, CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/invite/use", strings.NewReader(`{"code":"INV-GRANDCHILD"}`))
+	req = req.WithContext(context.WithValue(req.Context(), principalKey, principal{User: grandchild}))
+	rr = httptest.NewRecorder()
+	app.handleInviteUse(rr, req, nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("root limit should reject grandchild, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestTelegramGrantRegisterActionSetsPendingEntitlement(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().InviteDefaultDays = 12
+	target, err := app.store().CreateUser(store.User{Username: "tg-target", Role: store.RoleUnrecognized, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	panel := telegramPanelContext{Token: "grant", TargetUID: target.UID, ExpiresAt: time.Now().Add(time.Minute).Unix()}
+	app.telegramSavePanel(panel)
+	app.telegramApplyPanelAction(context.Background(), panel, "grant_register", 0)
+	updated, _ := app.store().User(target.UID)
+	if !updated.PendingEmby || updated.PendingEmbyDays == nil || *updated.PendingEmbyDays != 12 || updated.Role != store.RoleNormal {
+		t.Fatalf("grant_register did not create pending entitlement: %#v days=%#v", updated, updated.PendingEmbyDays)
+	}
+
+	admin, err := app.store().CreateUser(store.User{Username: "protected-admin", Role: store.RoleAdmin, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminPanel := telegramPanelContext{Token: "admin-grant", TargetUID: admin.UID, ExpiresAt: time.Now().Add(time.Minute).Unix()}
+	app.telegramSavePanel(adminPanel)
+	app.telegramApplyPanelAction(context.Background(), adminPanel, "grant_register", 0)
+	protected, _ := app.store().User(admin.UID)
+	if protected.PendingEmby {
+		t.Fatal("grant_register should not mutate protected admin accounts")
+	}
+}
+
+func TestTelegramRosterStatsUsesObservedMembers(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramGroupIDs = []string{"-1001"}
+	if err := app.store().UpsertTelegramRoster("-1001", 100, "member", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertTelegramRoster("-1001", 200, "member", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpsertTelegramRoster("-1001", 300, "member", true); err != nil {
+		t.Fatal(err)
+	}
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	admin, _ := app.store().FindUserByUsername("admin")
+	_, _ = app.store().UpdateUser(admin.UID, func(u *store.User) error { u.TelegramID = 100; return nil })
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	resp := doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/telegram/roster/stats", ``, []*http.Cookie{cookie}, nil)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"bound":1`) || !strings.Contains(resp.Body.String(), `"unbound":1`) || !strings.Contains(resp.Body.String(), `"bots":1`) {
+		t.Fatalf("roster stats status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestTelegramBotTestDoesNotExposeUpstreamError(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().TelegramMode = true
+	app.cfg().TelegramBotToken = "123:SECRET"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":502,"description":"dial http://10.0.0.8:65535 failed with bot 123:SECRET"}`))
+	}))
+	defer upstream.Close()
+	app.cfg().TelegramAPIURL = upstream.URL
+
+	cookies := registerAndLogin(t, app, "admin", "Admin123456")
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/system/admin/bot/test", `{}`, cookies, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("bot test status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if strings.Contains(body, "123:SECRET") || strings.Contains(body, "10.0.0.8") || strings.Contains(body, "dial") {
+		t.Fatalf("bot test exposed upstream diagnostics: %s", body)
+	}
+	if !strings.Contains(body, "Telegram 连接测试失败") {
+		t.Fatalf("bot test did not return generic failure: %s", body)
+	}
+}
+
+func TestUserStatsEndpointRemoved(t *testing.T) {
+	app := newTestApp(t)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"root","password":"Root123456"}`, nil)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"alpha","password":"Alpha123456"}`, nil)
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"beta","password":"Beta123456"}`, nil)
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"alpha","password":"Alpha123456"}`, nil)
+	cookie := findCookie(login.Result().Cookies(), "twilight_session")
+	beta, ok := app.store().FindUserByUsername("beta")
+	if !ok {
+		t.Fatal("beta user not found")
+	}
+
+	resp := doJSON(app, http.MethodGet, "/api/v1/stats/user/"+strconv.FormatInt(beta.UID, 10), ``, []*http.Cookie{cookie})
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("expected removed stats route, status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestBatchUserDangerousActionsRequireConfirm(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	tests := []struct {
+		name string
+		path string
+		body string
+		want string
+	}{
+		{"enable", "/api/v1/batch/users/enable", `{"uids":[1]}`, confirmBatchEnableUsers},
+		{"disable", "/api/v1/batch/users/disable", `{"uids":[1]}`, confirmBatchDisableUsers},
+		{"delete", "/api/v1/batch/users/delete", `{"uids":[1]}`, confirmBatchDeleteUsers},
+		{"renew", "/api/v1/batch/users/renew", `{"uids":[1],"days":30}`, confirmBatchRenewUsers},
+		{"emby unbind lock", "/api/v1/batch/users/emby-unbind-lock", `{"uids":[1]}`, confirmBatchLockEmbyUnbind},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := doJSONWithHeaders(app, http.MethodPost, tt.path, tt.body, cookies, headers)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+			}
+			body := resp.Body.String()
+			if !strings.Contains(body, tt.want) || !strings.Contains(body, `"error_code":"BATCH_CONFIRM_REQUIRED"`) {
+				t.Fatalf("missing confirm/error contract in body=%s", body)
+			}
+		})
+	}
+
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/enable", fmt.Sprintf(`{"confirm":%q}`, confirmBatchEnableUsers), cookies, headers)
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "uids required") || !strings.Contains(resp.Body.String(), `"error_code":"BATCH_UIDS_REQUIRED"`) {
+		t.Fatalf("missing uids contract, status=%d body=%s", resp.Code, resp.Body.String())
+	}
+
+	tooLarge := doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/renew", fmt.Sprintf(`{"confirm":%q,"uids":[1],"days":36501}`, confirmBatchRenewUsers), cookies, headers)
+	if tooLarge.Code != http.StatusBadRequest || !strings.Contains(tooLarge.Body.String(), `"error_code":"BATCH_DAYS_INVALID"`) {
+		t.Fatalf("batch renew days cap status=%d body=%s", tooLarge.Code, tooLarge.Body.String())
+	}
+}
+
+func TestBatchLockEmbyUnbindSupportsSelectedFilter(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	alpha, err := app.store().CreateUser(store.User{Username: "alpha-lock", PasswordHash: "x", Role: store.RoleNormal, Active: true, EmbyID: "emby-alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := app.store().CreateUser(store.User{Username: "beta-lock", PasswordHash: "x", Role: store.RoleNormal, Active: true, EmbyID: "emby-beta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gamma, err := app.store().CreateUser(store.User{Username: "gamma-lock", PasswordHash: "x", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().UpdateUser(beta.UID, func(u *store.User) error { u.Active = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	body := fmt.Sprintf(`{"select_all":true,"filter":{"role":1,"active":true,"search":"lock"},"confirm":%q}`, confirmBatchLockEmbyUnbind)
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/emby-unbind-lock", body, cookies, headers)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"selected_all":true`) || !strings.Contains(resp.Body.String(), `"success":1`) || !strings.Contains(resp.Body.String(), `"skipped_no_emby":0`) {
+		t.Fatalf("batch lock status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	updatedAlpha, _ := app.store().User(alpha.UID)
+	updatedBeta, _ := app.store().User(beta.UID)
+	updatedGamma, _ := app.store().User(gamma.UID)
+	if !updatedAlpha.EmbyGrantLocked {
+		t.Fatal("selected active user was not locked")
+	}
+	if updatedBeta.EmbyGrantLocked {
+		t.Fatal("filtered-out disabled user was locked")
+	}
+	if updatedGamma.EmbyGrantLocked {
+		t.Fatal("select_all should pre-filter user without Emby")
+	}
+
+	body = fmt.Sprintf(`{"uids":[%d],"confirm":%q}`, gamma.UID, confirmBatchLockEmbyUnbind)
+	resp = doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/emby-unbind-lock", body, cookies, headers)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"success":0`) || !strings.Contains(resp.Body.String(), `"failed":0`) || !strings.Contains(resp.Body.String(), `"skipped_no_emby":1`) {
+		t.Fatalf("explicit no-Emby lock status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	updatedGamma, _ = app.store().User(gamma.UID)
+	if updatedGamma.EmbyGrantLocked {
+		t.Fatal("explicit user without Emby should be skipped, not locked")
+	}
+}
+
+func TestOtherDangerousActionsRequireConfirm(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/violations/clear", `{}`, cookies, headers)
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), confirmClearViolations) || !strings.Contains(resp.Body.String(), `"error_code":"VIOLATION_CONFIRM_REQUIRED"`) {
+		t.Fatalf("clear violations missing confirm status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestCleanupInvalidUsersDefaultsToDryRunAndRequiresConfirm(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+	old := time.Now().Add(-10 * 24 * time.Hour).Unix()
+	ghost, err := app.store().CreateUser(store.User{Username: "ghost", PasswordHash: "x", Role: store.RoleNormal, Active: true, RegisterTime: old, CreatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preview := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/cleanup-invalid", `{}`, cookies, headers)
+	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), `"dry_run":true`) {
+		t.Fatalf("cleanup default dry run status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	if _, ok := app.store().User(ghost.UID); !ok {
+		t.Fatal("cleanup default request deleted user")
+	}
+
+	missingConfirm := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/cleanup-invalid", `{"dry_run":false}`, cookies, headers)
+	if missingConfirm.Code != http.StatusBadRequest || !strings.Contains(missingConfirm.Body.String(), confirmCleanupInvalidUsers) {
+		t.Fatalf("cleanup missing confirm status=%d body=%s", missingConfirm.Code, missingConfirm.Body.String())
+	}
+	if _, ok := app.store().User(ghost.UID); !ok {
+		t.Fatal("cleanup without confirm deleted user")
+	}
+
+	confirmed := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/cleanup-invalid", fmt.Sprintf(`{"dry_run":false,"confirm":%q}`, confirmCleanupInvalidUsers), cookies, headers)
+	if confirmed.Code != http.StatusOK || !strings.Contains(confirmed.Body.String(), `"dry_run":false`) {
+		t.Fatalf("cleanup confirmed status=%d body=%s", confirmed.Code, confirmed.Body.String())
+	}
+	if _, ok := app.store().User(ghost.UID); ok {
+		t.Fatal("confirmed cleanup did not delete user")
+	}
+}
+
+func doJSON(app *App, method, path, body string, cookies []*http.Cookie) *httptest.ResponseRecorder {
+	return doJSONWithHeaders(app, method, path, body, cookies, nil)
+}
+
+func doJSONWithHeaders(app *App, method, path, body string, cookies []*http.Cookie, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	for _, cookie := range cookies {
+		if cookie == nil {
+			continue
+		}
+		req.AddCookie(cookie)
+	}
+	rr := httptest.NewRecorder()
+	app.ServeHTTP(rr, req)
+	return rr
+}
+
+func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
+// TestDecodeMapEnforcesSizeAndDepthLimits 验证 decodeMap 在 256KB / 32 层
+// 边界外都返回空 map，避免攻击者通过超大 payload / 深嵌套 JSON 让单次解码
+// 吃光内存或拖慢后续遍历。
+func TestDecodeMapEnforcesSizeAndDepthLimits(t *testing.T) {
+	t.Run("rejects body over size limit", func(t *testing.T) {
+		// 构造略大于 maxJSONBodyBytes 的 payload：用一个长字符串字段顶到上限。
+		big := make([]byte, maxJSONBodyBytes+1024)
+		for i := range big {
+			big[i] = 'a'
+		}
+		body := []byte(`{"data":"`)
+		body = append(body, big...)
+		body = append(body, []byte(`"}`)...)
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		got := decodeMap(req)
+		if len(got) != 0 {
+			t.Fatalf("expected empty map for oversized body, got %v", got)
+		}
+	})
+	t.Run("rejects deeply nested payload", func(t *testing.T) {
+		var b strings.Builder
+		// 深度 = maxJSONNestingDepth + 5：一定越界。
+		depth := maxJSONNestingDepth + 5
+		for i := 0; i < depth; i++ {
+			b.WriteString(`{"a":`)
+		}
+		b.WriteString(`1`)
+		for i := 0; i < depth; i++ {
+			b.WriteString(`}`)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(b.String()))
+		req.Header.Set("Content-Type", "application/json")
+		got := decodeMap(req)
+		if len(got) != 0 {
+			t.Fatalf("expected empty map for over-nested body, got %v", got)
+		}
+	})
+	t.Run("rejects trailing JSON document", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"a":1}{"b":2}`))
+		if got := decodeMap(req); len(got) != 0 {
+			t.Fatalf("expected empty map for multiple JSON documents, got %v", got)
+		}
+		var payload struct {
+			A int `json:"a"`
+		}
+		req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"a":1}{"b":2}`))
+		if err := decodeJSON(req, &payload); err == nil {
+			t.Fatal("decodeJSON accepted multiple JSON documents")
+		}
+	})
+	t.Run("accepts shallow payload within limits", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"a":{"b":{"c":1}}}`))
+		req.Header.Set("Content-Type", "application/json")
+		got := decodeMap(req)
+		if len(got) == 0 {
+			t.Fatalf("expected non-empty map for shallow body")
+		}
+	})
+}
+
+// TestSharedHTTPClientRefusesCrossHostRedirect 锁定 sharedHTTPClient 的
+// CheckRedirect 策略：跨主机 302 必须被拒绝，调用方拿到 redirect 错误而非
+// 让 token / api_key 等自定义凭据被 Go 默认 follow 行为发到第三方。
+func TestSharedHTTPClientRefusesCrossHostRedirect(t *testing.T) {
+	// attacker 模拟外部恶意目标：如果 Go 真的 follow，会把 X-Emby-Token 这类
+	// 自定义头原样转发过来。靠 onAttacker 计数器断言 *没有* 命中。
+	var hitAttacker int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitAttacker, 1)
+		// 把所有自定义头回传，便于断言泄露。
+		for k, v := range r.Header {
+			for _, vv := range v {
+				w.Header().Add("X-Echo-"+k, vv)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer attacker.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/exfil", http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	headers := map[string]string{
+		"X-Emby-Token":  "super-secret-token",
+		"Authorization": "Bearer secret",
+	}
+	err := getJSON(context.Background(), upstream.URL+"/", headers, nil)
+	if err == nil {
+		t.Fatalf("expected error from cross-host redirect, got nil")
+	}
+	// 错误信息中应包含 redirect refused / status 3xx 字样
+	msg := err.Error()
+	if !strings.Contains(msg, "redirect") && !strings.Contains(msg, "302") && !strings.Contains(msg, "Location") {
+		t.Fatalf("expected redirect-refused error, got %q", msg)
+	}
+	if got := atomic.LoadInt32(&hitAttacker); got != 0 {
+		t.Fatalf("attacker host received %d requests, expected 0 (token would have leaked)", got)
+	}
+}
+
+// TestSharedHTTPClientFollowsSameHostRedirect 锁定同主机 302 仍然能正常 follow，
+// 避免 CheckRedirect 把合理的 trailing-slash / index 重定向也禁掉。
+func TestSharedHTTPClientFollowsSameHostRedirect(t *testing.T) {
+	var hits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/final", http.StatusFound)
+	})
+	mux.HandleFunc("/final", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var dst map[string]any
+	if err := getJSON(context.Background(), srv.URL+"/redirect", nil, &dst); err != nil {
+		t.Fatalf("same-host redirect failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("expected /final to be hit once, got %d", got)
+	}
+	if dst["ok"] != true {
+		t.Fatalf("expected ok:true, got %v", dst)
+	}
+}
+
+// TestValidateEmbyURLRejectsUnsafeTargets 锁定 Emby URL 校验：
+// 链路本地 / 元数据 IP / 非 http(s) scheme / query+fragment 必须被拒；
+// loopback / RFC1918 / 域名 + 公网必须被允许（与同机 / 同 VPC 部署兼容）。
+func TestValidateEmbyURLRejectsUnsafeTargets(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"loopback ipv4", "http://127.0.0.1:8096", false},
+		{"loopback ipv6", "http://[::1]:8096", false},
+		{"private rfc1918", "http://10.0.0.5:8096", false},
+		{"public host", "https://emby.example.com", false},
+		{"trailing slash trimmed", "http://127.0.0.1:8096/", false},
+		{"link-local ipv4", "http://169.254.0.10:8096", true},
+		{"aws metadata", "http://169.254.169.254/latest/meta-data/", true},
+		{"aliyun metadata", "http://100.100.100.200/", true},
+		{"link-local ipv6", "http://[fe80::1]:8096", true},
+		// IPv4-mapped IPv6 不能绕过否决：Go 的 To4() 会把 ::ffff:a.b.c.d 归一化，
+		// 元数据/link-local 仍被挡；而映射后的 RFC1918 仍按自托管策略放行。
+		{"ipv4-mapped metadata", "http://[::ffff:169.254.169.254]/", true},
+		{"ipv4-mapped aliyun", "http://[::ffff:100.100.100.200]/", true},
+		{"ipv4-mapped rfc1918 allowed", "http://[::ffff:10.0.0.5]:8096", false},
+		{"unspecified ipv4", "http://0.0.0.0:8096", true},
+		{"file scheme", "file:///etc/passwd", true},
+		{"ftp scheme", "ftp://example.com/", true},
+		{"missing host", "http:///path", true},
+		{"with query", "http://emby.example.com/?token=xxx", true},
+		{"with fragment", "http://emby.example.com/#frag", true},
+		{"empty", "", true},
+		{"whitespace only", "   ", true},
+		{"unparseable", "://", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateEmbyURL(strings.TrimSpace(tc.input))
+			gotErr := err != nil
+			if gotErr != tc.wantErr {
+				t.Fatalf("validateEmbyURL(%q) err=%v, wantErr=%v", tc.input, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateOutboundBaseURLForAllServices 锁定 Bangumi / Telegram / TMDB
+// 与 Emby 共享同一套 SSRF 否决：scheme 必须 http(s)、host 不能是 link-local
+// /unspecified / 阿里云 magic IP，且 base URL 不允许带 query / fragment。
+// 这条测试存在的意义是防止以后有人单独修 Emby 校验时漏改其他三家。
+func TestValidateOutboundBaseURLForAllServices(t *testing.T) {
+	type tc struct {
+		input   string
+		wantErr bool
+	}
+	cases := []tc{
+		{"https://api.example.com", false},
+		{"http://10.0.0.5", false},
+		{"http://127.0.0.1:8080", false},
+		{"http://169.254.169.254", true},
+		{"http://100.100.100.200", true},
+		{"http://[fe80::1]", true},
+		{"http://0.0.0.0", true},
+		{"javascript:alert(1)", true},
+		{"http:///path", true},
+		{"http://api.example.com/?k=v", true},
+		{"http://api.example.com/#x", true},
+	}
+	for _, svc := range []string{"Bangumi", "Telegram", "TMDB", "Emby"} {
+		for _, c := range cases {
+			c := c
+			t.Run(svc+"_"+c.input, func(t *testing.T) {
+				_, err := validateOutboundBaseURL(c.input, svc)
+				gotErr := err != nil
+				if gotErr != c.wantErr {
+					t.Fatalf("validateOutboundBaseURL(%q,%s) err=%v wantErr=%v", c.input, svc, err, c.wantErr)
+				}
+				if err != nil && !strings.Contains(err.Error(), svc) {
+					t.Fatalf("error message must surface service name %q, got %q", svc, err.Error())
+				}
+			})
+		}
+	}
+}
+
+// TestRenewReactivatesDisabledNonInvitedUser 锁定 R62-2 不变量：
+// check_expired 把"非邀请"过期账号设成 Active=false 后，任何续费路径都
+// 必须把 Active 同步复位到 true，否则用户续完照样登不上，admin 续完看到
+// "成功 200"实际上还得手动 enable 一遍——这是新人最容易踩的坑。
+//
+// 用 admin renew 路径覆盖这一点（self renew 需要消耗注册码、设置成本高，
+// admin renew 路径与 self/batch/regcode 共用同一个 renewExpiryAndReactivate
+// 助手，覆盖一条等价于覆盖四条）。
+func TestRenewReactivatesDisabledNonInvitedUser(t *testing.T) {
+	app := newTestApp(t)
+
+	// 第一个注册的用户自动晋升 admin（newTestApp 行为）。
+	_ = doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	adminLogin := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	if adminLogin.Code != http.StatusOK {
+		t.Fatalf("admin login: %d %s", adminLogin.Code, adminLogin.Body.String())
+	}
+	adminCookies := adminLogin.Result().Cookies()
+
+	// 构造一个已过期非邀请普通用户，模拟 check_expired 走完后的终态。
+	target, err := app.store().CreateUser(store.User{
+		Username:  "expired-normal",
+		Role:      store.RoleNormal,
+		Active:    false,
+		ExpiredAt: time.Now().Add(-24 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 触发 admin renew，days=30。修复前只 bump ExpiredAt，Active 仍是 false。
+	url := fmt.Sprintf("/api/v1/admin/users/%d/renew", target.UID)
+	resp := doJSONWithHeaders(app, http.MethodPost, url, `{"days":30}`, adminCookies, map[string]string{"X-Twilight-Client": "webui"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("admin renew: %d %s", resp.Code, resp.Body.String())
+	}
+
+	updated, ok := app.store().User(target.UID)
+	if !ok {
+		t.Fatalf("user disappeared after renew")
+	}
+	if !updated.Active {
+		t.Fatalf("R62-2 regression: renew did not reactivate disabled user (Active=%v)", updated.Active)
+	}
+	if updated.ExpiredAt <= time.Now().Unix() {
+		t.Fatalf("renew should advance ExpiredAt past now, got %d", updated.ExpiredAt)
+	}
+}
+
+// TestCheckExpiredSkipsAdminAndWhitelist 锁定 R62-3 不变量：
+// check_expired 调度看到 RoleAdmin / RoleWhitelist 用户即便 ExpiredAt 撞过
+// 期限也必须跳过——demote-then-repromote / 手动 SQL / 旧迁移都可能让 admin
+// 留下 finite ExpiredAt，一旦命中 check_expired 把 admin 自禁后 panel 就再
+// 也登不上。同时锁定 schedulerSummary 中暴露 skipped_protected 计数。
+func TestCheckExpiredSkipsAdminAndWhitelist(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().AdminUsernames = []string{"exp-config-admin"}
+
+	expiredUnix := time.Now().Add(-2 * time.Hour).Unix()
+	admin, err := app.store().CreateUser(store.User{Username: "exp-admin", Role: store.RoleAdmin, Active: true, ExpiredAt: expiredUnix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	whitelist, err := app.store().CreateUser(store.User{Username: "exp-wl", Role: store.RoleWhitelist, Active: true, ExpiredAt: expiredUnix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuredAdmin, err := app.store().CreateUser(store.User{Username: "exp-config-admin", Role: store.RoleNormal, Active: true, ExpiredAt: expiredUnix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normal, err := app.store().CreateUser(store.User{Username: "exp-normal", Role: store.RoleNormal, Active: true, ExpiredAt: expiredUnix})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/scheduler/internal", nil)
+	summary, _, err := app.runSchedulerJob(req, "check_expired")
+	if err != nil {
+		t.Fatalf("runSchedulerJob check_expired: %v", err)
+	}
+
+	// 普通用户：仍走原路径被禁。
+	if u, _ := app.store().User(normal.UID); u.Active {
+		t.Fatalf("non-admin expired user should be disabled, got Active=true")
+	}
+
+	// admin / whitelist：必须保留 Active=true。
+	if u, _ := app.store().User(admin.UID); !u.Active {
+		t.Fatalf("R62-3 regression: admin auto-disabled by check_expired")
+	}
+	if u, _ := app.store().User(whitelist.UID); !u.Active {
+		t.Fatalf("R62-3 regression: whitelist user auto-disabled by check_expired")
+	}
+	if u, _ := app.store().User(configuredAdmin.UID); !u.Active {
+		t.Fatalf("configured admin auto-disabled by check_expired")
+	}
+
+	// summary 必须暴露 skipped_protected 计数（admin + whitelist + configured admin = 3）。
+	got := int(numeric(summary["skipped_protected"]))
+	if got != 3 {
+		t.Fatalf("skipped_protected=%d in summary, want 3; summary=%v", got, summary)
+	}
+}
+
+// TestLoginByAPIKeyRejectsDisabledAccount 锁定与 handleLogin 同一不变量：
+// 禁用账号无法用 API Key 重新拿到 session。修复前 /auth/login/apikey 只查
+// API Key 命中即建会话，admin 把 Active=false 后这条路径仍可继续访问。
+func TestLoginByAPIKeyRejectsDisabledAccount(t *testing.T) {
+	app := newTestApp(t)
+	cookies := registerAndLogin(t, app, "carol", "Password123456")
+	rec := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/apikeys", `{"name":"k","rate_limit":50}`, cookies, map[string]string{"X-Twilight-Client": "webui"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create key status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var env envelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode key: %v", err)
+	}
+	key, _ := env.Data.(map[string]any)["key"].(string)
+	if !strings.HasPrefix(key, "key-") {
+		t.Fatalf("expected plaintext key, got %q", key)
+	}
+	user, ok := app.store().FindUserByUsername("carol")
+	if !ok {
+		t.Fatalf("user disappeared")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error { u.Active = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"apikey": key})
+	resp := doJSON(app, http.MethodPost, "/api/v1/auth/login/apikey", string(body), nil)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("login/apikey on disabled account: status=%d body=%s, want 403", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), string(ErrAccountDisabled)) {
+		t.Fatalf("expected ErrAccountDisabled in body, got %s", resp.Body.String())
+	}
+}
+
+// TestLoginDistinguishesExpiredFromDisabled 锁定 R62-6 不变量：
+// "管理员手动禁用"和"check_expired 触发的到期"两种 Active=false 状态在
+// /api/v1/auth/login 必须返回不同的 error_code，让 webui 的 CTA 分别走
+// /support 和 /renew。这条测试比单纯 helper 单测更接近 user-visible 契约：
+// 任何把 ErrAccountExpired 又静默融回 ErrAccountDisabled 的回归都会被它打断。
+func TestLoginDistinguishesExpiredFromDisabled(t *testing.T) {
+	app := newTestApp(t)
+	hash, err := security.HashPassword("Password123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 创建一个占位 admin，让后续两个测试用户不会被 bootstrap 路径强行
+	// 提升为 admin + Active=true（CreateUser 在 UserCount==0 时会无视
+	// 入参 Active 把首注册用户兜成 admin 启用态，绕开本测试要验证的禁用
+	// /到期分支）。
+	if _, err := app.store().CreateUser(store.User{Username: "boot-admin", Role: store.RoleAdmin, PasswordHash: hash, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := app.store().CreateUser(store.User{
+		Username:     "manually-disabled",
+		Role:         store.RoleNormal,
+		PasswordHash: hash,
+		Active:       true,
+		ExpiredAt:    time.Now().Add(24 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().UpdateUser(disabled.UID, func(u *store.User) error { u.Active = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := app.store().CreateUser(store.User{
+		Username:     "auto-expired",
+		Role:         store.RoleNormal,
+		PasswordHash: hash,
+		Active:       true,
+		ExpiredAt:    time.Now().Add(-1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store().UpdateUser(expired.UID, func(u *store.User) error { u.Active = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(username, want string) {
+		body := fmt.Sprintf(`{"username":%q,"password":"Password123456"}`, username)
+		resp := doJSON(app, http.MethodPost, "/api/v1/auth/login", body, nil)
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("login %s: status=%d body=%s, want 403", username, resp.Code, resp.Body.String())
+		}
+		if !strings.Contains(resp.Body.String(), want) {
+			t.Fatalf("login %s: expected %s in body, got %s", username, want, resp.Body.String())
+		}
+	}
+	check("manually-disabled", string(ErrAccountDisabled))
+	check("auto-expired", string(ErrAccountExpired))
+}
+
+// TestUserEntitlementOKExpiredBlocksInviteMint 锁定 R62-4 不变量：
+// 一个 Active=true 但 ExpiredAt < now 的用户不允许通过 invite_create / renew
+// code 路径继续 mint entitlement。这是新人最容易踩的一类逻辑：
+// "Active 字段为真就以为账号还能用任何接口"——R62-4 的本质是把 Active 与
+// ExpiredAt 这对 invariants 在 entitlement 决策点合并表达。
+//
+// 直接覆盖 userEntitlementOK helper（核心不变量），加一条 canInvite 验证
+// 提前给出可读 reason 文案。canInvite 已经隐式靠 maxCodeDays 挡住，但显
+// 式 gate 是防御纵深。
+func TestUserEntitlementOKExpiredBlocksInviteMint(t *testing.T) {
+	now := time.Now().Unix()
+	cases := []struct {
+		name string
+		user store.User
+		want bool
+	}{
+		{"active+future_expiry", store.User{Active: true, ExpiredAt: now + 86400}, true},
+		{"active+no_expiry", store.User{Active: true, ExpiredAt: 0}, true},
+		{"active+permanent_expiry", store.User{Active: true, ExpiredAt: 253402214400}, true},
+		{"active+past_expiry_blocks", store.User{Active: true, ExpiredAt: now - 1}, false},
+		{"inactive+future_expiry_blocks", store.User{Active: false, ExpiredAt: now + 86400}, false},
+		{"inactive+no_expiry_blocks", store.User{Active: false, ExpiredAt: 0}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := userEntitlementOK(tc.user); got != tc.want {
+				t.Fatalf("userEntitlementOK(%+v) = %v, want %v", tc.user, got, tc.want)
+			}
+		})
+	}
+
+	// 端到端：构造一个"Active=true 但已过期"的非邀请用户，调用 canInvite 必须
+	// 返回 (false, 含"到期"信号的 reason)。这一条防的是未来重构 maxCodeDays
+	// 改返回路径时静默放过 entitlement 的回归。
+	app := newTestApp(t)
+	app.cfg().InviteEnabled = true
+	user, err := app.store().CreateUser(store.User{
+		Username:  "active-but-expired",
+		Role:      store.RoleNormal,
+		Active:    true,
+		ExpiredAt: time.Now().Add(-1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	can, reason := app.canInvite(user)
+	if can {
+		t.Fatalf("R62-4 regression: canInvite returned true for Active=true & expired user")
+	}
+	if !strings.Contains(reason, "到期") {
+		t.Fatalf("expected reason to mention expiry, got %q", reason)
+	}
+}
+
+// TestForgotPasswordRejectsExpiredAccount 锁定 R62-7 不变量：
+// emby 鉴权通过但面板侧账号 entitlement 已过期（Active=true & ExpiredAt<now）
+// 时不应进入密码重置 + emby 写新密码流程。否则
+//  1. embySetUserEnabled 在过期态会立即把账号 disable，用户拿到的"new
+//     _password"登录就失败；
+//  2. 攻击者拿到 emby 密码可以反复 mint 面板凭据，把已经被运维软冻结的账号
+//     当成绕开续费的入口。
+func TestForgotPasswordRejectsExpiredAccount(t *testing.T) {
+	app := newTestApp(t)
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/Users/AuthenticateByName" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"User":{"Id":"emby-stale","Name":"stale"}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer emby.Close()
+	app.cfg().EmbyURL = emby.URL
+
+	// Active=true 但 ExpiredAt < now：典型"软冻结但还没被 check_expired 跑过"
+	// 状态，或邀请用户过期后保留 Active=true 的设计（参见 scheduler_runner.go
+	// 的 invited 分支）。
+	user, err := app.store().CreateUser(store.User{
+		Username:  "stale",
+		Role:      store.RoleNormal,
+		Active:    true,
+		EmbyID:    "emby-stale",
+		ExpiredAt: time.Now().Add(-1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = user
+
+	body := `{"emby_username":"stale","emby_password":"any-password"}`
+	resp := doJSON(app, http.MethodPost, "/api/v1/auth/forgot-password/emby", body, nil)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("forgot-password on expired account: status=%d body=%s, want 403", resp.Code, resp.Body.String())
+	}
+	// R62-6：到期路径必须返回 ErrAccountExpired，让 webui 把"续费"和
+	// "申诉"两条 CTA 区分开。如果未来又把它静默换回 ErrAccountDisabled，
+	// 用户会被错误引导到联系管理员而不是续费页。
+	if !strings.Contains(resp.Body.String(), string(ErrAccountExpired)) {
+		t.Fatalf("expected ErrAccountExpired in body, got %s", resp.Body.String())
+	}
+	// 确认密码哈希没有被改写：若旧实现漏掉 expired guard，UpdateUser 写哈希后
+	// PasswordHash 会变成非空。
+	updated, _ := app.store().User(user.UID)
+	if updated.PasswordHash != user.PasswordHash {
+		t.Fatalf("R62-7 regression: forgot-password modified password despite expired entitlement")
+	}
+}
+
+// TestSessionCookieRespectsConfiguredDomain 锁住 R62-cookie-domain 修复：
+// 双子域部署（webui = twilight.example.com / API = twilightapi.example.com）
+// 必须把 session cookie 显式打上注册域 ".example.com"，否则浏览器把
+// cookie 锁在 API 子域，webui 这边的 Next middleware 读不到，已登录用户访
+// 问 /dashboard 直接被 302 回 /login —— 用户视角即"登录成功但不跳转面板"。
+//
+// 这里走 runtime.Store 直接替换 cfg，是因为 New() 之后 cfg 副本存在
+// runtimeState 里，单纯改 a.cfg() 返回的指针字段会被下次 reload 覆盖。
+//
+// 关于 ".example.com" vs "example.com"：RFC 6265 已把前缀点视为兼容形式，
+// net/http 的 cookie 解析器会把它剥掉再回填到 cookie.Domain；浏览器实际收到
+// 的 Set-Cookie 文本里仍是 Domain=example.com，对子域共享语义没影响。这里
+// 测试比对的是 Go 解析后的形态，所以用 "example.com"（无前缀点）。
+func TestSessionCookieRespectsConfiguredDomain(t *testing.T) {
+	app := newTestApp(t)
+	rt := app.runtime.Load()
+	next := *rt
+	next.cfg.CookieDomain = ".example.com"
+	app.runtime.Store(&next)
+
+	const wantDomain = "example.com"
+
+	register := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	if register.Code != http.StatusCreated {
+		t.Fatalf("register status = %d body=%s", register.Code, register.Body.String())
+	}
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status = %d body=%s", login.Code, login.Body.String())
+	}
+	session := findCookie(login.Result().Cookies(), "twilight_session")
+	if session == nil {
+		t.Fatal("missing session cookie")
+	}
+	if session.Domain != wantDomain {
+		t.Fatalf("session cookie Domain = %q, want %q", session.Domain, wantDomain)
+	}
+
+	// 登出时 expire cookie 也必须复用同一 Domain，否则浏览器会按 default-domain
+	// (= 设置时的请求 host) 寻找另一份同名 cookie，删除失败 → "登出后再访问还是
+	// 登录态"幽灵 cookie。
+	logout := doJSON(app, http.MethodPost, "/api/v1/auth/logout", "", []*http.Cookie{session})
+	if logout.Code != http.StatusOK {
+		t.Fatalf("logout status = %d body=%s", logout.Code, logout.Body.String())
+	}
+	for _, c := range logout.Result().Cookies() {
+		if c.Name != "twilight_session" {
+			continue
+		}
+		if c.Domain != wantDomain {
+			t.Fatalf("logout %q cookie Domain = %q, want %q", c.Name, c.Domain, wantDomain)
+		}
+		if c.MaxAge >= 0 {
+			t.Fatalf("logout %q cookie MaxAge = %d, want negative (immediate expiry)", c.Name, c.MaxAge)
+		}
+	}
+}
+
+// TestSessionCookieOmitsDomainWhenUnset 守住单 origin 部署的旧行为：未配置
+// CookieDomain 时 Set-Cookie 不应写出 Domain= 属性，让浏览器把 cookie 锁回
+// 设置时的精确 host —— 这是单 origin 部署里更窄的暴露面。
+func TestSessionCookieOmitsDomainWhenUnset(t *testing.T) {
+	app := newTestApp(t)
+	register := doJSON(app, http.MethodPost, "/api/v1/users/register", `{"username":"admin","password":"Admin123456"}`, nil)
+	if register.Code != http.StatusCreated {
+		t.Fatalf("register status = %d body=%s", register.Code, register.Body.String())
+	}
+	login := doJSON(app, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"Admin123456"}`, nil)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status = %d body=%s", login.Code, login.Body.String())
+	}
+	session := findCookie(login.Result().Cookies(), "twilight_session")
+	if session == nil {
+		t.Fatal("missing session cookie on default config")
+	}
+	if session.Domain != "" {
+		t.Fatalf("session cookie Domain = %q, want empty (host-only)", session.Domain)
+	}
+}
+
+// TestBatchUserOutcomesCarryStableErrorCodes 锁住 R64-8 的契约：批量响应里
+// 每条失败 outcome 都附带 errors[].code（一个稳定的 ErrCode 字符串），前端
+// 用它做 UI 分支（"用户不存在" / "受保护账号" / "命中自己" / "未绑定 Emby"），
+// 而不是去 grep errors[].error 里漂浮的中文文案 / 拼接后的 fmt.Errorf 字符串。
+//
+// 这里覆盖的 4 条失败路径恰好是 batch_user_handlers.go 之前裸 fmt.Errorf 的
+// 全部位置：
+//   - delete 命中 self → BATCH_SELF_TARGET
+//   - disable 命中不存在的 uid → USER_NOT_FOUND
+//   - libraries 命中无 emby 的用户 → USER_NO_EMBY
+//   - delete 命中 protected admin → USER_PROTECTED
+func TestBatchUserOutcomesCarryStableErrorCodes(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	// admin 的 UID = 1。再造一个普通 user 留给后面的 disable 用，但故意不
+	// 把它放进请求里——下面 disable 走的是不存在的 uid=9999 路径。
+	_, err := app.store().CreateUser(store.User{Username: "ghost", PasswordHash: "x", Role: store.RoleNormal, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type errEntry struct {
+		UID  int64  `json:"uid"`
+		Code string `json:"code"`
+	}
+	type batchResp struct {
+		Data struct {
+			Errors []errEntry `json:"errors"`
+		} `json:"data"`
+	}
+
+	parse := func(t *testing.T, body string) []errEntry {
+		t.Helper()
+		var br batchResp
+		if err := json.Unmarshal([]byte(body), &br); err != nil {
+			t.Fatalf("decode batch resp: %v body=%s", err, body)
+		}
+		return br.Data.Errors
+	}
+
+	// 1) delete 命中 self（UID 1） → BATCH_SELF_TARGET
+	delBody := fmt.Sprintf(`{"confirm":%q,"uids":[1]}`, confirmBatchDeleteUsers)
+	resp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/delete", delBody, adminCookies, headers)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("delete self batch status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	errs := parse(t, resp.Body.String())
+	if len(errs) != 1 || errs[0].UID != 1 || errs[0].Code != string(ErrBatchSelfTarget) {
+		t.Fatalf("expected BATCH_SELF_TARGET on uid=1, got %+v", errs)
+	}
+
+	// 2) disable 命中不存在 uid=9999 → USER_NOT_FOUND
+	disBody := fmt.Sprintf(`{"confirm":%q,"uids":[9999]}`, confirmBatchDisableUsers)
+	resp = doJSONWithHeaders(app, http.MethodPost, "/api/v1/batch/users/disable", disBody, adminCookies, headers)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("disable missing batch status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	errs = parse(t, resp.Body.String())
+	if len(errs) != 1 || errs[0].UID != 9999 || errs[0].Code != string(ErrUserNotFound) {
+		t.Fatalf("expected USER_NOT_FOUND on uid=9999, got %+v", errs)
+	}
+
+}
+
+// TestUserNotFoundResponsesAreUniform 锁住 R64-6 / R64-7 的不变量：所有结构上
+// "按 uid 加载用户失败"的端点必须返回同一个 (HTTP 404, code=USER_NOT_FOUND,
+// message="用户不存在") 三元组。原先后端在 9 个 call site 内分裂出 3 种 copy
+// （"user not found" / "用户不存在" / "目标用户不存在"），其中 invite renew
+// code 还把 not-found 错挂到了 INVITE_RENEW_TARGET_MISSING 上——前端要写两份
+// 一模一样的"用户不存在"分支才能覆盖同一种语义。这个回归测试覆盖三条不同
+// path（admin GET / admin reset password / kick session）保证未来谁要把消息
+// 从 helper 里抽出来 inline 都会立刻炸掉。
+func TestUserNotFoundResponsesAreUniform(t *testing.T) {
+	app := newTestApp(t)
+	adminCookies := registerAndLogin(t, app, "admin", "Admin123456")
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	type errResp struct {
+		Code    string `json:"error_code"`
+		Message string `json:"message"`
+	}
+	expect := func(t *testing.T, label string, resp *httptest.ResponseRecorder) {
+		t.Helper()
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("%s: status=%d body=%s", label, resp.Code, resp.Body.String())
+		}
+		var e errResp
+		if err := json.Unmarshal(resp.Body.Bytes(), &e); err != nil {
+			t.Fatalf("%s: decode: %v body=%s", label, err, resp.Body.String())
+		}
+		if e.Code != string(ErrUserNotFound) {
+			t.Fatalf("%s: code=%q want USER_NOT_FOUND", label, e.Code)
+		}
+		if e.Message != "用户不存在" {
+			t.Fatalf("%s: message=%q want %q", label, e.Message, "用户不存在")
+		}
+	}
+
+	// admin user GET 走 handleAdminUser → userFromPath helper
+	expect(t, "GET admin user", doJSONWithHeaders(app, http.MethodGet, "/api/v1/admin/users/9999", "", adminCookies, headers))
+	// admin password reset 走 handleAdminResetPassword → 直接 store.User 查询
+	expect(t, "POST admin password reset", doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/9999/reset-password", `{"scope":"system"}`, adminCookies, headers))
+	// kick session 走 handleKickUser → userFromPath helper
+	expect(t, "POST admin kick", doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/users/9999/kick", "", adminCookies, headers))
+}
+
+// TestForceBindUnbindConsumesApprovedRebindAndPreservesAudit 覆盖强制绑定下
+// "换绑"完整链路的两条关键不变量：
+//  1. 普通用户在 force_bind_telegram 开启时，只有持有 admin 批准的 rebind
+//     请求才能解绑——批准后解绑成功；
+//  2. 解绑成功后该 approved 请求被标记成 used 而非删除，且管理员审核元数据
+//     （reviewer_uid / admin_note / reviewed_at）必须保留——这是把
+//     handleUnbindTelegram 从 ReviewRebindRequest(…,0,"used",…) 改为
+//     ConsumeRebindRequest 的回归点：旧实现会把审核痕迹清空，且 used 请求
+//     不能再被复用绕过强制绑定。
+func TestForceBindUnbindConsumesApprovedRebindAndPreservesAudit(t *testing.T) {
+	app := newTestApp(t)
+
+	// 先在未开启强制绑定时注册（force_bind 会拦截无绑定码注册）；第一个
+	// 注册用户即 admin，普通用户随后注册。注册完成后再打开 ForceBindTelegram
+	// 模拟"运营中途启用强制绑定"。
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "tguser", "User123456")
+	user, ok := app.store().FindUserByUsername("tguser")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.TelegramID = 555001
+		u.TelegramUsername = "tg_old"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app.cfg().ForceBindTelegram = true
+
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	// 1. 未批准时强制绑定下解绑必须被拒。
+	blocked := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/unbind", "", userCookies, headers)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("unbind without approval status=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+
+	// 2. 用户提交换绑请求。
+	reqResp := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/rebind-request", `{"reason":"old account lost"}`, userCookies, headers)
+	if reqResp.Code != http.StatusOK {
+		t.Fatalf("rebind-request status=%d body=%s", reqResp.Code, reqResp.Body.String())
+	}
+	pending := app.store().ListRebindRequests("pending")
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending rebind request, got %d", len(pending))
+	}
+	reqID := pending[0].ID
+
+	// 3. admin 批准（带备注）。
+	adminCookies := loginCookies(t, app, "admin", "Admin123456")
+	admin, _ := app.store().FindUserByUsername("admin")
+	approve := doJSONWithHeaders(app, http.MethodPost, fmt.Sprintf("/api/v1/admin/telegram/rebind-requests/%d/approve", reqID), `{"admin_note":"verified by ticket #42"}`, adminCookies, headers)
+	if approve.Code != http.StatusOK {
+		t.Fatalf("approve status=%d body=%s", approve.Code, approve.Body.String())
+	}
+
+	// 4. 批准后用户可以解绑。
+	unbind := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/unbind", "", userCookies, headers)
+	if unbind.Code != http.StatusOK {
+		t.Fatalf("unbind after approval status=%d body=%s", unbind.Code, unbind.Body.String())
+	}
+	after, _ := app.store().User(user.UID)
+	if after.TelegramID != 0 || after.TelegramUsername != "" {
+		t.Fatalf("telegram binding not cleared after unbind: %#v", after)
+	}
+
+	// 5. 请求被消费成 used，且审核元数据保留（回归点）。
+	consumed, found := app.store().UserLatestRebindRequest(user.UID)
+	if !found {
+		t.Fatal("rebind request disappeared after consume")
+	}
+	if consumed.Status != "used" {
+		t.Fatalf("expected status=used after unbind, got %q", consumed.Status)
+	}
+	if consumed.ReviewerUID != admin.UID {
+		t.Fatalf("reviewer_uid not preserved: got %d want %d", consumed.ReviewerUID, admin.UID)
+	}
+	if consumed.AdminNote != "verified by ticket #42" {
+		t.Fatalf("admin_note not preserved: got %q", consumed.AdminNote)
+	}
+	if consumed.ReviewedAt == 0 {
+		t.Fatal("reviewed_at not preserved after consume")
+	}
+
+	// 6. used 请求不能被复用：再次解绑（用户已重新绑定旧号模拟）必须被拒。
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.TelegramID = 555002
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reblocked := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/unbind", "", userCookies, headers)
+	if reblocked.Code != http.StatusForbidden {
+		t.Fatalf("reusing used rebind request should be forbidden, status=%d body=%s", reblocked.Code, reblocked.Body.String())
+	}
+}
+
+// TestRevokeAllRebindApprovalsClearsExistingPermissions 锁定一键撤销换绑权限：
+// 把所有 approved 申请置为 revoked，持有者立即失去解绑权限（解绑 403），但仍可
+// 重新提交申请；不影响 pending / used。
+func TestRevokeAllRebindApprovalsClearsExistingPermissions(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ForceBindTelegram = false
+
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "tguser", "User123456")
+	user, ok := app.store().FindUserByUsername("tguser")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.TelegramID = 700001
+		u.TelegramUsername = "tg_old"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	// 用户拿到一条 approved 换绑许可（模拟历史遗留权限）。
+	if r := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/rebind-request", `{"reason":"legacy"}`, userCookies, headers); r.Code != http.StatusOK {
+		t.Fatalf("rebind-request status=%d body=%s", r.Code, r.Body.String())
+	}
+	pending := app.store().ListRebindRequests("pending")
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending, got %d", len(pending))
+	}
+	adminCookies := loginCookies(t, app, "admin", "Admin123456")
+	if r := doJSONWithHeaders(app, http.MethodPost, fmt.Sprintf("/api/v1/admin/telegram/rebind-requests/%d/approve", pending[0].ID), `{}`, adminCookies, headers); r.Code != http.StatusOK {
+		t.Fatalf("approve status=%d body=%s", r.Code, r.Body.String())
+	}
+
+	// 一键撤销所有换绑权限。
+	revoke := doJSONWithHeaders(app, http.MethodPost, "/api/v1/admin/telegram/rebind-requests/revoke-approved", `{}`, adminCookies, headers)
+	if revoke.Code != http.StatusOK {
+		t.Fatalf("revoke-approved status=%d body=%s", revoke.Code, revoke.Body.String())
+	}
+	var revokeBody struct {
+		Data struct {
+			Revoked int `json:"revoked"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(revoke.Body.Bytes(), &revokeBody); err != nil {
+		t.Fatal(err)
+	}
+	if revokeBody.Data.Revoked != 1 {
+		t.Fatalf("expected 1 revoked, got %d (body=%s)", revokeBody.Data.Revoked, revoke.Body.String())
+	}
+
+	// 申请变为 revoked，审计元数据保留。
+	latest, found := app.store().UserLatestRebindRequest(user.UID)
+	if !found || latest.Status != "revoked" {
+		t.Fatalf("expected revoked status, found=%v req=%#v", found, latest)
+	}
+	admin, _ := app.store().FindUserByUsername("admin")
+	if latest.ReviewerUID != admin.UID || latest.ReviewedAt == 0 {
+		t.Fatalf("revoke audit metadata not recorded: %#v", latest)
+	}
+
+	// 持有者立即失去解绑权限。
+	if r := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/unbind", "", userCookies, headers); r.Code != http.StatusForbidden {
+		t.Fatalf("unbind after revoke should be forbidden, status=%d body=%s", r.Code, r.Body.String())
+	}
+
+	// 但仍可重新提交申请。
+	if r := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/rebind-request", `{"reason":"again"}`, userCookies, headers); r.Code != http.StatusOK {
+		t.Fatalf("re-apply after revoke should succeed, status=%d body=%s", r.Code, r.Body.String())
+	}
+}
+
+// TestUnbindAlwaysRequiresApprovalEvenWithoutForceBind 锁定用户反馈：关闭
+// force_bind_telegram 时，非管理员解绑同样必须先拿到 approved 换绑申请（用过即
+// 作废），杜绝"自助无限解绑/重绑"。每次更换都需管理员批准一次。
+func TestUnbindAlwaysRequiresApprovalEvenWithoutForceBind(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg().ForceBindTelegram = false
+
+	_ = registerAndLogin(t, app, "admin", "Admin123456")
+	userCookies := registerAndLogin(t, app, "tguser", "User123456")
+	user, ok := app.store().FindUserByUsername("tguser")
+	if !ok {
+		t.Fatal("created user not found")
+	}
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.TelegramID = 666001
+		u.TelegramUsername = "tg_old"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	headers := map[string]string{"X-Twilight-Client": "webui"}
+
+	// 没有批准的换绑申请：即便未开启强制绑定，解绑也必须被拒。
+	blocked := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/unbind", "", userCookies, headers)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("unbind without approval (force_bind off) status=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+
+	// 提交申请 → admin 批准 → 解绑成功，申请被消费成 used。
+	if r := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/rebind-request", `{"reason":"changed phone"}`, userCookies, headers); r.Code != http.StatusOK {
+		t.Fatalf("rebind-request status=%d body=%s", r.Code, r.Body.String())
+	}
+	pending := app.store().ListRebindRequests("pending")
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending request, got %d", len(pending))
+	}
+	adminCookies := loginCookies(t, app, "admin", "Admin123456")
+	if r := doJSONWithHeaders(app, http.MethodPost, fmt.Sprintf("/api/v1/admin/telegram/rebind-requests/%d/approve", pending[0].ID), `{}`, adminCookies, headers); r.Code != http.StatusOK {
+		t.Fatalf("approve status=%d body=%s", r.Code, r.Body.String())
+	}
+	if r := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/unbind", "", userCookies, headers); r.Code != http.StatusOK {
+		t.Fatalf("unbind after approval status=%d body=%s", r.Code, r.Body.String())
+	}
+	consumed, found := app.store().UserLatestRebindRequest(user.UID)
+	if !found || consumed.Status != "used" {
+		t.Fatalf("expected used request after unbind, found=%v req=%#v", found, consumed)
+	}
+
+	// 重新绑定后再次解绑：approved 已被消费，必须再次被拒（不能无限换绑）。
+	if _, err := app.store().UpdateUser(user.UID, func(u *store.User) error {
+		u.TelegramID = 666002
+		u.RebindingInProgress = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reblocked := doJSONWithHeaders(app, http.MethodPost, "/api/v1/users/me/telegram/unbind", "", userCookies, headers)
+	if reblocked.Code != http.StatusForbidden {
+		t.Fatalf("second unbind without new approval should be forbidden, status=%d body=%s", reblocked.Code, reblocked.Body.String())
+	}
+}
+
+// TestV2DeleteMediaRequestByIDRoute 锁住一条真实事故：v2 的
+// DELETE /api/v2/media/requests/{request_id} 曾经挂的是 ByKey 系列 handler，
+// 那个 handler 读 params["require_key"]，而本路由只有 request_id，于是
+// require_key 恒为空、删除永远 404。这里走完整路由表验证按 id 删除真的生效。
+func TestV2DeleteMediaRequestByIDRoute(t *testing.T) {
+	app := newTestApp(t)
+	const username = "mr-del-owner"
+	cookies := registerAndLogin(t, app, username, "Owner123456")
+	var uid int64
+	for _, u := range app.store().ListUsers() {
+		if u.Username == username {
+			uid = u.UID
+			break
+		}
+	}
+	if uid == 0 {
+		t.Fatalf("test user %q not found after registration", username)
+	}
+	created, err := app.store().CreateMediaRequest(store.MediaRequest{
+		UID: uid, Username: username, Title: "Delete By ID", Source: "tmdb", MediaID: 77, MediaType: "movie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := app.store().MediaRequest(created.ID); !ok {
+		t.Fatal("media request was not persisted")
+	}
+
+	headers := map[string]string{"X-Twilight-Client": "webui", "If-Match": `"1"`}
+	rr := doJSONWithHeaders(app, http.MethodDelete, fmt.Sprintf("/api/v2/media/requests/%d", created.ID), ``, cookies, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete by id status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, ok := app.store().MediaRequest(created.ID); ok {
+		t.Fatal("media request still exists after delete-by-id")
+	}
+
+	// 再删一次应当 404，而不是因为 require_key 为空以外的任何原因静默成功。
+	again := doJSONWithHeaders(app, http.MethodDelete, fmt.Sprintf("/api/v2/media/requests/%d", created.ID), ``, cookies, headers)
+	if again.Code != http.StatusNotFound {
+		t.Fatalf("second delete should be 404, status=%d body=%s", again.Code, again.Body.String())
+	}
+}

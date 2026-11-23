@@ -1,0 +1,156 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Activity, Loader2, LogIn, LogOut, Pause, Play, RefreshCw } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { useAsyncResource } from "@/hooks/use-async-resource";
+import { useToast } from "@/hooks/use-toast";
+import { api } from "@/lib/api";
+import type { EmbyActivityLogEntry } from "@/lib/api-types";
+import { useI18n } from "@/lib/i18n";
+
+function activityIcon(type: string) {
+  const t = type.toLowerCase();
+  if (t === "playback.stop" || t.includes("complete")) return <Pause className="h-3.5 w-3.5 text-green-500" />;
+  if (t.includes("playback")) return <Play className="h-3.5 w-3.5 text-blue-500" />;
+  if (t.includes("auth") || t.includes("login")) return <LogIn className="h-3.5 w-3.5 text-yellow-500" />;
+  if (t.includes("session") && t.includes("end")) return <LogOut className="h-3.5 w-3.5 text-muted-foreground" />;
+  if (t.includes("session")) return <LogIn className="h-3.5 w-3.5 text-yellow-500" />;
+  return <Activity className="h-3.5 w-3.5 text-muted-foreground" />;
+}
+
+function activityLabelKey(type: string) {
+  const t = type.toLowerCase();
+  if (t === "videoplayback" || t === "playback.start") return "embyActivityLogs.labelVideoPlayback" as const;
+  if (t === "videoplaybackcomplete" || t === "playback.stop") return "embyActivityLogs.labelVideoPlaybackComplete" as const;
+  if (t === "authenticationsucceeded") return "embyActivityLogs.labelAuthenticationSucceeded" as const;
+  if (t === "authenticationfailure") return "embyActivityLogs.labelAuthenticationFailure" as const;
+  if (t === "sessionstarted") return "embyActivityLogs.labelSessionStarted" as const;
+  if (t === "sessionended") return "embyActivityLogs.labelSessionEnded" as const;
+  return null;
+}
+
+export default function EmbyActivityLogs() {
+  const { toast } = useToast();
+  const { locale, t } = useI18n();
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+  const [lastNewEntries, setLastNewEntries] = useState<number | null>(null);
+  const refreshAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => refreshAbortRef.current?.abort(), []);
+
+  const formatDate = useCallback((unix: number) => {
+    if (!unix) return "";
+    return new Date(unix * 1000).toLocaleString(locale);
+  }, [locale]);
+
+  const applyMeta = useCallback((data: { new_entries?: number }) => {
+    setLastUpdated(Date.now());
+    if (typeof data.new_entries === "number") setLastNewEntries(data.new_entries);
+  }, []);
+
+  const load = useCallback(async (signal?: AbortSignal) => {
+    const res = await api.adminGetEmbyActivityLogs(100, false, 24, signal);
+    if (res.success && res.data) {
+      applyMeta(res.data);
+      return res.data.entries || [];
+    }
+    throw new Error(res.message || t("embyActivityLogs.loadFailed"));
+  }, [applyMeta, t]);
+
+  const { data: logs, isLoading, error, execute: reload, setData } = useAsyncResource(load, { immediate: true });
+
+  const handleRefresh = async () => {
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
+    setRefreshing(true);
+    try {
+      const res = await api.adminGetEmbyActivityLogs(100, true, 24, controller.signal);
+      if (controller.signal.aborted) return;
+      if (!res.success || !res.data) {
+        throw new Error(res.message || t("embyActivityLogs.refreshFailed"));
+      }
+      applyMeta(res.data);
+      setData(res.data.entries || []);
+      toast({
+        title: t("embyActivityLogs.refreshed"),
+        description: t("embyActivityLogs.newEntries", { count: res.data.new_entries ?? 0 }),
+        variant: "success",
+      });
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      toast({
+        title: t("embyActivityLogs.refreshFailed"),
+        description: err instanceof Error ? err.message : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      if (refreshAbortRef.current === controller) {
+        refreshAbortRef.current = null;
+        setRefreshing(false);
+      }
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+        <div className="min-w-0">
+          <h3 className="flex items-center gap-2 text-lg font-bold">
+            <Activity className="h-5 w-5 text-primary" />
+            {t("embyActivityLogs.title")}
+          </h3>
+          <p className="i18n-label text-sm text-muted-foreground">{t("embyActivityLogs.description")}</p>
+          <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+            {lastUpdated && <span>{t("embyActivityLogs.lastUpdated", { time: new Date(lastUpdated).toLocaleTimeString(locale) })}</span>}
+            {lastNewEntries !== null && <span>{t("embyActivityLogs.newEntries", { count: lastNewEntries })}</span>}
+          </div>
+        </div>
+        <div className="i18n-toolbar flex flex-wrap items-center gap-2">
+          <Button variant="outline" size="sm" onClick={() => void reload().catch(() => undefined)} disabled={isLoading || refreshing}>
+            {isLoading && !refreshing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
+            {t("common.refresh")}
+          </Button>
+          <Button size="sm" onClick={handleRefresh} disabled={refreshing || isLoading}>
+            {refreshing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
+            {t("embyActivityLogs.refresh")}
+          </Button>
+        </div>
+      </div>
+
+      {error ? (
+        <Card><CardContent className="p-6 text-center text-destructive">{String(error)}</CardContent></Card>
+      ) : isLoading && !logs ? (
+        <Card><CardContent className="flex justify-center p-8"><Loader2 className="h-6 w-6 animate-spin" /></CardContent></Card>
+      ) : !logs || logs.length === 0 ? (
+        <Card><CardContent className="p-8 text-center text-sm text-muted-foreground">{t("embyActivityLogs.empty")}</CardContent></Card>
+      ) : (
+        <div className="custom-scrollbar max-h-[min(68dvh,840px)] space-y-1.5 overflow-y-auto overscroll-contain pr-1">
+          {logs.map((log: EmbyActivityLogEntry, idx: number) => {
+            const labelKey = activityLabelKey(log.type);
+            return (
+              <div key={log.id || idx} className="flex items-start gap-3 rounded-lg border border-border/40 bg-accent/10 p-3 text-sm transition-colors hover:bg-accent/20">
+                <div className="mt-0.5 shrink-0">{activityIcon(log.type)}</div>
+                <div className="min-w-0 flex-1 space-y-0.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline" className="text-[10px]">{labelKey ? t(labelKey) : log.type}</Badge>
+                    {log.user_name && <span className="truncate text-xs font-medium">{log.user_name}</span>}
+                  </div>
+                  <p className="truncate text-xs text-muted-foreground">{log.name}</p>
+                  {log.overview && <p className="line-clamp-1 text-[11px] text-muted-foreground/70">{log.overview}</p>}
+                </div>
+                <div className="max-w-[8rem] shrink-0 text-right text-[10px] text-muted-foreground/50 sm:max-w-none sm:whitespace-nowrap">
+                  {formatDate(log.date)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}

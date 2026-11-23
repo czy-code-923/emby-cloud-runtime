@@ -1,0 +1,22 @@
+{
+    admin off
+    auto_https off
+}
+:8080 {
+    @foreign_origin {
+        method POST PUT PATCH DELETE
+        header Origin *
+        not header Origin http://localhost:13000 http://127.0.0.1:13000
+    }
+    respond @foreign_origin "Untrusted origin" 403
+    handle /api/* {
+        reverse_proxy backend:5000
+    }
+    handle_path /deployment/* {
+        root * /srv/deployment
+        file_server
+    }
+    handle {
+        reverse_proxy webui:3000
+    }
+}

@@ -1,0 +1,140 @@
+package api
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/prejudice-studio/twilight/internal/store"
+)
+
+func (a *App) handleV2UserDevices(w http.ResponseWriter, r *http.Request, params Params) {
+	uid := current(r).User.UID
+	items := a.security().listDevices(uid)
+	ok(w, "OK", items)
+}
+
+func (a *App) handleV2AdminUserDevices(w http.ResponseWriter, r *http.Request, params Params) {
+	uid, written := requireAdminForUIDParam(w, r, params)
+	if written {
+		return
+	}
+	items := a.security().listDevices(uid)
+	ok(w, "OK", items)
+}
+
+func (a *App) handleV2BlockDevice(w http.ResponseWriter, r *http.Request, params Params) {
+	uid, written := requireAdminForUIDParam(w, r, params)
+	if written {
+		return
+	}
+	deviceID, valid := requireDeviceIDParam(w, params)
+	if !valid {
+		return
+	}
+	if err := a.security().blockDevice(r.Context(), uid, deviceID); statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "block_device", "admin", uid, map[string]any{"device_id": deviceID})
+	ok(w, "device blocked", nil)
+}
+
+func (a *App) handleV2TrustDevice(w http.ResponseWriter, r *http.Request, params Params) {
+	uid := current(r).User.UID
+	deviceID, valid := requireDeviceIDParam(w, params)
+	if !valid {
+		return
+	}
+	if err := a.security().trustDevice(uid, deviceID); statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "trust_device", "user", uid, map[string]any{"device_id": deviceID})
+	ok(w, "device trusted", nil)
+}
+
+func (a *App) handleV2DeleteDevice(w http.ResponseWriter, r *http.Request, params Params) {
+	uid := current(r).User.UID
+	deviceID, valid := requireDeviceIDParam(w, params)
+	if !valid {
+		return
+	}
+	if err := a.security().deleteDevice(r.Context(), uid, deviceID); statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "delete_device", "user", uid, map[string]any{"device_id": deviceID})
+	ok(w, "device removed", nil)
+}
+
+func (a *App) handleV2UserLoginHistory(w http.ResponseWriter, r *http.Request, _ Params) {
+	uid := current(r).User.UID
+	limit := clamp(queryInt(r, "limit", 50), 1, 100)
+	items := a.security().loginHistory(uid, limit)
+	ok(w, "OK", map[string]any{"records": items, "total": len(items)})
+}
+
+func (a *App) handleV2AdminLoginHistory(w http.ResponseWriter, r *http.Request, params Params) {
+	uid, written := requireAdminForUIDParam(w, r, params)
+	if written {
+		return
+	}
+	limit := clamp(queryInt(r, "limit", 50), 1, 100)
+	items := a.security().loginHistory(uid, limit)
+	ok(w, "OK", map[string]any{"records": items, "total": len(items)})
+}
+
+func (a *App) handleV2IPBlacklist(w http.ResponseWriter, r *http.Request, _ Params) {
+	ok(w, "OK", a.security().listIPBlacklist())
+}
+
+func (a *App) handleV2AddIPBlacklist(w http.ResponseWriter, r *http.Request, _ Params) {
+	payload := decodeMap(r)
+	ip := strings.TrimSpace(stringValue(payload, "ip"))
+	if ip == "" {
+		failWithCode(w, http.StatusBadRequest, ErrIPRequired, "IP 不能为空")
+		return
+	}
+	normalizedIP, validIP := store.NormalizeIPBlacklistEntry(ip)
+	if !validIP {
+		failWithCode(w, http.StatusBadRequest, ErrIPInvalid, "IP 或 CIDR 格式无效")
+		return
+	}
+	ip = normalizedIP
+
+	const maxBlacklistHours = 24 * 365 * 10
+	hours := intValue(payload, "hours", -1)
+	if hours > maxBlacklistHours {
+		failWithCode(w, http.StatusBadRequest, ErrIPBlacklistDurationInvalid, "封禁时长超出允许范围")
+		return
+	}
+	if hours == 0 || (hours < 0 && hours != -1) {
+		failWithCode(w, http.StatusBadRequest, ErrIPBlacklistDurationInvalid, "封禁时长非法")
+		return
+	}
+
+	reason := stringValue(payload, "reason")
+	expireAt, err := a.security().addIPBlacklist(ip, reason, hours)
+	if statusFromError(w, err) {
+		return
+	}
+	// expire_at 记真实的过期时间戳（原实现误记成小时数）。
+	a.audit(r, "add_ip_blacklist", "admin", 0, map[string]any{"ip": ip, "expire_at": expireAt, "hours": hours, "reason": reason})
+	ok(w, "IP 已加入黑名单", nil)
+}
+
+func (a *App) handleV2DeleteIPBlacklist(w http.ResponseWriter, r *http.Request, _ Params) {
+	ip := strings.TrimSpace(stringValue(decodeMap(r), "ip"))
+	if ip == "" {
+		failWithCode(w, http.StatusBadRequest, ErrIPRequired, "IP 不能为空")
+		return
+	}
+	if err := a.security().removeIPBlacklist(ip); statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "delete_ip_blacklist", "admin", 0, map[string]any{"ip": ip})
+	ok(w, "IP 已移出黑名单", nil)
+}
+
+func (a *App) handleV2Suspicious(w http.ResponseWriter, r *http.Request, _ Params) {
+	hours := queryInt(r, "hours", 24)
+	items := a.security().suspiciousActivity(hours)
+	ok(w, "OK", items)
+}

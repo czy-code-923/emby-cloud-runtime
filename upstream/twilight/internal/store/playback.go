@@ -1,0 +1,1123 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
+
+const maxStoredPlaybackRecords = 5000
+
+const maxPlaybackSessions = 2000
+
+// playback 相关 PG 读写全部走带超时的 context：这些语句都可能因连接假死
+// 而无限阻塞，而 insertPlaybackRecordDB 曾在持有 s.mu 时同步执行——一旦
+// PG 卡住会拖垮所有 store 写操作。超时兜底让连接到期自行释放。
+const (
+	pgPlaybackReadTimeout  = 5 * time.Second
+	pgPlaybackWriteTimeout = 5 * time.Second
+)
+
+// playbackInsertChunk 是批量 INSERT 单条语句的最大行数：8 列 × 500 行 = 4000
+// 占位符，远低于 PG 65535 参数上限，同时避免单条 SQL 过长。
+const playbackInsertChunk = 500
+
+// playbackKey 是 (UID, ItemID, PlayedAt) 幂等键，批量去重时用它把逐条 O(N*M)
+// 扫描压到 O(N+M)。
+type playbackKey struct {
+	uid      int64
+	itemID   string
+	playedAt int64
+}
+
+func (s *Store) AddPlaybackSession(session PlaybackSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateAndSaveLocked(func() error {
+		s.state.PlaybackSessions = append(s.state.PlaybackSessions, session)
+		if len(s.state.PlaybackSessions) > maxPlaybackSessions {
+			s.state.PlaybackSessions = compactTail(s.state.PlaybackSessions, maxPlaybackSessions)
+		}
+		return nil
+	})
+}
+
+func (s *Store) UserPlaybackSessions(uid int64, limit int) []PlaybackSession {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > len(s.state.PlaybackSessions) {
+		limit = len(s.state.PlaybackSessions)
+	}
+	out := make([]PlaybackSession, 0, limit)
+	for i := len(s.state.PlaybackSessions) - 1; i >= 0 && len(out) < limit; i-- {
+		sess := s.state.PlaybackSessions[i]
+		if uid > 0 && sess.UID != uid {
+			continue
+		}
+		out = append(out, sess)
+	}
+	return out
+}
+
+const maxEmbyActivityLogs = 10000
+
+var errNoEmbyActivityLogChange = errors.New("emby activity logs unchanged")
+
+func (s *Store) SyncEmbyActivityLogs(entries []EmbyActivityLog) (int, error) {
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	added := 0
+	err := s.mutateAndSaveLocked(func() error {
+		// 冲突重放时重置闭包外的结果变量，避免沿用上一轮的值或重复累加。
+		added = 0
+		changed := false
+		if s.state.NextEmbyActivityLogID <= 0 {
+			maxID := int64(0)
+			for _, entry := range s.state.EmbyActivityLogs {
+				if entry.ID > maxID {
+					maxID = entry.ID
+				}
+			}
+			s.state.NextEmbyActivityLogID = maxID + 1
+			changed = true
+		}
+		existing := map[int64]int{}
+		for i, entry := range s.state.EmbyActivityLogs {
+			existing[entry.EmbyLogID] = i
+		}
+		for _, entry := range entries {
+			if index, ok := existing[entry.EmbyLogID]; ok {
+				current := s.state.EmbyActivityLogs[index]
+				entry.ID = current.ID
+				entry.CreatedAt = current.CreatedAt
+				if entry == current {
+					continue
+				}
+				s.state.EmbyActivityLogs[index] = entry
+				changed = true
+				continue
+			}
+			if entry.ID == 0 {
+				entry.ID = s.state.NextEmbyActivityLogID
+				s.state.NextEmbyActivityLogID++
+			}
+			if entry.CreatedAt == 0 {
+				entry.CreatedAt = time.Now().Unix()
+			}
+			s.state.EmbyActivityLogs = append(s.state.EmbyActivityLogs, entry)
+			existing[entry.EmbyLogID] = len(s.state.EmbyActivityLogs) - 1
+			added++
+			changed = true
+		}
+		if !changed {
+			return errNoEmbyActivityLogChange
+		}
+		sort.Slice(s.state.EmbyActivityLogs, func(i, j int) bool {
+			if s.state.EmbyActivityLogs[i].Date != s.state.EmbyActivityLogs[j].Date {
+				return s.state.EmbyActivityLogs[i].Date < s.state.EmbyActivityLogs[j].Date
+			}
+			return s.state.EmbyActivityLogs[i].EmbyLogID < s.state.EmbyActivityLogs[j].EmbyLogID
+		})
+		if len(s.state.EmbyActivityLogs) > maxEmbyActivityLogs {
+			s.state.EmbyActivityLogs = compactTail(s.state.EmbyActivityLogs, maxEmbyActivityLogs)
+		}
+		return nil
+	})
+	if errors.Is(err, errNoEmbyActivityLogChange) {
+		return added, nil
+	}
+	return added, err
+}
+
+func (s *Store) ListEmbyActivityLogs(uid int64, limit int) []EmbyActivityLog {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > len(s.state.EmbyActivityLogs) {
+		limit = len(s.state.EmbyActivityLogs)
+	}
+	targetEmbyID := ""
+	if uid > 0 {
+		user, ok := s.state.Users[uid]
+		if !ok || user.EmbyID == "" {
+			return nil
+		}
+		targetEmbyID = user.EmbyID
+	}
+	out := make([]EmbyActivityLog, 0, limit)
+	for i := len(s.state.EmbyActivityLogs) - 1; i >= 0 && len(out) < limit; i-- {
+		entry := s.state.EmbyActivityLogs[i]
+		if uid > 0 {
+			if entry.UserID != targetEmbyID {
+				continue
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func (s *Store) AddPlaybackRecord(record PlaybackRecord) error {
+	_, err := s.AddPlaybackRecordIdempotent(record)
+	return err
+}
+
+// AddPlaybackRecordIdempotent 在 (UID, ItemID, PlayedAt) 已经存在时跳过写入，
+// 返回 inserted=false。bangumi webhook 没有 timestamp + nonce 强签名，
+// 攻击者重放同一份合法请求体本来会让 PlaybackRecords 不停堆积；这里以
+// (uid + 媒体条目 + 播放秒) 作为天然幂等键阻断 replay 放大写入。
+//
+// 真实业务里同一用户在同一秒 stop 同一条目的概率为 0：webhook 由 Emby
+// "PlaybackStopped" 事件触发，事件之间至少相隔几秒。即使因网络重试导致同
+// 一事件重发，时间戳也会被 server 端的 time.Now() 在重试间隔内推进——所
+// 以受害的并不是合法用户，幂等去重不会丢失任何真实播放。
+//
+// 注意：本方法仍然假定调用方已经做过身份校验。它只阻止"已校验请求"被
+// 多次重放——签名伪造 / token 泄露这类外部信任问题不在这里处理。
+func (s *Store) AddPlaybackRecordIdempotent(record PlaybackRecord) (bool, error) {
+	if record.PlayedAt == 0 {
+		record.PlayedAt = time.Now().Unix()
+	}
+	s.mu.Lock()
+	// 走 mutateAndSaveLocked：存档失败回滚内存。旧实现失败后幽灵记录留在内存，
+	// 调用方重送时被当成「已存在」回 (false,nil)，专表永远不会写入。
+	inserted := false
+	err := s.mutateAndSaveLocked(func() error {
+		inserted = false
+		if record.UID != 0 && record.ItemID != "" {
+			for _, existing := range s.state.PlaybackRecords {
+				if existing.UID == record.UID && existing.ItemID == record.ItemID && existing.PlayedAt == record.PlayedAt {
+					return errNoChange
+				}
+			}
+		}
+		s.state.PlaybackRecords = prependBoundedHead(s.state.PlaybackRecords, record, maxStoredPlaybackRecords)
+		inserted = true
+		return nil
+	})
+	if err != nil || !inserted {
+		s.mu.Unlock()
+		return false, err
+	}
+	db := s.db
+	s.mu.Unlock()
+
+	// PG 插入是网络调用，放到锁外执行：记录已经由 saveLocked 落盘（JSON 文件或
+	// PG state jsonb），此处的独立表行只是读路径优先命中的副本，ON CONFLICT
+	// 保证幂等。持锁跨这段网络 I/O 会让一个卡死的 PG 连接冻结全部 store 写操作。
+	if db != nil && record.UID != 0 && record.ItemID != "" {
+		if _, dbErr := insertPlaybackRecordDB(db, record); dbErr != nil {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// AddPlaybackRecordsIdempotent 是 AddPlaybackRecordIdempotent 的批量版本：整批
+// 只做一次 refreshLocked + saveLocked，把 emby 活动同步里"逐条落全量状态"的
+// N 次 jsonb 序列化压成 1 次。去重语义与单条一致——(UID, ItemID, PlayedAt)
+// 命中即跳过，UID==0 或 ItemID=="" 的记录不参与去重（保持旧行为）。返回真正
+// 新增进状态的条数。
+func (s *Store) AddPlaybackRecordsIdempotent(records []PlaybackRecord) (int, error) {
+	if len(records) == 0 {
+		return 0, nil
+	}
+	now := time.Now().Unix()
+	s.mu.Lock()
+	// 走 mutateAndSaveLocked：失败回滚、冲突重放。accepted 在闭包内每次重建，
+	// 重放时基于最新 state 重新去重。
+	var accepted []PlaybackRecord
+	err := s.mutateAndSaveLocked(func() error {
+		seen := make(map[playbackKey]struct{}, len(s.state.PlaybackRecords)+len(records))
+		for _, existing := range s.state.PlaybackRecords {
+			if existing.UID != 0 && existing.ItemID != "" {
+				seen[playbackKey{existing.UID, existing.ItemID, existing.PlayedAt}] = struct{}{}
+			}
+		}
+		accepted = make([]PlaybackRecord, 0, len(records))
+		for _, record := range records {
+			if record.PlayedAt == 0 {
+				record.PlayedAt = now
+			}
+			if record.UID != 0 && record.ItemID != "" {
+				key := playbackKey{record.UID, record.ItemID, record.PlayedAt}
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
+			}
+			accepted = append(accepted, record)
+		}
+		if len(accepted) == 0 {
+			return errNoChange
+		}
+		// 逐条 prepend 等价于把 accepted 反序拼到 head 前再截断到上限。
+		head := make([]PlaybackRecord, 0, len(accepted)+len(s.state.PlaybackRecords))
+		for i := len(accepted) - 1; i >= 0; i-- {
+			head = append(head, accepted[i])
+		}
+		head = append(head, s.state.PlaybackRecords...)
+		s.state.PlaybackRecords = compactHead(head, maxStoredPlaybackRecords)
+		return nil
+	})
+	if err != nil || len(accepted) == 0 {
+		s.mu.Unlock()
+		return 0, err
+	}
+	db := s.db
+	s.mu.Unlock()
+
+	if db != nil {
+		insertPlaybackRecordsDB(db, accepted)
+	}
+	return len(accepted), nil
+}
+
+func (s *Store) PlaybackRecords(uid int64, since int64, limit int) []PlaybackRecord {
+	s.mu.RLock()
+	db := s.db
+	s.mu.RUnlock()
+	if db != nil {
+		records, err := queryPlaybackRecordsDB(db, uid, since, limit)
+		if err == nil && len(records) > 0 {
+			return records
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > maxStoredPlaybackRecords {
+		limit = maxStoredPlaybackRecords
+	}
+	out := make([]PlaybackRecord, 0, minInt(limit, len(s.state.PlaybackRecords)))
+	for _, record := range s.state.PlaybackRecords {
+		if uid != 0 && record.UID != uid {
+			continue
+		}
+		if since > 0 && record.PlayedAt < since {
+			continue
+		}
+		out = append(out, record)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// PlaybackRecordCounts returns playback row counts for a bounded set of users
+// in one database query. The fallback scans the compact in-memory compatibility
+// slice once when PostgreSQL is unavailable or the query fails.
+func (s *Store) PlaybackRecordCounts(uids []int64) map[int64]int {
+	counts := make(map[int64]int, len(uids))
+	if len(uids) == 0 {
+		return counts
+	}
+	wanted := make(map[int64]struct{}, len(uids))
+	placeholders := make([]string, 0, len(uids))
+	args := make([]any, 0, len(uids))
+	for _, uid := range uids {
+		if uid <= 0 {
+			continue
+		}
+		if _, exists := wanted[uid]; exists {
+			continue
+		}
+		wanted[uid] = struct{}{}
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)+1))
+		args = append(args, uid)
+	}
+	if len(wanted) == 0 {
+		return counts
+	}
+	if s.db != nil {
+		query := `SELECT uid, COUNT(*) FROM twilight_playback_records WHERE uid IN (` + strings.Join(placeholders, ",") + `) GROUP BY uid`
+		ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackReadTimeout)
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err == nil {
+			scanOK := true
+			for rows.Next() {
+				var uid int64
+				var count int
+				if scanErr := rows.Scan(&uid, &count); scanErr != nil {
+					scanOK = false
+					break
+				}
+				counts[uid] = count
+			}
+			rowErr := rows.Err()
+			_ = rows.Close()
+			cancel()
+			if scanOK && rowErr == nil {
+				return counts
+			}
+		} else {
+			cancel()
+		}
+		counts = make(map[int64]int, len(uids))
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, record := range s.state.PlaybackRecords {
+		if _, ok := wanted[record.UID]; ok {
+			counts[record.UID]++
+		}
+	}
+	return counts
+}
+
+func (s *Store) PlaybackRecordSummary(since int64) (totalPlays int, totalDuration int64, uniqueUsers int, err error) {
+	if s.db != nil {
+		err = queryPlaybackSummaryDB(s.db, since, &totalPlays, &totalDuration, &uniqueUsers)
+		if err == nil {
+			return
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	users := map[int64]bool{}
+	for _, record := range s.state.PlaybackRecords {
+		if since > 0 && record.PlayedAt < since {
+			continue
+		}
+		totalPlays++
+		totalDuration += record.Duration
+		users[record.UID] = true
+	}
+	uniqueUsers = len(users)
+	return
+}
+
+// PlaybackRecordCoverage 回答"系统到底记录了多少播放数据"：总条数、最早与最晚
+// 播放时间。榜单默认只开窗到今天/本周，运营无从判断库里还沉淀了多少历史可看，
+// 这个覆盖面让前端能把"系统已记录区间"直接显示出来。
+func (s *Store) PlaybackRecordCoverage() (total int64, earliest int64, latest int64, err error) {
+	s.mu.RLock()
+	db := s.db
+	s.mu.RUnlock()
+	if db != nil {
+		if err = queryPlaybackCoverageDB(db, &total, &earliest, &latest); err == nil {
+			return total, earliest, latest, nil
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, record := range s.state.PlaybackRecords {
+		total++
+		if record.PlayedAt <= 0 {
+			continue
+		}
+		if earliest == 0 || record.PlayedAt < earliest {
+			earliest = record.PlayedAt
+		}
+		if record.PlayedAt > latest {
+			latest = record.PlayedAt
+		}
+	}
+	return total, earliest, latest, nil
+}
+
+func queryPlaybackCoverageDB(db *sql.DB, total *int64, earliest *int64, latest *int64) error {
+	query := `SELECT COUNT(*), COALESCE(MIN(played_at), 0), COALESCE(MAX(played_at), 0)
+FROM twilight_playback_records`
+	ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackReadTimeout)
+	defer cancel()
+	return db.QueryRowContext(ctx, query).Scan(total, earliest, latest)
+}
+
+func queryPlaybackRecordsDB(db *sql.DB, uid int64, since int64, limit int) ([]PlaybackRecord, error) {
+	var args []any
+	var clauses []string
+	if uid > 0 {
+		clauses = append(clauses, fmt.Sprintf("uid = $%d", len(args)+1))
+		args = append(args, uid)
+	}
+	if since > 0 {
+		clauses = append(clauses, fmt.Sprintf("played_at >= $%d", len(args)+1))
+		args = append(args, since)
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = "WHERE " + strings.Join(clauses, " AND ")
+	}
+	if limit <= 0 {
+		limit = 10000
+	}
+	query := fmt.Sprintf(`SELECT uid, item_id, title, series_name, media_type, index_number, duration, played_at, source
+FROM twilight_playback_records %s ORDER BY played_at DESC LIMIT $%d`, where, len(args)+1)
+	args = append(args, limit)
+	ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackReadTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []PlaybackRecord
+	for rows.Next() {
+		var r PlaybackRecord
+		if err := rows.Scan(&r.UID, &r.ItemID, &r.Title, &r.SeriesName, &r.MediaType, &r.IndexNumber, &r.Duration, &r.PlayedAt, &r.Source); err != nil {
+			return records, err
+		}
+		records = append(records, r)
+	}
+	return records, rows.Err()
+}
+
+func queryPlaybackSummaryDB(db *sql.DB, since int64, totalPlays *int, totalDuration *int64, uniqueUsers *int) error {
+	query := `SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(duration), 0), COALESCE(COUNT(DISTINCT uid), 0)
+FROM twilight_playback_records WHERE played_at >= $1`
+	ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackReadTimeout)
+	defer cancel()
+	return db.QueryRowContext(ctx, query, since).Scan(totalPlays, totalDuration, uniqueUsers)
+}
+
+func insertPlaybackRecordDB(db *sql.DB, record PlaybackRecord) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackWriteTimeout)
+	defer cancel()
+	result, err := db.ExecContext(ctx, `INSERT INTO twilight_playback_records (uid, item_id, title, series_name, media_type, index_number, duration, played_at, source)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (uid, item_id, played_at) DO NOTHING`,
+		record.UID, record.ItemID, record.Title, record.SeriesName, record.MediaType, record.IndexNumber, record.Duration, record.PlayedAt, playbackSourceForWrite(record.Source))
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	return n > 0, nil
+}
+
+// insertPlaybackRecordsDB 把整批记录用分块多行 INSERT 落到独立表。与单条路径
+// 一致：DB 失败不影响已落盘的状态副本，因此这里吞掉错误只做尽力写入。空 UID /
+// 空 ItemID 记录不入表（与单条路径的写入前置条件一致）。
+func insertPlaybackRecordsDB(db *sql.DB, records []PlaybackRecord) {
+	valid := records[:0:0]
+	for _, record := range records {
+		if record.UID != 0 && record.ItemID != "" {
+			valid = append(valid, record)
+		}
+	}
+	for start := 0; start < len(valid); start += playbackInsertChunk {
+		end := start + playbackInsertChunk
+		if end > len(valid) {
+			end = len(valid)
+		}
+		insertPlaybackRecordChunkDB(db, valid[start:end])
+	}
+}
+
+func insertPlaybackRecordChunkDB(db *sql.DB, chunk []PlaybackRecord) {
+	if len(chunk) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`INSERT INTO twilight_playback_records (uid, item_id, title, series_name, media_type, index_number, duration, played_at, source) VALUES `)
+	args := make([]any, 0, len(chunk)*9)
+	for i, record := range chunk {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		base := i * 9
+		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9)
+		args = append(args, record.UID, record.ItemID, record.Title, record.SeriesName, record.MediaType, record.IndexNumber, record.Duration, record.PlayedAt, playbackSourceForWrite(record.Source))
+	}
+	b.WriteString(` ON CONFLICT (uid, item_id, played_at) DO NOTHING`)
+	ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackWriteTimeout)
+	defer cancel()
+	_, _ = db.ExecContext(ctx, b.String(), args...)
+}
+
+func (s *Store) DeletePlaybackRecordsBefore(ctx context.Context, cutoff int64) (int64, error) {
+	if s.db == nil {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM twilight_playback_records WHERE played_at < $1`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// playbackSourceForWrite 把来源收敛到两个枚举值之一。空来源一律算活动日志——
+// 在加 source 列之前写入的存量行只可能来自活动日志配对。
+func playbackSourceForWrite(source string) string {
+	if source == PlaybackSourceReporting {
+		return PlaybackSourceReporting
+	}
+	return PlaybackSourceActivityLog
+}
+
+// playbackReportingMatchSlack 是判断"这两行是不是同一场播放"的容差（秒）。
+//
+// 两个数据源对"这一场播放发生在什么时刻"的记法并不一致，而且偏差没有可靠办法
+// 推算：
+//   - 插件记的是它自己那条 PlaybackActivity 的时间，活动日志记录的是停止事件的
+//     时间，两者相差最多一场播放的长度；
+//   - 插件的 SQLite 时间戳可能是 UTC（DateTime('now')），而活动日志走服务器本地
+//     时区，两者再差若干个整小时，且取决于 Emby 那台机器的时区配置。
+//
+// 所以容差取得比较宽，并在候选里挑时间最接近的那一条：同一用户同一集在一天内
+// 看两遍时，两条各配各的最近项，不会整体错位。放宽的代价是极端情况下（同一集
+// 反复重看）可能配错，而配错只是把两场时长对调，不会凭空多出一次播放——相比
+// 配不上导致的"一次播放记两遍"，这是划算的取舍。
+const playbackReportingMatchSlack = 12 * 60 * 60
+
+// ApplyPlaybackReportingRecords 用 Playback Reporting 插件的行修正并补充播放记录，
+// 返回被修正的条数与新增的条数。
+//
+// 这里最要紧的是**不能把一次播放记成两次**：活动日志早就为同一场播放写过一行
+// （时间是停止时刻、时长是墙上时钟差），插件若直接再插一行，"播放次数"就会翻倍，
+// 榜单立刻失真。所以命中同场播放时只把那一行的时长换成净时长并改来源，只有没
+// 命中时才插入新行。
+//
+// 只修正非插件来源的行：已经被插件修正过的行重复同步时不应再次参与匹配，否则
+// 时长会被后来的、可能更短的窗口数据覆盖回去。
+func (s *Store) ApplyPlaybackReportingRecords(records []PlaybackRecord) (int, int, error) {
+	if len(records) == 0 {
+		return 0, 0, nil
+	}
+	s.mu.RLock()
+	db := s.db
+	s.mu.RUnlock()
+	if db != nil {
+		matched, inserted, err := applyPlaybackReportingDB(db, records)
+		if err == nil {
+			return matched, inserted, nil
+		}
+	}
+	return s.applyPlaybackReportingMemory(records)
+}
+
+func playbackReportingWindow(record PlaybackRecord) (int64, int64) {
+	window := record.WallDuration
+	if window < 0 {
+		window = 0
+	}
+	return record.PlayedAt - window - playbackReportingMatchSlack, record.PlayedAt + window + playbackReportingMatchSlack
+}
+
+func applyPlaybackReportingDB(db *sql.DB, records []PlaybackRecord) (int, int, error) {
+	matched, inserted := 0, 0
+	for _, record := range records {
+		if record.UID == 0 || record.ItemID == "" {
+			continue
+		}
+		low, high := playbackReportingWindow(record)
+		ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackWriteTimeout)
+		var id int64
+		err := db.QueryRowContext(ctx, `SELECT id FROM twilight_playback_records
+WHERE uid = $1 AND item_id = $2 AND played_at BETWEEN $3 AND $4 AND source <> $5
+ORDER BY played_at DESC LIMIT 1`,
+			record.UID, record.ItemID, low, high, PlaybackSourceReporting).Scan(&id)
+		if err == nil {
+			if _, execErr := db.ExecContext(ctx, `UPDATE twilight_playback_records
+SET duration = $1, source = $2 WHERE id = $3`, record.Duration, PlaybackSourceReporting, id); execErr == nil {
+				matched++
+			}
+			cancel()
+			continue
+		}
+		// xmax = 0 表示这一行是真的插进去的，而不是撞上 (uid,item_id,played_at)
+		// 走了 DO UPDATE。重复同步同一窗口时才不会把"新增"虚报一遍。
+		var wasInsert bool
+		err = db.QueryRowContext(ctx, `INSERT INTO twilight_playback_records
+(uid, item_id, title, series_name, media_type, index_number, duration, played_at, source)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (uid, item_id, played_at) DO UPDATE SET duration = EXCLUDED.duration, source = EXCLUDED.source
+RETURNING (xmax = 0)`,
+			record.UID, record.ItemID, record.Title, record.SeriesName, record.MediaType, record.IndexNumber,
+			record.Duration, record.PlayedAt, PlaybackSourceReporting).Scan(&wasInsert)
+		cancel()
+		if err != nil {
+			return matched, inserted, err
+		}
+		if wasInsert {
+			inserted++
+		}
+	}
+	return matched, inserted, nil
+}
+
+func (s *Store) applyPlaybackReportingMemory(records []PlaybackRecord) (int, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 走 mutateAndSaveLocked：旧实现只有「命中修正、无新增」时直接 return 不存档，
+	// 已就地改掉的 Duration/Source 成了幽灵变更；这里只要有命中或新增就落盘，
+	// 失败回滚、冲突重放（计数在闭包开头重置）。
+	matched, inserted := 0, 0
+	err := s.mutateAndSaveLocked(func() error {
+		matched, inserted = 0, 0
+		// 就地修改前先复制切片：读路径可能在锁外持有旧切片（同第 4 条）。
+		current := append([]PlaybackRecord(nil), s.state.PlaybackRecords...)
+		accepted := make([]PlaybackRecord, 0, len(records))
+		touched := false
+		for _, record := range records {
+			if record.UID == 0 || record.ItemID == "" {
+				continue
+			}
+			low, high := playbackReportingWindow(record)
+			hit := -1
+			for index := range current {
+				existing := &current[index]
+				if existing.UID != record.UID || existing.ItemID != record.ItemID {
+					continue
+				}
+				if existing.PlayedAt < low || existing.PlayedAt > high {
+					continue
+				}
+				if existing.Source == PlaybackSourceReporting {
+					continue
+				}
+				if hit < 0 || absInt64(existing.PlayedAt-record.PlayedAt) < absInt64(current[hit].PlayedAt-record.PlayedAt) {
+					hit = index
+				}
+			}
+			if hit >= 0 {
+				current[hit].Duration = record.Duration
+				current[hit].Source = PlaybackSourceReporting
+				matched++
+				touched = true
+				continue
+			}
+			duplicate := false
+			for index := range current {
+				existing := &current[index]
+				if existing.UID == record.UID && existing.ItemID == record.ItemID && existing.PlayedAt == record.PlayedAt {
+					existing.Duration = record.Duration
+					existing.Source = PlaybackSourceReporting
+					duplicate = true
+					touched = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			stored := record
+			stored.Source = PlaybackSourceReporting
+			accepted = append(accepted, stored)
+			inserted++
+		}
+		if !touched && len(accepted) == 0 {
+			return errNoChange
+		}
+		head := make([]PlaybackRecord, 0, len(accepted)+len(current))
+		for i := len(accepted) - 1; i >= 0; i-- {
+			head = append(head, accepted[i])
+		}
+		head = append(head, current...)
+		s.state.PlaybackRecords = compactHead(head, maxStoredPlaybackRecords)
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return matched, inserted, nil
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+// playbackRankDefaultLimit / playbackRankMaxLimit 约束榜单长度：排行榜是聚合
+// 结果，返回全表没有意义，也容易被拿来拖库。
+const (
+	playbackRankDefaultLimit = 20
+	playbackRankMaxLimit     = 100
+)
+
+// 媒体榜的两种聚合维度。item 是"每一集/每一部电影单独一行"，series 是"把一部剧
+// 的所有集合并成一行"——后者回答"哪部剧最受欢迎"，前者回答"哪一集最受欢迎"。
+const (
+	PlaybackRankGroupItem   = "item"
+	PlaybackRankGroupSeries = "series"
+	// PlaybackRankGroupMovie 只统计电影，每部一行；series 只统计剧集，按剧名归并。
+	// 两个榜单互不混入对方的类型。
+	PlaybackRankGroupMovie = "movie"
+)
+
+// PlaybackRankGroup 把外部传入的分组参数收敛成两个枚举值之一。空值与未知值一律
+// 按 item 处理：宁可退回逐条明细，也不要让未过滤的字符串进到 SQL 的 GROUP BY 里。
+func PlaybackRankGroup(value string) string {
+	switch value {
+	case PlaybackRankGroupSeries, PlaybackRankGroupMovie:
+		return value
+	}
+	return PlaybackRankGroupItem
+}
+
+// 电影与剧集的判定口径，PG 与内存兜底共用：同步时 media_type 已规范成小写，
+// 历史数据可能有大小写差异，统一 LOWER 比较；带剧名的条目一律算剧集。
+const (
+	playbackMovieFilterSQL  = `LOWER(COALESCE(media_type, '')) = 'movie' AND COALESCE(series_name, '') = ''`
+	playbackSeriesFilterSQL = `(LOWER(COALESCE(media_type, '')) = 'episode' OR COALESCE(series_name, '') <> '')`
+)
+
+func playbackRecordInGroup(groupBy string, record PlaybackRecord) bool {
+	switch groupBy {
+	case PlaybackRankGroupMovie:
+		return strings.EqualFold(record.MediaType, "movie") && record.SeriesName == ""
+	case PlaybackRankGroupSeries:
+		return strings.EqualFold(record.MediaType, "episode") || record.SeriesName != ""
+	}
+	return true
+}
+
+// 榜单的排序口径。两个指标回答的不是同一个问题：
+//
+//	plays    —— "被点开过多少次"，偏向热度与流行度；
+//	duration —— "一共占用了多少时间"，偏向实际投入。
+//
+// 一部 20 分钟的番剧刷 30 遍和一部三小时电影看 1 次，按次数和按时长排出来
+// 的名次是反的，所以必须由调用方显式选，不能替它默认。
+const (
+	PlaybackRankSortPlays    = "plays"
+	PlaybackRankSortDuration = "duration"
+)
+
+// PlaybackRankSort 把外部传入的排序参数收敛成两个枚举值之一。未知值一律回退
+// plays：它是"最热"这个默认语境下的口径，且绝不能让未过滤的字符串进 ORDER BY。
+func PlaybackRankSort(value string) string {
+	if value == PlaybackRankSortDuration {
+		return PlaybackRankSortDuration
+	}
+	return PlaybackRankSortPlays
+}
+
+// PlaybackRankOptions 是榜单查询参数。用结构体而不是逐个传参，是因为这四个
+// 参数里两个是字符串、两个是整数，按位置传很容易错位——since 与 limit 换个
+// 位置不报编译错，只会静默返回错的数据。
+type PlaybackRankOptions struct {
+	Since   int64
+	Limit   int
+	GroupBy string
+	SortBy  string
+}
+
+// PlaybackMediaRank 是一部媒体在某个时间窗内的聚合：播放次数、累计时长和看过
+// 的人数。它只回答"哪部最热"，不包含任何一次播放的时间点。
+//
+// Episodes 是这一行覆盖了多少个不同的 item：item 模式下恒为 1，series 模式下是
+// 这部剧被看过的集数。"播放 30 次"到底是 30 个人各看一集、还是一个人刷了同一集
+// 30 遍，光看 Plays 分不出来，必须靠它。
+type PlaybackMediaRank struct {
+	// RepresentativeItemID resolves artwork without exposing an episode as the series identity.
+	RepresentativeItemID string
+	ItemID               string
+	Title                string
+	SeriesName           string
+	MediaType            string
+	Plays                int
+	Duration             int64
+	Viewers              int
+	Episodes             int
+}
+
+// PlaybackUserRank 是一个用户在同一时间窗内的聚合。UID 只下发给管理员接口，
+// 普通用户接口会把用户名脱敏后丢弃 UID。
+type PlaybackUserRank struct {
+	UID      int64
+	Plays    int
+	Duration int64
+	Items    int
+}
+
+// PlaybackRank 返回 since 之后的媒体榜与用户榜。PG 可用时两条 GROUP BY 直接
+// 在库里聚合；PG 不可用或查询失败时回落到内存副本（maxStoredPlaybackRecords
+// 条）做同样的聚合，保证降级时榜单仍然可用。
+//
+// groupBy 只影响媒体榜（用户榜始终按 uid 聚合）：传 PlaybackRankGroupSeries 时
+// 把一部剧的所有集合成一行。
+//
+// sortBy 同时作用于两个榜：此前媒体榜写死按次数排、用户榜写死按时长排，两个榜
+// 的"第一名"根本不是同一个口径，也没法切换。现在统一由 sortBy 决定。
+func (s *Store) PlaybackRank(opts PlaybackRankOptions) ([]PlaybackMediaRank, []PlaybackUserRank, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = playbackRankDefaultLimit
+	}
+	if opts.Limit > playbackRankMaxLimit {
+		opts.Limit = playbackRankMaxLimit
+	}
+	if opts.Since < 0 {
+		opts.Since = 0
+	}
+	opts.GroupBy = PlaybackRankGroup(opts.GroupBy)
+	opts.SortBy = PlaybackRankSort(opts.SortBy)
+
+	s.mu.RLock()
+	db := s.db
+	s.mu.RUnlock()
+
+	if db != nil {
+		media, mediaErr := queryPlaybackMediaRankDB(db, opts)
+		users, userErr := queryPlaybackUserRankDB(db, opts)
+		if mediaErr == nil && userErr == nil {
+			return media, users, nil
+		}
+		return s.playbackRankFromMemory(opts)
+	}
+	return s.playbackRankFromMemory(opts)
+}
+
+// playbackRankLess 是内存兜底路径的比较器，与 playbackRankOrderBy 一一对应：
+// 主排序键由 sortBy 决定，另一个指标做次排序键，tieBreak 兜底保证完全确定。
+//
+// 写成函数而不是在每个 sort.Slice 里各写一遍，是为了让两条路径（SQL / 内存）
+// 的排序口径只有一处定义——PG 降级时榜单名次不能变，否则用户会觉得数据错了。
+func playbackRankLess(sortBy string, playsA, playsB int, durationA, durationB int64, tieBreak func() bool) bool {
+	if sortBy == PlaybackRankSortDuration {
+		if durationA != durationB {
+			return durationA > durationB
+		}
+		if playsA != playsB {
+			return playsA > playsB
+		}
+		return tieBreak()
+	}
+	if playsA != playsB {
+		return playsA > playsB
+	}
+	if durationA != durationB {
+		return durationA > durationB
+	}
+	return tieBreak()
+}
+
+// playbackRankOrderBy 生成 ORDER BY 子句。
+//
+// 排序表达式只能从这两个白名单常量里挑，绝不能把外部字符串拼进来；次排序键
+// 固定用另一个指标，保证同分时顺序稳定（否则同一份数据每次刷新名次都在跳），
+// 最后再跟一个唯一键兜底做到完全确定。
+func playbackRankOrderBy(sortBy string, tieBreak string) string {
+	const (
+		plays    = "COUNT(*)"
+		duration = "COALESCE(SUM(duration), 0)"
+	)
+	if sortBy == PlaybackRankSortDuration {
+		return duration + " DESC, " + plays + " DESC, " + tieBreak + " ASC"
+	}
+	return plays + " DESC, " + duration + " DESC, " + tieBreak + " ASC"
+}
+
+// playbackSeriesKey 是 series 模式的分组键：剧集取剧名，电影取自己的标题，两者
+// 都缺失时退回 item_id。
+//
+// 用剧名而不是 SeriesId 分组，是因为表里根本没有存 SeriesId。代价是同名剧会被
+// 并成一行——可接受的近似，真要精确得再存一列。
+const playbackSeriesKey = `COALESCE(NULLIF(series_name, ''), NULLIF(title, ''), item_id)`
+
+func queryPlaybackMediaRankDB(db *sql.DB, opts PlaybackRankOptions) ([]PlaybackMediaRank, error) {
+	query := `SELECT item_id, MAX(title), COALESCE(MAX(series_name), ''), COALESCE(MAX(media_type), ''),
+COUNT(*), COALESCE(SUM(duration), 0), COUNT(DISTINCT uid), COUNT(DISTINCT item_id), MIN(item_id COLLATE "C")
+FROM twilight_playback_records
+WHERE played_at >= $1 AND item_id <> ''
+GROUP BY item_id
+ORDER BY ` + playbackRankOrderBy(opts.SortBy, "item_id") + `
+LIMIT $2`
+	switch opts.GroupBy {
+	case PlaybackRankGroupSeries:
+		query = `SELECT '' AS item_id, MAX(` + playbackSeriesKey + `) AS title, '' AS series_name,
+COALESCE(MAX(media_type), '') AS media_type,
+COUNT(*), COALESCE(SUM(duration), 0), COUNT(DISTINCT uid), COUNT(DISTINCT item_id), MIN(item_id COLLATE "C")
+FROM twilight_playback_records
+WHERE played_at >= $1 AND item_id <> '' AND ` + playbackSeriesKey + ` <> '' AND ` + playbackSeriesFilterSQL + `
+GROUP BY ` + playbackSeriesKey + `
+ORDER BY ` + playbackRankOrderBy(opts.SortBy, "2") + `
+LIMIT $2`
+	case PlaybackRankGroupMovie:
+		query = `SELECT item_id, MAX(title), '' AS series_name, COALESCE(MAX(media_type), ''),
+COUNT(*), COALESCE(SUM(duration), 0), COUNT(DISTINCT uid), COUNT(DISTINCT item_id), MIN(item_id COLLATE "C")
+FROM twilight_playback_records
+WHERE played_at >= $1 AND item_id <> '' AND ` + playbackMovieFilterSQL + `
+GROUP BY item_id
+ORDER BY ` + playbackRankOrderBy(opts.SortBy, "item_id") + `
+LIMIT $2`
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackReadTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, query, opts.Since, opts.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]PlaybackMediaRank, 0, opts.Limit)
+	for rows.Next() {
+		var item PlaybackMediaRank
+		if err := rows.Scan(&item.ItemID, &item.Title, &item.SeriesName, &item.MediaType, &item.Plays, &item.Duration, &item.Viewers, &item.Episodes, &item.RepresentativeItemID); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func queryPlaybackUserRankDB(db *sql.DB, opts PlaybackRankOptions) ([]PlaybackUserRank, error) {
+	query := `SELECT uid, COUNT(*), COALESCE(SUM(duration), 0), COUNT(DISTINCT item_id)
+FROM twilight_playback_records
+WHERE played_at >= $1 AND uid > 0
+GROUP BY uid
+ORDER BY ` + playbackRankOrderBy(opts.SortBy, "uid") + `
+LIMIT $2`
+	ctx, cancel := context.WithTimeout(context.Background(), pgPlaybackReadTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, query, opts.Since, opts.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]PlaybackUserRank, 0, opts.Limit)
+	for rows.Next() {
+		var item PlaybackUserRank
+		if err := rows.Scan(&item.UID, &item.Plays, &item.Duration, &item.Items); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// playbackRankFromMemory 是 PG 不可用时的兜底：内存副本本身就是最近的记录，
+// 只做一次线性扫描 + map 聚合，再按同样的排序口径截断。
+func (s *Store) playbackRankFromMemory(opts PlaybackRankOptions) ([]PlaybackMediaRank, []PlaybackUserRank, error) {
+	since, limit, groupBy := opts.Since, opts.Limit, opts.GroupBy
+	type mediaAgg struct {
+		item     PlaybackMediaRank
+		viewers  map[int64]struct{}
+		episodes map[string]struct{}
+	}
+	type userAgg struct {
+		item  PlaybackUserRank
+		items map[string]struct{}
+	}
+
+	mediaMap := map[string]*mediaAgg{}
+	userMap := map[int64]*userAgg{}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, record := range s.state.PlaybackRecords {
+		if since > 0 && record.PlayedAt < since {
+			continue
+		}
+		if record.ItemID != "" && playbackRecordInGroup(groupBy, record) {
+			// series 模式按剧名归并：剧集用 series_name，电影没有剧名就用自己
+			// 的标题，与 PG 路径的 playbackSeriesKey 完全一致。
+			key := record.ItemID
+			if groupBy == PlaybackRankGroupSeries {
+				switch {
+				case record.SeriesName != "":
+					key = record.SeriesName
+				case record.Title != "":
+					key = record.Title
+				default:
+					key = record.ItemID
+				}
+			}
+			agg := mediaMap[key]
+			if agg == nil {
+				agg = &mediaAgg{
+					item: PlaybackMediaRank{
+						ItemID:     record.ItemID,
+						Title:      record.Title,
+						SeriesName: record.SeriesName,
+						MediaType:  record.MediaType,
+					},
+					viewers:  map[int64]struct{}{},
+					episodes: map[string]struct{}{},
+				}
+				mediaMap[key] = agg
+			}
+			agg.item.Plays++
+			agg.item.Duration += record.Duration
+			if agg.item.RepresentativeItemID == "" || record.ItemID < agg.item.RepresentativeItemID {
+				agg.item.RepresentativeItemID = record.ItemID
+			}
+			if agg.item.Title == "" {
+				agg.item.Title = record.Title
+			}
+			if agg.item.SeriesName == "" {
+				agg.item.SeriesName = record.SeriesName
+			}
+			if agg.item.MediaType == "" {
+				agg.item.MediaType = record.MediaType
+			}
+			if record.UID != 0 {
+				agg.viewers[record.UID] = struct{}{}
+			}
+			agg.episodes[record.ItemID] = struct{}{}
+		}
+		if record.UID > 0 {
+			agg := userMap[record.UID]
+			if agg == nil {
+				agg = &userAgg{item: PlaybackUserRank{UID: record.UID}, items: map[string]struct{}{}}
+				userMap[record.UID] = agg
+			}
+			agg.item.Plays++
+			agg.item.Duration += record.Duration
+			if record.ItemID != "" {
+				agg.items[record.ItemID] = struct{}{}
+			}
+		}
+	}
+
+	media := make([]PlaybackMediaRank, 0, minInt(limit, len(mediaMap)))
+	for _, agg := range mediaMap {
+		agg.item.Viewers = len(agg.viewers)
+		agg.item.Episodes = len(agg.episodes)
+		if groupBy == PlaybackRankGroupSeries {
+			// 与 PG 路径对齐：series 模式下这一行代表整部剧，标题取剧名，
+			// 不带单集的 item_id / series_name，前端不必再判断该显示哪个。
+			title := agg.item.SeriesName
+			if title == "" {
+				title = agg.item.Title
+			}
+			agg.item.Title = title
+			agg.item.SeriesName = ""
+			agg.item.ItemID = ""
+		}
+		media = append(media, agg.item)
+	}
+	// 与 SQL 路径的 playbackRankOrderBy 同口径：主排序键由 sortBy 决定，另一
+	// 个指标做次排序键，最后用唯一键兜底。PG 挂掉走内存时名次必须与 PG 一致，
+	// 否则同一次刷新前后榜单会跳。
+	sort.Slice(media, func(i, j int) bool {
+		if groupBy == PlaybackRankGroupSeries {
+			return playbackRankLess(opts.SortBy, media[i].Plays, media[j].Plays, media[i].Duration, media[j].Duration,
+				func() bool { return media[i].Title < media[j].Title })
+		}
+		return playbackRankLess(opts.SortBy, media[i].Plays, media[j].Plays, media[i].Duration, media[j].Duration,
+			func() bool { return media[i].ItemID < media[j].ItemID })
+	})
+
+	users := make([]PlaybackUserRank, 0, minInt(limit, len(userMap)))
+	for _, agg := range userMap {
+		agg.item.Items = len(agg.items)
+		users = append(users, agg.item)
+	}
+	sort.Slice(users, func(i, j int) bool {
+		return playbackRankLess(opts.SortBy, users[i].Plays, users[j].Plays, users[i].Duration, users[j].Duration,
+			func() bool { return users[i].UID < users[j].UID })
+	})
+
+	if len(media) > limit {
+		media = media[:limit]
+	}
+	if len(users) > limit {
+		users = users[:limit]
+	}
+	return media, users, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

@@ -1,0 +1,847 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Server,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Users,
+  RefreshCw,
+  Trash2,
+  Download,
+  AlertTriangle,
+  Link2,
+  Link2Off,
+  Shield,
+  MonitorSmartphone,
+  Wifi,
+  WifiOff,
+  Activity,
+} from "lucide-react";
+import AdminDeviceAuditPanel from "@/components/admin/emby-device-audit-panel";
+import EmbyActivityLogs from "@/components/admin/emby-activity-logs";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useToast } from "@/hooks/use-toast";
+import { useAsyncResource } from "@/hooks/use-async-resource";
+import { useI18n } from "@/lib/i18n";
+import { api } from "@/lib/api";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+
+const EMBY_TABLE_BATCH_SIZE = 300;
+
+interface TestResult {
+  name: string;
+  success: boolean;
+  latency_ms?: number;
+  message: string;
+}
+
+interface ConnectivityResult {
+  emby_url: string;
+  tests: TestResult[];
+  overall: boolean;
+  /** not_configured / online / unreachable */
+  status?: string;
+  server_info?: { name: string; version: string; os: string; id: string };
+}
+
+interface EmbyUserItem {
+  emby_id: string;
+  emby_name: string;
+  has_password: boolean;
+  is_admin: boolean;
+  is_disabled: boolean;
+  is_hidden: boolean;
+  last_login: string | null;
+  last_activity: string | null;
+  local_user: {
+    uid: number;
+    username: string;
+    telegram_id: number | null;
+    active: boolean;
+    role: number;
+  } | null;
+  sync_status: "synced" | "name_mismatch" | "unlinked";
+}
+
+interface OrphanItem {
+  uid: number;
+  username: string;
+  emby_id: string;
+  telegram_id: number | null;
+}
+
+interface EmbyUsersData {
+  emby_users: EmbyUserItem[];
+  orphans: OrphanItem[];
+  total_emby: number;
+  total_linked: number;
+  total_orphans: number;
+}
+
+export default function AdminEmbyPage() {
+  const { toast } = useToast();
+  const { t } = useI18n();
+  const [activeTab, setActiveTab] = useState("accounts");
+  const [deviceAuditVisited, setDeviceAuditVisited] = useState(false);
+
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("tab") === "devices") {
+      setActiveTab("devices");
+      setDeviceAuditVisited(true);
+    }
+  }, []);
+
+  // Connectivity test state
+  const [testResult, setTestResult] = useState<ConnectivityResult | null>(null);
+  const [isTesting, setIsTesting] = useState(false);
+
+  // Emby 用户表筛选：name 关键字 + 关联状态 + 属性
+  const [userSearch, setUserSearch] = useState("");
+  const [linkFilter, setLinkFilter] = useState<"all" | "linked" | "unlinked" | "name_mismatch">("all");
+  const [attrFilter, setAttrFilter] = useState<"all" | "admin" | "disabled" | "hidden">("all");
+  const [userRowLimit, setUserRowLimit] = useState(EMBY_TABLE_BATCH_SIZE);
+  const [orphanRowLimit, setOrphanRowLimit] = useState(EMBY_TABLE_BATCH_SIZE);
+
+  const loadEmbyUsers = useCallback(async (signal?: AbortSignal): Promise<EmbyUsersData> => {
+    const res = await api.listEmbyUsers(signal);
+    if (res.success && res.data) return res.data;
+    throw new Error(res.message || t("adminEmby.loadFailed"));
+  }, [t]);
+
+  const {
+    data: embyData,
+    isLoading: isLoadingUsers,
+    error: userLoadError,
+    execute: reloadEmbyUsers,
+  } = useAsyncResource(loadEmbyUsers, { immediate: false });
+
+  const filteredEmbyUsers = useMemo<EmbyUserItem[]>(() => {
+    if (!embyData) return [];
+    const q = userSearch.trim().toLowerCase();
+    return embyData.emby_users.filter((eu) => {
+      // 关键字匹配 emby_name / emby_id / 本地 username / 本地 UID
+      if (q) {
+        const haystacks = [
+          eu.emby_name,
+          eu.emby_id,
+          eu.local_user?.username || "",
+          eu.local_user ? String(eu.local_user.uid) : "",
+          eu.local_user?.telegram_id ? String(eu.local_user.telegram_id) : "",
+        ];
+        if (!haystacks.some((h) => h.toLowerCase().includes(q))) return false;
+      }
+
+      // 关联状态
+      if (linkFilter === "linked" && !eu.local_user) return false;
+      if (linkFilter === "unlinked" && eu.local_user) return false;
+      if (linkFilter === "name_mismatch" && eu.sync_status !== "name_mismatch") return false;
+
+      // 属性
+      if (attrFilter === "admin" && !eu.is_admin) return false;
+      if (attrFilter === "disabled" && !eu.is_disabled) return false;
+      if (attrFilter === "hidden" && !eu.is_hidden) return false;
+
+      return true;
+    });
+  }, [embyData, userSearch, linkFilter, attrFilter]);
+
+  const visibleEmbyUsers = useMemo(
+    () => filteredEmbyUsers.slice(0, userRowLimit),
+    [filteredEmbyUsers, userRowLimit],
+  );
+  const visibleOrphans = useMemo(
+    () => (embyData?.orphans || []).slice(0, orphanRowLimit),
+    [embyData, orphanRowLimit],
+  );
+
+  useEffect(() => {
+    setUserRowLimit(EMBY_TABLE_BATCH_SIZE);
+  }, [embyData, userSearch, linkFilter, attrFilter]);
+
+  useEffect(() => {
+    setOrphanRowLimit(EMBY_TABLE_BATCH_SIZE);
+  }, [embyData]);
+
+  // Action loading states
+  const [busyAction, setBusyAction] = useState<"sync" | "import" | "delete-unlinked" | "cleanup" | "reset" | null>(null);
+  const mutationBusy = busyAction !== null;
+
+  // Confirm dialog
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+
+  // Connectivity test
+  const handleTestConnectivity = useCallback(async () => {
+    setIsTesting(true);
+    try {
+      const res = await api.testEmbyConnectivity();
+      if (res.success && res.data) {
+        setTestResult(res.data);
+        toast({
+          title: res.data.overall ? t("adminEmby.connOk") : t("adminEmby.connPartialFail"),
+          description: res.data.tests
+            .map((tr) => `${tr.name}: ${tr.success ? "✓" : "✗"}`)
+            .join(", "),
+          variant: res.data.overall ? "success" : "destructive",
+        });
+      } else {
+        toast({ title: t("adminEmby.testFailed"), description: res.message, variant: "destructive" });
+      }
+    } catch (err: any) {
+      toast({ title: t("adminEmby.testError"), description: err.message, variant: "destructive" });
+    } finally {
+      setIsTesting(false);
+    }
+  }, [toast, t]);
+
+  // Load Emby users
+  const handleLoadUsers = useCallback(async () => {
+    try {
+      await reloadEmbyUsers();
+    } catch (err: any) {
+      toast({ title: t("adminEmby.loadError"), description: err.message, variant: "destructive" });
+    }
+  }, [reloadEmbyUsers, toast, t]);
+
+  // Sync all
+  const handleSync = useCallback(async () => {
+    if (mutationBusy) return;
+    setBusyAction("sync");
+    try {
+      const res = await api.syncAllEmbyUsers();
+      if (res.success && res.data) {
+        toast({
+          title: t("adminEmby.syncComplete"),
+          description: t("adminEmby.syncResult", { success: res.data.success, failed: res.data.failed }),
+          variant: res.data.failed > 0 ? "destructive" : "success",
+        });
+        await handleLoadUsers();
+      } else {
+        toast({ title: t("adminEmby.syncFailed"), description: res.message, variant: "destructive" });
+      }
+    } catch (err: any) {
+      toast({ title: t("adminEmby.syncError"), description: err.message, variant: "destructive" });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [mutationBusy, toast, handleLoadUsers, t]);
+
+  // Import unlinked users
+  const handleImport = useCallback(async () => {
+    if (mutationBusy) return;
+    setBusyAction("import");
+    try {
+      const res = await api.importEmbyUsers();
+      if (res.success && res.data) {
+        toast({
+          title: t("adminEmby.scanComplete"),
+          description: t("adminEmby.scanResult", { unlinked: res.data.unlinked_count, skipped: res.data.skipped_count }),
+          variant: "success",
+        });
+        await handleLoadUsers();
+      } else {
+        toast({ title: t("adminEmby.scanFailed"), description: res.message, variant: "destructive" });
+      }
+    } catch (err: any) {
+      toast({ title: t("adminEmby.scanError"), description: err.message, variant: "destructive" });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [mutationBusy, toast, handleLoadUsers, t]);
+
+  const handleDeleteUnlinked = useCallback(async () => {
+    if (mutationBusy) return;
+    setBusyAction("delete-unlinked");
+    try {
+      const res = await api.deleteUnlinkedEmbyUsers(false);
+      if (res.success && res.data) {
+        toast({
+          title: t("adminEmby.deleteComplete"),
+          description: t("adminEmby.deleteResult", { count: res.data.count, deleted: res.data.deleted.length }),
+          variant: res.data.failed.length > 0 ? "destructive" : "success",
+        });
+        await handleLoadUsers();
+      } else {
+        toast({ title: t("adminEmby.deleteFailed"), description: res.message, variant: "destructive" });
+      }
+    } catch (err: any) {
+      toast({ title: t("adminEmby.deleteError"), description: err.message, variant: "destructive" });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [mutationBusy, toast, handleLoadUsers, t]);
+
+  // Cleanup orphans
+  const handleCleanup = useCallback(async () => {
+    if (mutationBusy) return;
+    setBusyAction("cleanup");
+    try {
+      const res = await api.cleanupOrphanEmbyIds();
+      if (res.success && res.data) {
+        toast({
+          title: t("adminEmby.cleanupComplete"),
+          description: t("adminEmby.cleanupResult", { count: res.data.count }),
+          variant: "success",
+        });
+        await handleLoadUsers();
+      } else {
+        toast({ title: t("adminEmby.cleanupFailed"), description: res.message, variant: "destructive" });
+      }
+    } catch (err: any) {
+      toast({ title: t("adminEmby.cleanupError"), description: err.message, variant: "destructive" });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [mutationBusy, toast, handleLoadUsers, t]);
+
+  // Reset all bindings
+  const handleResetBindings = useCallback(async () => {
+    if (mutationBusy) return;
+    setBusyAction("reset");
+    try {
+      const res = await api.resetAllEmbyBindings();
+      if (res.success && res.data) {
+        toast({
+          title: t("adminEmby.resetComplete"),
+          description: t("adminEmby.resetResult", { count: res.data.count }),
+          variant: "success",
+        });
+        setResetDialogOpen(false);
+        await handleLoadUsers();
+      } else {
+        toast({ title: t("adminEmby.resetFailed"), description: res.message, variant: "destructive" });
+      }
+    } catch (err: any) {
+      toast({ title: t("adminEmby.resetError"), description: err.message, variant: "destructive" });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [mutationBusy, toast, handleLoadUsers, t]);
+
+  const syncStatusBadge = (status: string) => {
+    // 用户名一致与否不展示——本地与 Emby 用户名是允许不一致的，
+    // 只要本地账户绑定到了对应 Emby ID 即视为已绑定。
+    if (status === "unlinked") {
+      return <Badge variant="secondary">{t("adminEmby.statusUnbound")}</Badge>;
+    }
+    return (
+      <Badge
+        variant="default"
+        className="bg-emerald-500/10 text-emerald-500 border-emerald-500/20"
+      >
+        {t("adminEmby.statusBound")}
+      </Badge>
+    );
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Page Header */}
+      <div>
+        <h1 className="text-3xl font-bold">{t("adminEmby.title")}</h1>
+        <p className="text-muted-foreground">
+          {t("adminEmby.description")}
+        </p>
+      </div>
+
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => {
+          setActiveTab(value);
+          if (value === "devices") setDeviceAuditVisited(true);
+        }}
+        className="space-y-5"
+      >
+        <div className="custom-scrollbar overflow-x-auto overscroll-x-contain pb-1">
+        <TabsList className="i18n-stable-tabs grid h-auto w-full grid-cols-3 sm:w-fit">
+          <TabsTrigger value="accounts" className="gap-2">
+            <Server className="h-4 w-4" />
+            {t("adminEmby.accountsTab")}
+          </TabsTrigger>
+          <TabsTrigger value="devices" className="gap-2">
+            <MonitorSmartphone className="h-4 w-4" />
+            {t("adminEmby.deviceAuditTab")}
+          </TabsTrigger>
+          <TabsTrigger value="activity" className="gap-2">
+            <Activity className="h-4 w-4" />
+            {t("embyActivityLogs.title")}
+          </TabsTrigger>
+        </TabsList>
+        </div>
+
+        <TabsContent value="accounts" className="mt-0 space-y-6">
+      {/* Connectivity Test */}
+      <div>
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <CardTitle className="flex items-center gap-2">
+                  <Wifi className="h-5 w-5" />
+                  {t("adminEmby.connTitle")}
+                </CardTitle>
+                <CardDescription>
+                  {t("adminEmby.connDesc")}
+                </CardDescription>
+              </div>
+              <Button className="w-full sm:w-auto" onClick={handleTestConnectivity} disabled={isTesting || mutationBusy}>
+                {isTesting ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                )}
+                {t("adminEmby.connTest")}
+              </Button>
+            </div>
+          </CardHeader>
+          {testResult && (
+            <CardContent className="space-y-4">
+              {/* Server info */}
+              {testResult.server_info && (
+                <div className="rounded-lg border p-3 bg-muted/50">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Server className="h-4 w-4 text-muted-foreground" />
+                    <span className="text-sm font-medium">{t("adminEmby.serverInfo")}</span>
+                  </div>
+                  <div className="grid gap-2 text-sm sm:grid-cols-2 md:grid-cols-4">
+                    <div>
+                      <span className="text-muted-foreground">{t("adminEmby.nameLabel")}</span>
+                      {testResult.server_info.name}
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">{t("adminEmby.versionLabel")}</span>
+                      {testResult.server_info.version}
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">{t("adminEmby.systemLabel")}</span>
+                      {testResult.server_info.os}
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">{t("adminEmby.urlLabel")}</span>
+                      <span className="break-all">{testResult.emby_url}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+              {/* Test results */}
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {testResult.tests.map((t, i) => (
+                  <div
+                    key={i}
+                    className={`rounded-lg border p-3 ${
+                      t.success
+                        ? "border-emerald-500/20 bg-emerald-500/5"
+                        : "border-red-500/20 bg-red-500/5"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      {t.success ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                      ) : (
+                        <XCircle className="h-4 w-4 text-red-500" />
+                      )}
+                      <span className="font-medium text-sm">{t.name}</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">{t.message}</p>
+                  </div>
+                ))}
+              </div>
+              {/* Overall status */}
+              <div className="flex items-center gap-2">
+                {testResult.overall ? (
+                  <>
+                    <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+                    <span className="text-sm font-medium text-emerald-500">
+                      {t("adminEmby.allTestsPassed")}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <WifiOff className="h-5 w-5 text-red-500" />
+                    <span className="text-sm font-medium text-red-500">
+                      {t("adminEmby.partialTestsFailed")}
+                    </span>
+                  </>
+                )}
+              </div>
+            </CardContent>
+          )}
+        </Card>
+      </div>
+
+      {/* User Management */}
+      <div>
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between flex-wrap gap-4">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  <Users className="h-5 w-5" />
+                  {t("adminEmby.userMgmtTitle")}
+                </CardTitle>
+                <CardDescription>
+                  {t("adminEmby.userMgmtDesc")}
+                </CardDescription>
+              </div>
+              <div className="i18n-toolbar grid w-full grid-cols-1 gap-2 sm:flex sm:w-auto sm:flex-wrap">
+                <Button className="w-full sm:w-auto" variant="outline" onClick={handleLoadUsers} disabled={isLoadingUsers || mutationBusy}>
+                  {isLoadingUsers ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="mr-2 h-4 w-4" />
+                  )}
+                  {t("adminEmby.fetchData")}
+                </Button>
+                <Button className="w-full sm:w-auto" variant="outline" onClick={handleSync} disabled={mutationBusy || !embyData}>
+                  {busyAction === "sync" ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Link2 className="mr-2 h-4 w-4" />
+                  )}
+                  {t("adminEmby.syncUsers")}
+                </Button>
+                <Button className="w-full sm:w-auto" variant="outline" onClick={handleImport} disabled={mutationBusy || !embyData}>
+                  {busyAction === "import" ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Download className="mr-2 h-4 w-4" />
+                  )}
+                  {t("adminEmby.scanUnlinked")}
+                </Button>
+                <Button className="w-full sm:w-auto" variant="destructive" onClick={handleDeleteUnlinked} disabled={mutationBusy || !embyData}>
+                  {busyAction === "delete-unlinked" ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="mr-2 h-4 w-4" />
+                  )}
+                  {t("adminEmby.deleteUnlinkedBtn")}
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          {userLoadError && !embyData ? (
+            <CardContent>
+              <div className="rounded-lg border border-destructive/40 p-6 text-center text-sm text-destructive">
+                {userLoadError}
+              </div>
+            </CardContent>
+          ) : embyData ? (
+            <CardContent className="space-y-4">
+              {/* Summary */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="rounded-lg border p-3 text-center">
+                  <div className="text-2xl font-bold">{embyData.total_emby}</div>
+                  <div className="text-xs text-muted-foreground">{t("adminEmby.statEmbyUsers")}</div>
+                </div>
+                <div className="rounded-lg border p-3 text-center">
+                  <div className="text-2xl font-bold text-emerald-500">{embyData.total_linked}</div>
+                  <div className="text-xs text-muted-foreground">{t("adminEmby.statLinked")}</div>
+                </div>
+                <div className="rounded-lg border p-3 text-center">
+                  <div className="text-2xl font-bold text-blue-500">
+                    {embyData.total_emby - embyData.total_linked}
+                  </div>
+                  <div className="text-xs text-muted-foreground">{t("adminEmby.statUnlinked")}</div>
+                </div>
+                <div className="rounded-lg border p-3 text-center">
+                  <div className={`text-2xl font-bold ${embyData.total_orphans > 0 ? "text-amber-500" : ""}`}>
+                    {embyData.total_orphans}
+                  </div>
+                  <div className="text-xs text-muted-foreground">{t("adminEmby.statOrphans")}</div>
+                </div>
+              </div>
+
+              {/* Emby Users Table */}
+              <div>
+                <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                  <h3 className="text-sm font-medium">{t("adminEmby.userListTitle")}</h3>
+                  <Badge variant="outline" className="w-fit text-xs">
+                    {t("adminEmby.showingCount", { shown: filteredEmbyUsers.length, total: embyData.emby_users.length })}
+                  </Badge>
+                </div>
+
+                <div className="mb-3 grid gap-2 md:grid-cols-2">
+                  <Input
+                    placeholder={t("adminEmby.searchPlaceholder")}
+                    value={userSearch}
+                    onChange={(event) => setUserSearch(event.target.value)}
+                  />
+                  <Select value={linkFilter} onValueChange={(value) => setLinkFilter(value as typeof linkFilter)}>
+                    <SelectTrigger>
+                      <SelectValue placeholder={t("adminEmby.linkFilterPlaceholder")} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">{t("adminEmby.linkAll")}</SelectItem>
+                      <SelectItem value="linked">{t("adminEmby.linkLinked")}</SelectItem>
+                      <SelectItem value="unlinked">{t("adminEmby.linkUnlinked")}</SelectItem>
+                      <SelectItem value="name_mismatch">{t("adminEmby.linkNameMismatch")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Select value={attrFilter} onValueChange={(value) => setAttrFilter(value as typeof attrFilter)}>
+                    <SelectTrigger>
+                      <SelectValue placeholder={t("adminEmby.attrFilterPlaceholder")} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">{t("adminEmby.attrAll")}</SelectItem>
+                      <SelectItem value="admin">{t("adminEmby.attrAdmin")}</SelectItem>
+                      <SelectItem value="disabled">{t("adminEmby.attrDisabled")}</SelectItem>
+                      <SelectItem value="hidden">{t("adminEmby.attrHidden")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="overflow-hidden rounded-lg border">
+                  <div className="custom-scrollbar max-h-[min(62dvh,800px)] overflow-auto overscroll-contain">
+                    <table className="w-full min-w-[720px] text-sm">
+                      <thead className="sticky top-0 z-10 bg-muted">
+                        <tr>
+                          <th className="text-left p-3 font-medium">{t("adminEmby.thEmbyUsername")}</th>
+                          <th className="text-left p-3 font-medium">{t("adminEmby.thAttr")}</th>
+                          <th className="text-left p-3 font-medium">{t("adminEmby.thLocalUser")}</th>
+                          <th className="text-left p-3 font-medium">{t("adminEmby.thStatus")}</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y">
+                        {visibleEmbyUsers.map((eu) => (
+                          <tr key={eu.emby_id} className="hover:bg-muted/30">
+                            <td className="p-3">
+                              <div className="font-medium">{eu.emby_name}</div>
+                              <div className="text-xs text-muted-foreground font-mono">
+                                {eu.emby_id.slice(0, 8)}...
+                              </div>
+                            </td>
+                            <td className="p-3">
+                              <div className="flex flex-wrap gap-1">
+                                {eu.is_admin && (
+                                  <Badge variant="default" className="border-info/20 bg-info/10 text-info">
+                                    <Shield className="h-3 w-3 mr-1" />{t("adminEmby.badgeAdmin")}
+                                  </Badge>
+                                )}
+                                {eu.is_disabled && (
+                                  <Badge variant="destructive" className="text-xs">{t("adminEmby.badgeDisabled")}</Badge>
+                                )}
+                                {eu.is_hidden && (
+                                  <Badge variant="secondary" className="text-xs">{t("adminEmby.badgeHidden")}</Badge>
+                                )}
+                              </div>
+                            </td>
+                            <td className="p-3">
+                              {eu.local_user ? (
+                                <div>
+                                  <span className="font-medium">{eu.local_user.username}</span>
+                                  <span className="text-xs text-muted-foreground ml-1">
+                                    (UID: {eu.local_user.uid})
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-muted-foreground">—</span>
+                              )}
+                            </td>
+                            <td className="p-3">{syncStatusBadge(eu.sync_status)}</td>
+                          </tr>
+                        ))}
+                        {filteredEmbyUsers.length === 0 && (
+                          <tr>
+                            <td colSpan={4} className="p-6 text-center text-muted-foreground">
+                              {t("adminEmby.noFilterMatch")}
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                  {filteredEmbyUsers.length > 0 && (
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-t px-3 py-2 text-xs text-muted-foreground">
+                      <span>{t("adminEmby.renderedRows", { shown: visibleEmbyUsers.length, total: filteredEmbyUsers.length })}</span>
+                      {visibleEmbyUsers.length < filteredEmbyUsers.length && (
+                        <Button variant="outline" size="sm" onClick={() => setUserRowLimit((current) => current + EMBY_TABLE_BATCH_SIZE)}>
+                          {t("adminEmby.loadMoreRows")}
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Orphans */}
+              {embyData.orphans.length > 0 && (
+                <div>
+                  <h3 className="text-sm font-medium mb-2 flex items-center gap-2">
+                    <AlertTriangle className="h-4 w-4 text-amber-500" />
+                    {t("adminEmby.orphansTitle")}
+                    <span className="text-xs text-muted-foreground">
+                      {t("adminEmby.orphansHint")}
+                    </span>
+                  </h3>
+                  <div className="overflow-hidden rounded-lg border">
+                    <div className="custom-scrollbar max-h-[min(45dvh,560px)] overflow-auto overscroll-contain">
+                      <table className="w-full min-w-[620px] text-sm">
+                        <thead className="sticky top-0 z-10 bg-muted">
+                          <tr>
+                            <th className="text-left p-3 font-medium">{t("adminEmby.thLocalUsername")}</th>
+                            <th className="text-left p-3 font-medium">UID</th>
+                            <th className="text-left p-3 font-medium">{t("adminEmby.thInvalidEmbyId")}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {visibleOrphans.map((o) => (
+                            <tr key={o.uid} className="hover:bg-muted/30">
+                              <td className="p-3 font-medium">{o.username}</td>
+                              <td className="p-3">{o.uid}</td>
+                              <td className="p-3 font-mono text-xs text-muted-foreground">
+                                {o.emby_id}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-t px-3 py-2 text-xs text-muted-foreground">
+                      <span>{t("adminEmby.renderedRows", { shown: visibleOrphans.length, total: embyData.orphans.length })}</span>
+                      {visibleOrphans.length < embyData.orphans.length && (
+                        <Button variant="outline" size="sm" onClick={() => setOrphanRowLimit((current) => current + EMBY_TABLE_BATCH_SIZE)}>
+                          {t("adminEmby.loadMoreRows")}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          ) : (
+            <CardContent>
+              <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">
+                {t("adminEmby.usersNotAutoLoaded")}
+              </div>
+            </CardContent>
+          )}
+        </Card>
+      </div>
+
+      {/* Cleanup Actions */}
+      <div>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Trash2 className="h-5 w-5" />
+              {t("adminEmby.cleanupTitle")}
+            </CardTitle>
+            <CardDescription>
+              {t("adminEmby.cleanupCardDesc")}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {/* Cleanup orphans */}
+            <div className="flex flex-col items-stretch gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <div className="font-medium flex items-center gap-2">
+                  <Link2Off className="h-4 w-4 text-amber-500" />
+                  {t("adminEmby.cleanOrphansTitle")}
+                </div>
+                <p className="text-sm text-muted-foreground mt-1">
+                  {t("adminEmby.cleanOrphansDesc")}
+                </p>
+              </div>
+              <Button
+                className="w-full sm:w-auto"
+                variant="outline"
+                onClick={handleCleanup}
+                disabled={mutationBusy}
+              >
+                {busyAction === "cleanup" ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Trash2 className="mr-2 h-4 w-4" />
+                )}
+                {t("adminEmby.cleanBtn")}
+              </Button>
+            </div>
+
+            {/* Reset all bindings */}
+            <div className="flex flex-col items-stretch gap-3 rounded-lg border border-red-500/20 bg-red-500/5 p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <div className="font-medium flex items-center gap-2 text-red-500">
+                  <AlertTriangle className="h-4 w-4" />
+                  {t("adminEmby.resetBindingsTitle")}
+                </div>
+                <p className="text-sm text-muted-foreground mt-1">
+                  {t("adminEmby.resetBindingsDesc")}
+                </p>
+              </div>
+              <Button
+                className="w-full sm:w-auto"
+                variant="destructive"
+                onClick={() => setResetDialogOpen(true)}
+                disabled={mutationBusy}
+              >
+                {busyAction === "reset" ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Trash2 className="mr-2 h-4 w-4" />
+                )}
+                {t("adminEmby.resetBindingsBtn")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+        </TabsContent>
+
+        <TabsContent value="devices" className="mt-0">
+          {deviceAuditVisited && <AdminDeviceAuditPanel embedded />}
+        </TabsContent>
+        <TabsContent value="activity" className="mt-0">
+          <EmbyActivityLogs />
+        </TabsContent>
+      </Tabs>
+
+      {/* Reset confirmation dialog */}
+      <Dialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-red-500">
+              <AlertTriangle className="h-5 w-5" />
+              {t("adminEmby.resetDialogTitle")}
+            </DialogTitle>
+            <DialogDescription>
+              {t("adminEmby.resetDialogDesc")}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setResetDialogOpen(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleResetBindings}
+              disabled={mutationBusy}
+            >
+              {busyAction === "reset" && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {t("adminEmby.resetConfirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+    </div>
+  );
+}

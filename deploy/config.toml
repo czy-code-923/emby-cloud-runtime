@@ -1,0 +1,62 @@
+setup_mode = true
+[Global]
+server_name = "Emby Cloud"
+log_level = "info"
+runtime_log_limit = 300
+runtime_memory_limit_mb = 64
+redis_url = ""
+telegram_mode = false
+force_bind_telegram = false
+[Database]
+driver = "postgres"
+postgres_host = "postgres"
+postgres_user = "twilight"
+postgres_database = "twilight"
+postgres_max_open_conns = 4
+postgres_max_idle_conns = 2
+migration_panel_enabled = false
+[API]
+host = "0.0.0.0"
+port = 5000
+cors_origins = ["http://localhost:13000", "http://127.0.0.1:13000"]
+session_cookie_secure = false
+session_cookie_samesite = "Strict"
+[Emby]
+emby_url = "http://emby:8096"
+emby_token = ""
+emby_url_list = []
+emby_url_list_for_whitelist = []
+[Telegram]
+bot_token = ""
+login_enabled = false
+require_group_membership = false
+group_check_concurrency = 1
+group_action_concurrency = 1
+[SAR]
+register_mode = false
+user_limit = 5
+emby_direct_register_enabled = false
+emby_direct_register_workers = 1
+emby_direct_register_max_queue = 50
+signin_enabled = false
+daily_min = 10
+daily_max = 20
+streak_bonus_enabled = false
+signin_renewal_enabled = false
+signin_auto_renewal_enabled = false
+signin_renewal_cost = 300
+signin_renewal_days = 30
+auto_cleanup_no_emby = false
+auto_cleanup_pending_emby = false
+[DeviceLimit]
+device_limit_enabled = false
+[Security]
+telegram_direct_login_enabled = false
+apikey_direct_login_enabled = false
+[RateLimit]
+enabled = true
+login_per_minute = 10
+login_user_per_5m = 5
+register_per_10m = 5
+[SystemUpdate]
+auto_update_enabled = false

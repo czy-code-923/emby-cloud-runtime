@@ -1,0 +1,1817 @@
+package store
+
+import (
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func newJSONStoreForTest(t *testing.T) *Store {
+	t.Helper()
+	st, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func TestStrconv36(t *testing.T) {
+	cases := map[int64]string{
+		-1:   "",
+		0:    "0",
+		1:    "1",
+		35:   "z",
+		36:   "10",
+		1295: "zz",
+		1296: "100",
+	}
+	for input, want := range cases {
+		if got := strconv36(input); got != want {
+			t.Fatalf("strconv36(%d)=%q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestUserUIDsMatchingKeepsOrderAndCountWithoutUserCopies(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	// CreateUser 一律把 Active 置 true（store.go 的 CreateUser 强制覆盖入参），
+	// 想造一个停用账号必须在创建之后再 UpdateUser 关掉。
+	for _, username := range []string{"alpha", "beta", "gamma", "delta"} {
+		created, err := st.CreateUser(User{Username: username, Role: RoleNormal})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if username == "beta" {
+			if _, err := st.UpdateUser(created.UID, func(u *User) error { u.Active = false; return nil }); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	uids, matched := st.UserUIDsMatching(2, func(u User) bool { return u.Active })
+	if matched != 3 {
+		t.Fatalf("matched=%d, want 3", matched)
+	}
+	allUsers := st.ListUsers()
+	want := []int64{allUsers[0].UID, allUsers[2].UID}
+	if len(uids) != len(want) || uids[0] != want[0] || uids[1] != want[1] {
+		t.Fatalf("uids=%v, want %v", uids, want)
+	}
+
+	all, allMatched := st.UserUIDsMatching(0, func(u User) bool { return u.Active })
+	if allMatched != 3 || len(all) != 3 {
+		t.Fatalf("unlimited result=%v matched=%d, want three", all, allMatched)
+	}
+}
+
+func TestUsersByUIDsCopiesOnlyRequestedUsers(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	first, err := st.CreateUser(User{Username: "first", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.CreateUser(User{Username: "second", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := st.UsersByUIDs([]int64{second.UID, 999999, second.UID})
+	if len(users) != 1 || users[second.UID].Username != "second" {
+		t.Fatalf("users=%v, want only second user", users)
+	}
+	if _, ok := users[first.UID]; ok {
+		t.Fatal("unrequested user was copied")
+	}
+}
+
+func TestUsersMatchingWithCountLimitsCopiesAndCountsAllMatches(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	for _, username := range []string{"one", "two", "three"} {
+		if _, err := st.CreateUser(User{Username: username, Role: RoleNormal}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	users, matched := st.UsersMatchingWithCount(2, func(User) bool { return true })
+	if matched != 3 || len(users) != 2 {
+		t.Fatalf("users=%d matched=%d, want two returned and three matched", len(users), matched)
+	}
+	if users[0].Username != "one" || users[1].Username != "two" {
+		t.Fatalf("users=%v, want UID order", users)
+	}
+}
+
+func TestUsersByTelegramIDsCopiesOnlyRequestedBindings(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	first, err := st.CreateUser(User{Username: "first-tg", TelegramID: 101, Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateUser(User{Username: "second-tg", TelegramID: 202, Role: RoleNormal}); err != nil {
+		t.Fatal(err)
+	}
+	users := st.UsersByTelegramIDs([]int64{101, 999, 101})
+	if len(users) != 1 || users[101].UID != first.UID {
+		t.Fatalf("users=%v, want only Telegram 101 binding", users)
+	}
+}
+
+func TestUsersWithEmbyExcludesUnboundUsers(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if _, err := st.CreateUser(User{Username: "unbound", Role: RoleNormal}); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := st.CreateUser(User{Username: "bound", EmbyID: "emby-1", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := st.UsersWithEmby()
+	if len(users) != 1 || users[0].UID != bound.UID {
+		t.Fatalf("users=%v, want only bound user", users)
+	}
+}
+
+func TestEmbyIDIndexTracksUserLifecycle(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	alpha, err := st.CreateUser(User{Username: "alpha", EmbyID: "emby-alpha", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := st.FindUserByEmbyID("emby-alpha"); !ok || got.UID != alpha.UID {
+		t.Fatalf("created user not found by emby index: ok=%v got=%#v", ok, got)
+	}
+	if _, err := st.CreateUser(User{Username: "duplicate", EmbyID: "emby-alpha", Role: RoleNormal}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate emby id should conflict, got %v", err)
+	}
+
+	updated, err := st.UpdateUser(alpha.UID, func(u *User) error {
+		u.EmbyID = "emby-alpha-new"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.FindUserByEmbyID("emby-alpha"); ok {
+		t.Fatal("old emby id remained indexed after update")
+	}
+	if got, ok := st.FindUserByEmbyID("emby-alpha-new"); !ok || got.UID != updated.UID {
+		t.Fatalf("updated user not found by new emby id: ok=%v got=%#v", ok, got)
+	}
+
+	beta, err := st.CreateUser(User{Username: "beta", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateUser(beta.UID, func(u *User) error {
+		u.EmbyID = "emby-alpha-new"
+		return nil
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdateUser duplicate emby id should conflict, got %v", err)
+	}
+
+	bound, displaced, err := st.BindUserEmbyAtomic(beta.UID, "emby-alpha-new", "beta", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if displaced != alpha.UID || bound.UID != beta.UID {
+		t.Fatalf("unexpected force bind result: displaced=%d bound=%#v", displaced, bound)
+	}
+	if got, ok := st.FindUserByEmbyID("emby-alpha-new"); !ok || got.UID != beta.UID {
+		t.Fatalf("force-bound emby id points to wrong user: ok=%v got=%#v", ok, got)
+	}
+	if alphaAfter, ok := st.User(alpha.UID); !ok || alphaAfter.EmbyID != "" || !alphaAfter.PendingEmby {
+		t.Fatalf("displaced user not unbound correctly: ok=%v user=%#v", ok, alphaAfter)
+	}
+
+	if err := st.DeleteUser(beta.UID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.FindUserByEmbyID("emby-alpha-new"); ok {
+		t.Fatal("deleted user's emby id remained indexed")
+	}
+}
+
+func TestEmbyIDIndexTracksCodeConsumptionCallbacks(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	owner, err := st.CreateUser(User{Username: "owner", EmbyID: "emby-owner", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := st.CreateUser(User{Username: "code-user", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "REG-EMBY", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, _, err := st.ConsumeRegCodeAndUpdateUser("REG-EMBY", user.UID, 0, func(u *User, _ RegCode) error {
+		u.EmbyID = "emby-code-user"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := st.FindUserByEmbyID("emby-code-user"); !ok || got.UID != updated.UID {
+		t.Fatalf("regcode callback emby id not indexed: ok=%v got=%#v", ok, got)
+	}
+
+	conflictUser, err := st.CreateUser(User{Username: "conflict-user", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "REG-CONFLICT", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ConsumeRegCodeAndUpdateUser("REG-CONFLICT", conflictUser.UID, 0, func(u *User, _ RegCode) error {
+		u.EmbyID = owner.EmbyID
+		return nil
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate emby id from regcode callback should conflict, got %v", err)
+	}
+	if rc, ok := st.RegCode("REG-CONFLICT"); !ok || rc.UseCount != 0 || !rc.Active || rc.UsedBy != 0 || len(rc.UsedByUIDs) != 0 {
+		t.Fatalf("conflicting regcode consumption should be rolled back: ok=%v rc=%#v", ok, rc)
+	}
+	if got, ok := st.FindUserByEmbyID(owner.EmbyID); !ok || got.UID != owner.UID {
+		t.Fatalf("owner emby id index changed after rollback: ok=%v got=%#v", ok, got)
+	}
+
+	inviteUser, err := st.CreateUser(User{Username: "invite-user", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertInviteCode(InviteCode{Code: "INV-EMBY", InviterUID: owner.UID, Days: 30, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	inviteUpdated, _, err := st.ConsumeInviteCodeAndUpdateUser("INV-EMBY", inviteUser.UID, 3, 0, func(u *User, _ InviteCode) error {
+		u.EmbyID = "emby-invite-user"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := st.FindUserByEmbyID("emby-invite-user"); !ok || got.UID != inviteUpdated.UID {
+		t.Fatalf("invite callback emby id not indexed: ok=%v got=%#v", ok, got)
+	}
+}
+
+func TestSelfServiceRenewalBenefitsRequireEmbyWithoutMutation(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	user, err := st.CreateUser(User{Username: "renew-no-emby", Role: RoleNormal, Active: true, ExpiredAt: time.Now().AddDate(0, 0, 1).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := st.AddSignin(user.UID, 100); err != nil || !created {
+		t.Fatalf("seed points created=%v err=%v", created, err)
+	}
+	if _, _, err := st.SpendSigninPointsAndUpdateUser(user.UID, 40, func(u *User) error {
+		u.ExpiredAt = time.Now().AddDate(0, 0, 10).Unix()
+		return nil
+	}); !errors.Is(err, ErrEmbyRequired) {
+		t.Fatalf("spend without Emby error=%v", err)
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "RENEW-NO-EMBY", Type: 2, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ConsumeRegCodeAndUpdateUser("RENEW-NO-EMBY", user.UID, 0, nil); !errors.Is(err, ErrEmbyRequired) {
+		t.Fatalf("renew code without Emby error=%v", err)
+	}
+	latest, _ := st.User(user.UID)
+	reg, ok := st.RegCode("RENEW-NO-EMBY")
+	if latest.ExpiredAt != user.ExpiredAt || st.Signin(user.UID).Points != 100 {
+		t.Fatalf("rejected points renewal mutated state: user=%#v signin=%#v", latest, st.Signin(user.UID))
+	}
+	if !ok || reg.UseCount != 0 || !reg.Active || len(reg.UsedByUIDs) != 0 {
+		t.Fatalf("rejected renewal code was consumed: ok=%v reg=%#v", ok, reg)
+	}
+}
+
+func TestUserIdentityIndexesTrackUsernameAndEmailLifecycle(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	alpha, err := st.CreateUser(User{Username: "Alpha", Email: "Alpha@Example.com", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := st.FindUserByUsername("alpha"); !ok || got.UID != alpha.UID {
+		t.Fatalf("created user not found by username index: ok=%v got=%#v", ok, got)
+	}
+	if got, ok := st.FindUserByEmail(" alpha@example.com "); !ok || got.UID != alpha.UID {
+		t.Fatalf("created user not found by email index: ok=%v got=%#v", ok, got)
+	}
+	if _, err := st.CreateUser(User{Username: "ALPHA", Role: RoleNormal}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate username should conflict, got %v", err)
+	}
+	if _, err := st.CreateUser(User{Username: "mail-dup", Email: "alpha@example.com", Role: RoleNormal}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate email should conflict, got %v", err)
+	}
+
+	beta, err := st.CreateUser(User{Username: "beta", Email: "beta@example.com", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateUser(beta.UID, func(u *User) error {
+		u.Username = "alpha"
+		return nil
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdateUser duplicate username should conflict, got %v", err)
+	}
+	if _, err := st.UpdateUser(beta.UID, func(u *User) error {
+		u.Email = "ALPHA@example.com"
+		return nil
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdateUser duplicate email should conflict, got %v", err)
+	}
+
+	updated, err := st.UpdateUser(alpha.UID, func(u *User) error {
+		u.Username = "alpha-renamed"
+		u.Email = "alpha-renamed@example.com"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.FindUserByUsername("alpha"); ok {
+		t.Fatal("old username remained indexed after update")
+	}
+	if _, ok := st.FindUserByEmail("alpha@example.com"); ok {
+		t.Fatal("old email remained indexed after update")
+	}
+	if got, ok := st.FindUserByUsername("ALPHA-RENAMED"); !ok || got.UID != updated.UID {
+		t.Fatalf("updated username not indexed: ok=%v got=%#v", ok, got)
+	}
+	if got, ok := st.FindUserByEmail("Alpha-Renamed@Example.com"); !ok || got.UID != updated.UID {
+		t.Fatalf("updated email not indexed: ok=%v got=%#v", ok, got)
+	}
+
+	if err := st.DeleteUser(alpha.UID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.FindUserByUsername("alpha-renamed"); ok {
+		t.Fatal("deleted user's username remained indexed")
+	}
+	if _, ok := st.FindUserByEmail("alpha-renamed@example.com"); ok {
+		t.Fatal("deleted user's email remained indexed")
+	}
+}
+
+func TestUserSummaryCountsScansWithoutListSemantics(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if _, err := st.CreateUser(User{Username: "admin", Role: RoleAdmin, TelegramID: 1001, EmbyID: "emby-admin", Email: "admin@example.com", EmailVerified: true}); err != nil {
+		t.Fatal(err)
+	}
+	inactive, err := st.CreateUser(User{Username: "inactive", Role: RoleNormal, Email: "inactive@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateUser(inactive.UID, func(u *User) error {
+		u.Active = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateUser(User{Username: "blank", Role: RoleNormal, EmbyID: "   ", Email: "   ", PendingEmby: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	counts := st.UserSummaryCounts()
+	if counts.Total != 3 || counts.Active != 2 || counts.Admins != 1 {
+		t.Fatalf("unexpected base user counts: %#v", counts)
+	}
+	if counts.TelegramBound != 1 || counts.EmbyBound != 1 || counts.EmailBound != 2 || counts.EmailVerified != 1 {
+		t.Fatalf("unexpected binding counts: %#v", counts)
+	}
+	if counts.PendingEmby != 1 {
+		t.Fatalf("unexpected pending Emby count: %#v", counts)
+	}
+}
+
+func TestListUsersKeepsUIDOrderAcrossUserLifecycle(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	alpha, err := st.CreateUser(User{Username: "alpha", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := st.CreateUser(User{Username: "beta", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gamma, err := st.CreateUser(User{Username: "gamma", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := userUIDsFromList(st.ListUsers()); !sameInt64s(got, []int64{alpha.UID, beta.UID, gamma.UID}) {
+		t.Fatalf("initial ListUsers order=%v", got)
+	}
+	if got := append([]int64(nil), st.userUIDs...); !sameInt64s(got, []int64{alpha.UID, beta.UID, gamma.UID}) {
+		t.Fatalf("initial userUIDs index=%v", got)
+	}
+
+	if err := st.DeleteUser(beta.UID); err != nil {
+		t.Fatal(err)
+	}
+	delta, err := st.CreateUser(User{Username: "delta", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{alpha.UID, gamma.UID, delta.UID}
+	if got := userUIDsFromList(st.ListUsers()); !sameInt64s(got, want) {
+		t.Fatalf("ListUsers order after delete/create=%v want=%v", got, want)
+	}
+	if got := append([]int64(nil), st.userUIDs...); !sameInt64s(got, want) {
+		t.Fatalf("userUIDs index after delete/create=%v want=%v", got, want)
+	}
+}
+
+func TestSearchUsersPreservesUIDOrderAndLimitsWithoutListCopy(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	first, err := st.CreateUser(User{Username: "AlphaOne", Email: "alpha@example.com", Role: RoleNormal, TelegramID: 9001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.CreateUser(User{Username: "AlphaTwo", EmbyUsername: "MediaAlpha", EmbyID: "emby-alpha", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateUser(User{Username: "Beta", Role: RoleNormal}); err != nil {
+		t.Fatal(err)
+	}
+
+	matches := st.SearchUsers("ALPHA", 10)
+	if len(matches) != 2 || matches[0].UID != first.UID || matches[1].UID != second.UID {
+		t.Fatalf("unexpected ordered search result: %#v", matches)
+	}
+	limited := st.SearchUsers("alpha", 1)
+	if len(limited) != 1 || limited[0].UID != first.UID {
+		t.Fatalf("unexpected limited search result: %#v", limited)
+	}
+	byTelegram := st.SearchUsers("9001", 10)
+	if len(byTelegram) != 1 || byTelegram[0].UID != first.UID {
+		t.Fatalf("Telegram ID search failed: %#v", byTelegram)
+	}
+	if got := st.SearchUsers("+"+strconv.FormatInt(first.UID, 10), 10); len(got) != 0 {
+		t.Fatalf("non-canonical UID unexpectedly matched: %#v", got)
+	}
+}
+
+func TestUpdateTelegramUsernameIfBoundKeepsBindingIdentity(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	user, err := st.CreateUser(User{Username: "telegram-sync", Role: RoleNormal, TelegramID: 7001, TelegramUsername: "old_name"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, changed, err := st.UpdateTelegramUsernameIfBound(7001, "@new_name")
+	if err != nil || !changed || updated.UID != user.UID || updated.TelegramUsername != "new_name" {
+		t.Fatalf("username refresh = %#v changed=%v err=%v", updated, changed, err)
+	}
+	if _, changed, err = st.UpdateTelegramUsernameIfBound(7001, ""); err != nil || changed {
+		t.Fatalf("empty username should be ignored, changed=%v err=%v", changed, err)
+	}
+
+	if _, err := st.UpdateUser(user.UID, func(u *User) error {
+		u.TelegramID = 0
+		u.TelegramUsername = ""
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err = st.UpdateTelegramUsernameIfBound(7001, "stale_name"); err != nil || changed {
+		t.Fatalf("stale identity should not be refreshed, changed=%v err=%v", changed, err)
+	}
+	final, _ := st.User(user.UID)
+	if final.TelegramID != 0 || final.TelegramUsername != "" {
+		t.Fatalf("stale username changed an unbound user: %#v", final)
+	}
+}
+
+func TestSearchUsersByIdentityRestrictsConfiguredField(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	alpha, err := st.CreateUser(User{Username: "web-testuser", Role: RoleNormal, TelegramID: 812345, TelegramUsername: "tg-testuser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 干扰账号的每一项取值都不能包含上面要查的子串：搜索是子串匹配，用户名里
+	// 带 "testuser"、Telegram ID 里带 "2345" 都会让它一起命中。
+	if _, err := st.CreateUser(User{Username: "other-user", Role: RoleNormal, TelegramID: 923456, TelegramUsername: "other-tg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		query string
+		field UserIdentitySearchField
+	}{
+		{query: "testuser", field: UserIdentitySearchUsername},
+		{query: "8123", field: UserIdentitySearchTelegramID},
+		{query: "testuser", field: UserIdentitySearchTelegramUsername},
+		{query: strconv.FormatInt(alpha.UID, 10), field: UserIdentitySearchUID},
+	} {
+		matches := st.SearchUsersByIdentity(test.query, test.field, 10)
+		if len(matches) != 1 || matches[0].UID != alpha.UID {
+			t.Fatalf("field=%d query=%q matches=%#v", test.field, test.query, matches)
+		}
+	}
+}
+
+func userUIDsFromList(users []User) []int64 {
+	out := make([]int64, 0, len(users))
+	for _, u := range users {
+		out = append(out, u.UID)
+	}
+	return out
+}
+
+func sameInt64s(left, right []int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func TestDeleteRegCodePhysicallyDeletesUsedCode(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if err := st.UpsertRegCode(RegCode{Code: "USED-REG", Type: 2, Days: 30, ValidityTime: -1, UseCountLimit: 5, UseCount: 1, UsedByUIDs: []int64{101}, UsedByTelegramIDs: []int64{202}, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.DeleteRegCode("USED-REG"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := st.RegCode("USED-REG"); ok {
+		t.Fatal("used regcode should be physically deleted")
+	}
+}
+
+func TestStoreCountHelpersMatchListSemantics(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	now := time.Now().Unix()
+	activeUser, err := st.CreateUser(User{Username: "count-active", Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inactiveUser, err := st.CreateUser(User{Username: "count-inactive", Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateUser(inactiveUser.UID, func(user *User) error {
+		user.Active = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if total, active := st.UserCounts(); total != st.UserCount() || active != 1 || activeUser.UID == inactiveUser.UID {
+		t.Fatalf("user counts total=%d active=%d user_count=%d", total, active, st.UserCount())
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "REG-1", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	// UpsertRegCode 对新建的码有一条规定：`!Active && UseCount == 0` 时会被强制
+	// 置为启用（Go 零值分不清"没设置"和"显式 false"，新建的码默认就该可用）。
+	// 所以要造一个停用状态的码，必须让它带使用次数——也就是已用尽的码。
+	if err := st.UpsertRegCode(RegCode{Code: "REG-2", Type: 2, Days: 30, ValidityTime: -1, UseCountLimit: 1, UseCount: 1, Active: false}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := st.CountRegCodes(), len(st.ListRegCodes()); got != want {
+		t.Fatalf("regcode count=%d want list len %d", got, want)
+	}
+	if total, active := st.RegCodeCounts(); total != 2 || active != 1 {
+		t.Fatalf("regcode counts total=%d active=%d", total, active)
+	}
+
+	if _, err := st.UpsertAnnouncement(Announcement{Title: "visible", Content: "ok", Visible: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertAnnouncement(Announcement{Title: "hidden", Content: "hidden", Visible: false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertAnnouncement(Announcement{Title: "expired", Content: "old", Visible: true, ExpiredAt: now - 10}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := st.CountAnnouncements(false), len(st.ListAnnouncements(false)); got != want || got != 1 {
+		t.Fatalf("visible announcement count=%d want list len %d and visible=1", got, want)
+	}
+	if got, want := st.CountAnnouncements(true), len(st.ListAnnouncements(true)); got != want || got != 3 {
+		t.Fatalf("all announcement count=%d want list len %d and all=3", got, want)
+	}
+	// 形参是 (includeHidden, includeExpired)：只看"可见且未过期"要传 (false, false)。
+	if got := st.ListAnnouncementsFiltered(false, false); len(got) != 1 || got[0].Title != "visible" {
+		t.Fatalf("visible-only announcement filter returned %#v", got)
+	}
+	// 含隐藏但排除过期：visible + hidden = 2（expired 那条约 10 秒前到期，被排除）。
+	if got := st.ListAnnouncementsFiltered(true, false); len(got) != 2 {
+		t.Fatalf("non-expired announcement filter returned %d items, want 2", len(got))
+	}
+
+	if _, err := st.UpsertDeveloperJSPreset(DeveloperJSPreset{Name: "one", Code: "return 1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertDeveloperJSPreset(DeveloperJSPreset{Name: "two", Code: "return 2"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := st.CountDeveloperJSPresets(), len(st.ListDeveloperJSPresets()); got != want {
+		t.Fatalf("developer preset count=%d want list len %d", got, want)
+	}
+}
+
+func TestBatchDeleteRegCodesPhysicallyDeletesUsedAndUnused(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if err := st.UpsertRegCode(RegCode{Code: "UNUSED-REG", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "USED-REG", Type: 2, Days: 7, ValidityTime: -1, UseCountLimit: 3, UseCount: 1, UsedByUIDs: []int64{303}, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, missing, err := st.DeleteRegCodes([]string{"UNUSED-REG", "USED-REG", "MISSING-REG"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 2 || len(missing) != 1 || missing[0] != "MISSING-REG" {
+		t.Fatalf("unexpected delete result deleted=%v missing=%v", deleted, missing)
+	}
+	if _, ok := st.RegCode("UNUSED-REG"); ok {
+		t.Fatal("unused regcode was not physically deleted")
+	}
+	if _, ok := st.RegCode("USED-REG"); ok {
+		t.Fatal("used regcode was not physically deleted")
+	}
+}
+
+func TestUpsertRegCodesRejectsExistingCodeAtomically(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if err := st.UpsertRegCode(RegCode{Code: "EXISTING-REG", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true, Note: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	err := st.UpsertRegCodes([]RegCode{
+		{Code: "EXISTING-REG", Type: 2, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true, Note: "overwrite"},
+		{Code: "NEW-REG", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true},
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict for existing bulk regcode, got %v", err)
+	}
+	existing, ok := st.RegCode("EXISTING-REG")
+	if !ok || existing.Type != 1 || existing.Note != "keep" {
+		t.Fatalf("existing regcode was overwritten: ok=%v reg=%#v", ok, existing)
+	}
+	if _, ok := st.RegCode("NEW-REG"); ok {
+		t.Fatal("bulk regcode conflict should roll back the whole batch")
+	}
+}
+
+func TestRefreshLoadsExternallyChangedRegCodesAndTickets(t *testing.T) {
+	st, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertRegCode(RegCode{Code: "STALE-REG", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := st.CreateTicket(Ticket{UID: 1, Username: "user", Title: "stale", Content: "content", Type: TicketTypeDefault, Status: TicketStatusOpen}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := st.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state State
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	delete(state.RegCodes, "STALE-REG")
+	delete(state.Tickets, ticket.ID)
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 用另一个连到同一测试库的 Store 做带外写入（模拟其他进程改库），
+	// LoadSnapshot 走 saveLockedForce 覆盖持久层，第一个 Store 的内存仍是旧的。
+	writer := reopenTestStore(t)
+	if err := writer.LoadSnapshot(data); err != nil {
+		writer.Close()
+		t.Fatal(err)
+	}
+	writer.Close()
+
+	if _, ok := st.RegCode("STALE-REG"); !ok {
+		t.Fatal("test setup expected stale in-memory regcode before refresh")
+	}
+	if _, ok := st.Ticket(ticket.ID); !ok {
+		t.Fatal("test setup expected stale in-memory ticket before refresh")
+	}
+	if err := st.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.RegCode("STALE-REG"); ok {
+		t.Fatal("refresh did not remove externally deleted regcode from memory")
+	}
+	if _, ok := st.Ticket(ticket.ID); ok {
+		t.Fatal("refresh did not remove externally deleted ticket from memory")
+	}
+}
+
+func TestRefreshUnchangedVersionKeepsAuthoritativeStateBytes(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if _, err := st.CreateUser(User{Username: "unchanged-refresh", PasswordHash: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	st.mu.RLock()
+	if len(st.stateRaw) == 0 {
+		st.mu.RUnlock()
+		t.Fatal("save did not retain authoritative state bytes")
+	}
+	before := &st.stateRaw[0]
+	beforeVersion := st.stateVersion
+	st.mu.RUnlock()
+	if err := st.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	if st.stateVersion != beforeVersion {
+		t.Fatalf("unchanged refresh moved version from %d to %d", beforeVersion, st.stateVersion)
+	}
+	if len(st.stateRaw) == 0 || &st.stateRaw[0] != before {
+		t.Fatal("unchanged refresh replaced the authoritative state payload")
+	}
+}
+
+// ClearEmbyGrantForUnboundUsers 必须只解锁"无 Emby 账号"用户的注册资格，并回退其
+// 占用的注册码/邀请码使用记录；已绑定 Emby 与 PendingEmby 在飞的用户保持不动。
+func TestClearEmbyGrantForUnboundUsers(t *testing.T) {
+	st := newJSONStoreForTest(t)
+
+	// blocked：无 Emby、非 pending，被迁移误锁——应被清理。
+	blocked, err := st.CreateUser(User{Username: "blocked", PasswordHash: "x", EmbyGrantLocked: true, RegistrationSource: "regcode", RegistrationCode: "RC1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// bound：已绑定 Emby——不可重置注册资格。
+	bound, err := st.CreateUser(User{Username: "bound", PasswordHash: "x", EmbyID: "emby-x", EmbyGrantLocked: true, RegistrationSource: "regcode", RegistrationCode: "RC2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pending：待开通在飞——保留其资格。
+	pending, err := st.CreateUser(User{Username: "pending", PasswordHash: "x", PendingEmby: true, EmbyGrantLocked: true, RegistrationSource: "invite", RegistrationCode: "INV1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 直接种入码侧记录（精确控制字段，避免 Upsert 归一化干扰）：
+	//   RC1 被 blocked 用满（Active=false），清理后回退 UseCount=0 并恢复可用。
+	//   INV1 + 邀请关系：blocked 作为被邀请者。
+	st.mu.Lock()
+	st.state.RegCodes["RC1"] = RegCode{Code: "RC1", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, UseCount: 1, UsedBy: blocked.UID, UsedByUIDs: []int64{blocked.UID}, Active: false}
+	st.state.InviteCodes["INV1"] = InviteCode{Code: "INV1", InviterUID: 999, UseCountLimit: 1, UseCount: 1, Used: true, UsedByUID: blocked.UID, Active: false}
+	st.state.InviteRelations[blocked.UID] = InviteRelation{ParentUID: 999, ChildUID: blocked.UID, Code: "INV1"}
+	if err := st.saveLocked(); err != nil {
+		st.mu.Unlock()
+		t.Fatal(err)
+	}
+	st.mu.Unlock()
+
+	res, err := st.ClearEmbyGrantForUnboundUsers([]int64{blocked.UID, bound.UID, pending.UID, 4242})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !containsInt64(res.Cleared, blocked.UID) {
+		t.Fatalf("blocked must be cleared: %+v", res)
+	}
+	if !containsInt64(res.SkippedHasEmby, bound.UID) {
+		t.Fatalf("bound must be skipped (has emby): %+v", res)
+	}
+	if !containsInt64(res.SkippedPending, pending.UID) {
+		t.Fatalf("pending must be skipped (pending emby): %+v", res)
+	}
+	if !containsInt64(res.Missing, 4242) {
+		t.Fatalf("4242 must be missing: %+v", res)
+	}
+	if res.RegcodeRefs != 1 {
+		t.Fatalf("expected 1 regcode ref removed, got %d", res.RegcodeRefs)
+	}
+	if res.InviteRefs == 0 {
+		t.Fatalf("expected invite ref removed, got %d", res.InviteRefs)
+	}
+
+	// 用户侧：blocked 解锁；bound/pending 保持锁定。
+	if got, _ := st.User(blocked.UID); got.EmbyGrantLocked || got.RegistrationSource != "" || got.RegistrationCode != "" {
+		t.Fatalf("blocked grant not cleared: %+v", got)
+	}
+	if got, _ := st.User(bound.UID); !got.EmbyGrantLocked {
+		t.Fatal("bound must keep grant lock")
+	}
+	if got, _ := st.User(pending.UID); !got.EmbyGrantLocked {
+		t.Fatal("pending must keep grant lock")
+	}
+
+	// 码侧：RC1 回退并恢复可用。
+	rc, ok := st.RegCode("RC1")
+	if !ok {
+		t.Fatal("RC1 missing")
+	}
+	if rc.UseCount != 0 || rc.UsedBy != 0 || len(rc.UsedByUIDs) != 0 || !rc.Active {
+		t.Fatalf("RC1 not rolled back: %+v", rc)
+	}
+
+	// 邀请关系断开 + 邀请码回退。
+	if _, ok := st.ParentOf(blocked.UID); ok {
+		t.Fatal("invite relation should be detached")
+	}
+	inv, ok := st.InviteCode("INV1")
+	if !ok {
+		t.Fatal("INV1 missing")
+	}
+	if inv.UsedByUID != 0 || inv.Used || inv.UseCount != 0 || !inv.Active {
+		t.Fatalf("INV1 not rolled back: %+v", inv)
+	}
+}
+
+func TestRepairRegistrationResidueRestoresGrantAndPendingState(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	dirtyBound, err := st.CreateUser(User{Username: "dirty-bound", PasswordHash: "x", EmbyID: "emby-bound", PendingEmby: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lostGrant, err := st.CreateUser(User{Username: "lost-grant", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "USED-REG", Type: 1, Days: 14, Active: false, UseCountLimit: 1, UseCount: 1, UsedBy: lostGrant.UID, UsedByUIDs: []int64{lostGrant.UID}}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := st.RepairRegistrationResidue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ClearedBoundPending != 1 || result.RestoredGrantLocks != 1 || result.RestoredPendingEntitlement != 1 {
+		t.Fatalf("unexpected repair result: %#v", result)
+	}
+	updatedBound, _ := st.User(dirtyBound.UID)
+	if updatedBound.PendingEmby || updatedBound.PendingEmbyDays != nil {
+		t.Fatalf("bound user pending state was not cleared: %#v", updatedBound)
+	}
+	updatedLost, _ := st.User(lostGrant.UID)
+	if !updatedLost.EmbyGrantLocked || updatedLost.RegistrationSource != "regcode" || updatedLost.RegistrationCode != "USED-REG" {
+		t.Fatalf("grant provenance was not restored: %#v", updatedLost)
+	}
+	if !updatedLost.PendingEmby || updatedLost.PendingEmbyDays == nil || *updatedLost.PendingEmbyDays != 14 {
+		t.Fatalf("pending entitlement was not restored: %#v days=%#v", updatedLost, updatedLost.PendingEmbyDays)
+	}
+}
+
+func TestDetachInviteClearsInviteCodeUsage(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	child, err := st.CreateUser(User{Username: "detach-child", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Lock()
+	st.state.InviteCodes["INV-DETACH"] = InviteCode{Code: "INV-DETACH", InviterUID: 999, UseCountLimit: 1, UseCount: 1, Used: true, UsedByUID: child.UID, Active: false}
+	st.state.InviteRelations[child.UID] = InviteRelation{ParentUID: 999, ChildUID: child.UID, Code: "INV-DETACH"}
+	if err := st.saveLocked(); err != nil {
+		st.mu.Unlock()
+		t.Fatal(err)
+	}
+	st.mu.Unlock()
+
+	if err := st.DetachInvite(child.UID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.ParentOf(child.UID); ok {
+		t.Fatal("invite relation should be detached")
+	}
+	invite, ok := st.InviteCode("INV-DETACH")
+	if !ok {
+		t.Fatal("invite code should remain after detach")
+	}
+	// 断开只清引用：码保持已用（不退次数、不重新启用），防止小号重复使用同一张码。
+	if invite.UsedByUID != 0 || !invite.Used || invite.UseCount != 1 || invite.Active {
+		t.Fatalf("detach must only drop the reference and keep the code consumed: %#v", invite)
+	}
+}
+
+func TestDeleteInviteCodePhysicallyDeletesUsedCode(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	parent, err := st.CreateUser(User{Username: "invite-parent", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := st.CreateUser(User{Username: "invite-child", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertInviteCode(InviteCode{Code: "USED-INVITE", UID: parent.UID, InviterUID: parent.UID, Days: 7, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ConsumeInviteCode("USED-INVITE", child.UID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteInviteCode(parent.UID, "USED-INVITE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.InviteCode("USED-INVITE"); ok {
+		t.Fatal("used invite code should be physically deleted")
+	}
+	if rel, ok := st.ParentOf(child.UID); !ok || rel.ParentUID != parent.UID {
+		t.Fatalf("deleting an invite code should not detach historical relation: ok=%v rel=%#v", ok, rel)
+	}
+}
+
+func TestDetachInviteClearsLegacyRelationByChildUID(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	child, err := st.CreateUser(User{Username: "legacy-detach-child", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Lock()
+	st.state.InviteCodes["INV-LEGACY-DETACH"] = InviteCode{Code: "INV-LEGACY-DETACH", InviterUID: 999, UseCountLimit: 1, UseCount: 1, Used: true, UsedByUID: child.UID, Active: false}
+	st.state.InviteRelations[424242] = InviteRelation{ParentUID: 999, ChildUID: child.UID, Code: "INV-LEGACY-DETACH"}
+	if err := st.saveLocked(); err != nil {
+		st.mu.Unlock()
+		t.Fatal(err)
+	}
+	st.mu.Unlock()
+
+	if _, ok := st.ParentOf(child.UID); !ok {
+		t.Fatal("legacy relation should be visible before detach")
+	}
+	if children := st.ChildrenOf(999); len(children) != 1 || children[0].ChildUID != child.UID {
+		t.Fatalf("legacy child should be visible before detach: %#v", children)
+	}
+	if err := st.DetachInvite(child.UID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.ParentOf(child.UID); ok {
+		t.Fatal("legacy relation should be detached")
+	}
+	if children := st.ChildrenOf(999); len(children) != 0 {
+		t.Fatalf("legacy child should not reappear after refresh: %#v", children)
+	}
+	invite, ok := st.InviteCode("INV-LEGACY-DETACH")
+	if !ok {
+		t.Fatal("invite code should remain after legacy detach")
+	}
+	if invite.UsedByUID != 0 || !invite.Used || invite.UseCount != 1 || invite.Active {
+		t.Fatalf("legacy detach must only drop the reference and keep the code consumed: %#v", invite)
+	}
+}
+
+func TestConsumeInviteRejectsLegacyRelationByChildUID(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	child, err := st.CreateUser(User{Username: "legacy-consume-child", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Lock()
+	st.state.InviteCodes["INV-NEW-PARENT"] = InviteCode{Code: "INV-NEW-PARENT", InviterUID: 1000, UseCountLimit: 1, Active: true}
+	st.state.InviteRelations[424243] = InviteRelation{ParentUID: 999, ChildUID: child.UID, Code: "INV-OLD-PARENT"}
+	if err := st.saveLocked(); err != nil {
+		st.mu.Unlock()
+		t.Fatal(err)
+	}
+	st.mu.Unlock()
+
+	if _, _, err := st.ConsumeInviteCodeAndUpdateUser("INV-NEW-PARENT", child.UID, 10, 0, nil); err != ErrConflict {
+		t.Fatalf("expected ErrConflict for legacy parent relation, got %v", err)
+	}
+}
+
+func TestMediaRequestStatusHelpers(t *testing.T) {
+	cases := map[string]string{
+		"pending":        MediaRequestStatusUnhandled,
+		"pending_review": MediaRequestStatusUnhandled,
+		"approved":       MediaRequestStatusAccepted,
+		"reject":         MediaRequestStatusRejected,
+		"done":           MediaRequestStatusCompleted,
+		"download":       MediaRequestStatusDownloading,
+	}
+	for input, want := range cases {
+		if got := NormalizeMediaRequestStatus(input); got != want {
+			t.Fatalf("NormalizeMediaRequestStatus(%q)=%q want %q", input, got, want)
+		}
+	}
+	if got := NormalizeMediaRequestStatus(""); got != "" {
+		t.Fatalf("empty status should be invalid outside create defaulting, got %q", got)
+	}
+	if !MediaRequestStatusMatches(MediaRequestStatusDownloading, "active") {
+		t.Fatal("active filter should include downloading requests")
+	}
+	if MediaRequestStatusMatches(MediaRequestStatusDownloading, "pending") {
+		t.Fatal("pending filter should include only unhandled requests")
+	}
+	if IsActiveMediaRequestStatus(MediaRequestStatusCompleted) {
+		t.Fatal("completed request should not be active")
+	}
+	if got := MediaRequestStatusText(MediaRequestStatusAccepted); got != "已接受" {
+		t.Fatalf("MediaRequestStatusText accepted=%q", got)
+	}
+}
+
+func TestUpdateMediaRequestStatusNoteModes(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	req, err := st.CreateMediaRequest(MediaRequest{UID: 1, Title: "Movie", Source: "tmdb", MediaID: 42, MediaType: "movie"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := st.UpdateMediaRequestStatus(req.ID, "accepted", "first note", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != MediaRequestStatusAccepted || updated.AdminNote != "first note" {
+		t.Fatalf("unexpected first status update: %#v", updated)
+	}
+	updated, err = st.UpdateMediaRequestStatus(req.ID, "downloading", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != MediaRequestStatusDownloading || updated.AdminNote != "first note" {
+		t.Fatalf("empty admin note should preserve existing note: %#v", updated)
+	}
+	updated, err = st.UpdateMediaRequestStatus(req.ID, "completed", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != MediaRequestStatusCompleted || updated.AdminNote != "" {
+		t.Fatalf("replace note mode should clear note: %#v", updated)
+	}
+	if _, err := st.UpdateMediaRequestStatus(req.ID, "", "", true); err != ErrInvalid {
+		t.Fatalf("expected ErrInvalid for empty status update, got %v", err)
+	}
+}
+
+func TestCreateMediaRequestRejectsInvalidStatus(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if _, err := st.CreateMediaRequest(MediaRequest{UID: 1, Title: "Movie", Source: "tmdb", MediaID: 42, MediaType: "movie", Status: "wat"}); err != ErrInvalid {
+		t.Fatalf("expected ErrInvalid for bad create status, got %v", err)
+	}
+	req, err := st.CreateMediaRequest(MediaRequest{UID: 1, Title: "Movie", Source: "tmdb", MediaID: 43, MediaType: "movie"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != MediaRequestStatusUnhandled {
+		t.Fatalf("empty create status should default to unhandled, got %q", req.Status)
+	}
+}
+
+func TestCreateMediaRequestEnforcesUserActiveLimitAtomically(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	const attempts = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := st.CreateMediaRequestWithOptions(MediaRequest{
+				UID:       42,
+				Title:     "Movie",
+				Source:    "tmdb",
+				MediaID:   int64(1000 + i),
+				MediaType: "movie",
+			}, MediaRequestCreateOptions{UserActiveLimit: 1})
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	success := 0
+	limited := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, ErrMediaRequestUserActiveLimit):
+			limited++
+		default:
+			t.Fatalf("unexpected create error: %v", err)
+		}
+	}
+	if success != 1 || limited != attempts-1 {
+		t.Fatalf("expected 1 success and %d limited, got success=%d limited=%d", attempts-1, success, limited)
+	}
+	if got := st.ActiveMediaRequestCount(42); got != 1 {
+		t.Fatalf("active request count=%d want 1", got)
+	}
+}
+
+func TestCreateMediaRequestEnforcesGlobalActiveLimit(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if _, err := st.CreateMediaRequestWithOptions(MediaRequest{UID: 1, Title: "One", Source: "tmdb", MediaID: 1, MediaType: "movie"}, MediaRequestCreateOptions{GlobalActiveLimit: 1}); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if _, err := st.CreateMediaRequestWithOptions(MediaRequest{UID: 2, Title: "Two", Source: "tmdb", MediaID: 2, MediaType: "movie"}, MediaRequestCreateOptions{GlobalActiveLimit: 1}); !errors.Is(err, ErrMediaRequestGlobalActiveLimit) {
+		t.Fatalf("expected global active limit, got %v", err)
+	}
+}
+
+func TestCountMediaRequestsMatchesListFilters(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if _, err := st.CreateMediaRequestWithOptions(MediaRequest{UID: 1, Title: "One", Source: "tmdb", MediaID: 1, MediaType: "movie"}, MediaRequestCreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateMediaRequestWithOptions(MediaRequest{UID: 1, Title: "Two", Source: "tmdb", MediaID: 2, MediaType: "movie"}, MediaRequestCreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateMediaRequestWithOptions(MediaRequest{UID: 2, Title: "Other", Source: "tmdb", MediaID: 3, MediaType: "movie"}, MediaRequestCreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := st.CountMediaRequests(1, false), len(st.ListMediaRequests(1, false)); got != want {
+		t.Fatalf("user media request count=%d want list len %d", got, want)
+	}
+	if got, want := st.CountMediaRequests(0, true), len(st.ListMediaRequests(0, true)); got != want {
+		t.Fatalf("all media request count=%d want list len %d", got, want)
+	}
+}
+
+func TestListMediaRequestsPageFiltersAndPaginates(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	var requests []MediaRequest
+	for i := 0; i < 6; i++ {
+		req, err := st.CreateMediaRequestWithOptions(MediaRequest{
+			UID:       int64(1 + i%2),
+			Title:     "Movie",
+			Source:    "tmdb",
+			MediaID:   int64(100 + i),
+			MediaType: "movie",
+		}, MediaRequestCreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, req)
+	}
+	if _, err := st.UpdateMediaRequestStatus(requests[1].ID, MediaRequestStatusCompleted, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateMediaRequestStatus(requests[2].ID, MediaRequestStatusDownloading, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateMediaRequestStatus(requests[3].ID, MediaRequestStatusRejected, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateMediaRequestStatus(requests[4].ID, MediaRequestStatusAccepted, "", true); err != nil {
+		t.Fatal(err)
+	}
+
+	active := st.ListMediaRequestsPage(0, true, "active", 2, 2)
+	if active.Total != 4 {
+		t.Fatalf("active total=%d want 4", active.Total)
+	}
+	if active.StatusCounts["active"] != 4 || active.StatusCounts["pending"] != 2 || active.StatusCounts["completed"] != 1 {
+		t.Fatalf("unexpected status counts: %#v", active.StatusCounts)
+	}
+	if active.Page != 2 || active.PerPage != 2 || active.TotalPages != 2 || active.HasNext {
+		t.Fatalf("unexpected pagination metadata: %#v", active)
+	}
+	if got, want := mediaRequestIDs(active.Requests), []int64{requests[2].ID, requests[0].ID}; !sameInt64s(got, want) {
+		t.Fatalf("active page IDs=%v want %v", got, want)
+	}
+
+	pending := st.ListMediaRequestsPage(0, true, "pending", 1, 10)
+	if pending.Total != 2 {
+		t.Fatalf("pending total=%d want 2", pending.Total)
+	}
+	if got, want := mediaRequestIDs(pending.Requests), []int64{requests[5].ID, requests[0].ID}; !sameInt64s(got, want) {
+		t.Fatalf("pending IDs=%v want %v", got, want)
+	}
+
+	empty := st.ListMediaRequestsPage(0, true, "active", 99, 10)
+	if empty.Total != 4 || len(empty.Requests) != 0 {
+		t.Fatalf("out-of-range page=%#v want total 4 and no rows", empty)
+	}
+
+	filtered := st.ListMediaRequestsPageWithOptions(MediaRequestListOptions{
+		All: true, StatusFilter: "all", Source: "tmdb", Query: "105", Page: 1, PerPage: 10,
+	})
+	if filtered.Total != 1 || len(filtered.Requests) != 1 || filtered.Requests[0].MediaID != 105 {
+		t.Fatalf("filtered page=%#v want media id 105", filtered)
+	}
+	if filtered.StatusCounts["all"] != 1 || filtered.StatusCounts["pending"] != 1 {
+		t.Fatalf("filtered counts=%#v", filtered.StatusCounts)
+	}
+}
+
+func TestListMediaRequestGroupsBeforePagination(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	first, err := st.CreateMediaRequest(MediaRequest{
+		UID: 1, Title: "  Same   Name ", Source: "tmdb", MediaID: 101, MediaType: "movie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.CreateMediaRequest(MediaRequest{
+		UID: 2, Title: "same name", Source: "bangumi", MediaID: 202, MediaType: "tv",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := st.CreateMediaRequest(MediaRequest{
+		UID: 3, Title: "Other", Source: "tmdb", MediaID: 303, MediaType: "movie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page := st.ListMediaRequestGroupsPageWithOptions(MediaRequestListOptions{
+		All: true, StatusFilter: "all", Source: "all", Page: 1, PerPage: 1,
+	})
+	if page.Total != 2 || page.RequestTotal != 3 || page.TotalPages != 2 || !page.HasNext {
+		t.Fatalf("unexpected grouped metadata: %#v", page)
+	}
+	// 分组键取归一化后的标题，只有标题为空才回落成 "request:<RequireKey>"，
+	// 所以 third 的键是 "other"；组间按组内首条 ID 降序，third.ID 最大排第一页。
+	if len(page.Groups) != 1 || page.Groups[0].Key != "other" || len(page.Groups[0].Requests) != 1 || page.Groups[0].Requests[0].ID != third.ID {
+		t.Fatalf("first grouped page=%#v", page.Groups)
+	}
+	page = st.ListMediaRequestGroupsPageWithOptions(MediaRequestListOptions{
+		All: true, StatusFilter: "all", Source: "all", Page: 2, PerPage: 1,
+	})
+	if len(page.Groups) != 1 || page.Groups[0].Key != "same name" || len(page.Groups[0].Requests) != 2 {
+		t.Fatalf("same-name group=%#v", page.Groups)
+	}
+	if got, want := mediaRequestIDs(page.Groups[0].Requests), []int64{second.ID, first.ID}; !sameInt64s(got, want) {
+		t.Fatalf("same-name member IDs=%v want %v", got, want)
+	}
+}
+
+func TestUpdateMediaRequestsStatusByKeyIsAtomic(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	first, err := st.CreateMediaRequest(MediaRequest{UID: 1, Title: "Same", Source: "tmdb", MediaID: 1, MediaType: "movie"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.CreateMediaRequest(MediaRequest{UID: 2, Title: "Same", Source: "bangumi", MediaID: 2, MediaType: "tv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRevision, staleRevision := first.Revision, second.Revision+1
+	items := []MediaRequestBatchItem{
+		{RequireKey: first.RequireKey, Revision: &firstRevision},
+		{RequireKey: second.RequireKey, Revision: &staleRevision},
+	}
+	if _, err := st.UpdateMediaRequestsStatusByKey(items, "accepted", "batch", false); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale batch err=%v want conflict", err)
+	}
+	unchangedFirst, _ := st.FindMediaRequestByKey(first.RequireKey)
+	unchangedSecond, _ := st.FindMediaRequestByKey(second.RequireKey)
+	if unchangedFirst.Status != MediaRequestStatusUnhandled || unchangedSecond.Status != MediaRequestStatusUnhandled || unchangedFirst.Revision != 1 || unchangedSecond.Revision != 1 {
+		t.Fatalf("conflicting batch changed state: first=%#v second=%#v", unchangedFirst, unchangedSecond)
+	}
+
+	secondRevision := second.Revision
+	items[1].Revision = &secondRevision
+	updated, err := st.UpdateMediaRequestsStatusByKey(items, "accepted", "batch", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated) != 2 || updated[0].Revision != 2 || updated[1].Revision != 2 || updated[0].AdminNote != "batch" || updated[1].AdminNote != "batch" {
+		t.Fatalf("unexpected batch result: %#v", updated)
+	}
+}
+
+func TestMediaRequestRevisionProtectsAdminMutations(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	request, err := st.CreateMediaRequest(MediaRequest{
+		UID: 1, Title: "Movie", Source: "tmdb", MediaID: 42, MediaType: "movie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Revision != 1 {
+		t.Fatalf("initial revision=%d want 1", request.Revision)
+	}
+
+	expected := request.Revision
+	updated, err := st.UpdateMediaRequestStatusByKey(request.RequireKey, "accepted", "ok", false, &expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Revision != 2 || updated.Status != MediaRequestStatusAccepted {
+		t.Fatalf("updated request=%#v", updated)
+	}
+	if _, err := st.UpdateMediaRequestStatusByKey(request.RequireKey, "completed", "", false, &expected); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale update err=%v want conflict", err)
+	}
+	if _, err := st.DeleteMediaRequestByKey(request.RequireKey, &expected); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale delete err=%v want conflict", err)
+	}
+
+	expected = updated.Revision
+	deleted, err := st.DeleteMediaRequestByKey(request.RequireKey, &expected)
+	if err != nil || deleted.ID != request.ID {
+		t.Fatalf("delete request=%#v err=%v", deleted, err)
+	}
+}
+
+func mediaRequestIDs(requests []MediaRequest) []int64 {
+	ids := make([]int64, 0, len(requests))
+	for _, req := range requests {
+		ids = append(ids, req.ID)
+	}
+	return ids
+}
+
+func TestCreateTicketEnforcesUserOpenLimitAtomically(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	const attempts = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := st.CreateTicket(Ticket{
+				UID:      100,
+				Username: "user",
+				Title:    "ticket",
+				Content:  "content",
+				Type:     TicketTypeDefault,
+				Priority: TicketPriorityMedium,
+			}, 1, 0)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	success := 0
+	userLimited := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, ErrTicketUserOpenLimit):
+			userLimited++
+		default:
+			t.Fatalf("unexpected create ticket error: %v", err)
+		}
+	}
+	if success != 1 || userLimited != attempts-1 {
+		t.Fatalf("expected one success and %d user-limit errors, got success=%d limit=%d", attempts-1, success, userLimited)
+	}
+	if got := st.CountUserOpenTickets(100); got != 1 {
+		t.Fatalf("expected one persisted open ticket, got %d", got)
+	}
+}
+
+func TestCreateTicketEnforcesGlobalOpenLimit(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if _, err := st.CreateTicket(Ticket{UID: 1, Username: "a", Title: "one", Content: "content", Type: TicketTypeDefault}, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateTicket(Ticket{UID: 2, Username: "b", Title: "two", Content: "content", Type: TicketTypeDefault}, 0, 1); !errors.Is(err, ErrTicketGlobalOpenLimit) {
+		t.Fatalf("expected global limit error, got %v", err)
+	}
+}
+
+// TestReopenTicketRechecksOpenLimit 复现并锁死「关掉再重开」绕过开单上限的漏洞：
+// 用户上限=1 时，先建一单占满上限，再建第二单会被建单门挡下；把第一单关闭腾出名额、
+// 建出第二单后，若此时仍能重开第一单，用户就同时持有 2 个开态工单越过上限。
+// ReopenTicket 必须在同一把锁内复核 countOpenTicketsLocked，令重开在超限时返回
+// ErrTicketUserOpenLimit；名额确有空余时才放行。
+func TestReopenTicketRechecksOpenLimit(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	first, err := st.CreateTicket(Ticket{UID: 7, Username: "u", Title: "one", Content: "content", Type: TicketTypeDefault}, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 上限=1，已有一个开态单，第二次建单应被挡。
+	if _, err := st.CreateTicket(Ticket{UID: 7, Username: "u", Title: "two", Content: "content", Type: TicketTypeDefault}, 1, 0); !errors.Is(err, ErrTicketUserOpenLimit) {
+		t.Fatalf("expected user limit on second create, got %v", err)
+	}
+	// 关闭第一单腾出名额，再建第二单成功。
+	if _, err := st.UpdateTicket(first.ID, TicketUpdate{Status: stringPtr(TicketStatusClosed)}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.CreateTicket(Ticket{UID: 7, Username: "u", Title: "two", Content: "content", Type: TicketTypeDefault}, 1, 0)
+	if err != nil {
+		t.Fatalf("expected second create to succeed after close, got %v", err)
+	}
+	// 名额已被第二单占满：重开第一单必须被上限挡下（否则同时持有 2 个开态单）。
+	if _, err := st.ReopenTicket(first.ID, 7, 1, 0); !errors.Is(err, ErrTicketUserOpenLimit) {
+		t.Fatalf("expected reopen to be blocked by user limit, got %v", err)
+	}
+	// 关掉第二单腾出名额后，重开第一单应成功且回到开态。
+	if _, err := st.UpdateTicket(second.ID, TicketUpdate{Status: stringPtr(TicketStatusClosed)}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := st.ReopenTicket(first.ID, 7, 1, 0)
+	if err != nil {
+		t.Fatalf("expected reopen to succeed after freeing slot, got %v", err)
+	}
+	if NormalizeTicketStatus(reopened.Status) != TicketStatusOpen {
+		t.Fatalf("expected reopened ticket to be open, got %q", reopened.Status)
+	}
+	// 非归属用户不能重开他人工单（uid 不匹配按 not found 处理）。
+	if _, err := st.UpdateTicket(first.ID, TicketUpdate{Status: stringPtr(TicketStatusClosed)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReopenTicket(first.ID, 999, 1, 0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected reopen by non-owner to be not-found, got %v", err)
+	}
+	// 未关闭的工单不可重开。
+	open, err := st.CreateTicket(Ticket{UID: 8, Username: "v", Title: "live", Content: "content", Type: TicketTypeDefault}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReopenTicket(open.ID, 8, 0, 0); !errors.Is(err, ErrTicketNotClosed) {
+		t.Fatalf("expected reopen of open ticket to fail with ErrTicketNotClosed, got %v", err)
+	}
+}
+
+func TestCountTicketsMatchesListFilters(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	first, err := st.CreateTicket(Ticket{UID: 1, Username: "a", Title: "one", Content: "content", Type: TicketTypeDefault, Priority: TicketPriorityMedium}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateTicket(Ticket{UID: 1, Username: "a", Title: "two", Content: "content", Type: "bug", Priority: TicketPriorityHigh}, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateTicket(Ticket{UID: 2, Username: "b", Title: "three", Content: "content", Type: TicketTypeDefault, Priority: TicketPriorityLow}, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateTicket(first.ID, TicketUpdate{Status: stringPtr(TicketStatusClosed)}); err != nil {
+		t.Fatal(err)
+	}
+
+	filters := []TicketFilter{
+		{},
+		{UID: 1},
+		{Type: TicketTypeDefault},
+		{Priority: TicketPriorityHigh},
+		{Status: TicketStatusClosed},
+		{ActiveOnly: true},
+		{UID: 1, Type: "bug", Priority: TicketPriorityHigh, ActiveOnly: true},
+	}
+	for _, filter := range filters {
+		if got, want := st.CountTickets(filter), len(st.ListTickets(filter)); got != want {
+			t.Fatalf("ticket count for filter=%#v got=%d want list len %d", filter, got, want)
+		}
+	}
+}
+
+func TestListTicketsPageFiltersAndPaginates(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	var tickets []Ticket
+	for i := 0; i < 6; i++ {
+		ticket, err := st.CreateTicket(Ticket{
+			UID:      int64(1 + i%2),
+			Username: "user",
+			Title:    "Ticket",
+			Content:  "content",
+			Type:     TicketTypeDefault,
+			Status:   TicketStatusOpen,
+			Priority: TicketPriorityMedium,
+		}, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tickets = append(tickets, ticket)
+	}
+	for _, item := range []struct {
+		index  int
+		status string
+	}{
+		{1, TicketStatusResolved},
+		{2, TicketStatusInProgress},
+		{3, TicketStatusClosed},
+		{4, TicketStatusInProgress},
+	} {
+		status := item.status
+		if _, err := st.UpdateTicket(tickets[item.index].ID, TicketUpdate{Status: &status}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	active := st.ListTicketsPage(TicketFilter{ActiveOnly: true}, 2, 2)
+	if active.Total != 4 {
+		t.Fatalf("active total=%d want 4", active.Total)
+	}
+	if got, want := ticketIDs(active.Tickets), []int64{tickets[2].ID, tickets[0].ID}; !sameInt64s(got, want) {
+		t.Fatalf("active page IDs=%v want %v", got, want)
+	}
+
+	resolved := st.ListTicketsPage(TicketFilter{Status: TicketStatusResolved}, 1, 10)
+	if resolved.Total != 1 || len(resolved.Tickets) != 1 || resolved.Tickets[0].ID != tickets[1].ID {
+		t.Fatalf("resolved page=%#v want ticket %d", resolved, tickets[1].ID)
+	}
+
+	empty := st.ListTicketsPage(TicketFilter{ActiveOnly: true}, 99, 10)
+	if empty.Total != 4 || len(empty.Tickets) != 0 {
+		t.Fatalf("out-of-range page=%#v want total 4 and no rows", empty)
+	}
+}
+
+func ticketIDs(tickets []Ticket) []int64 {
+	ids := make([]int64, 0, len(tickets))
+	for _, ticket := range tickets {
+		ids = append(ids, ticket.ID)
+	}
+	return ids
+}
+
+func TestUpdateTicketCanAppendReplyAtomically(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	ticket, err := st.CreateTicket(Ticket{UID: 1, Username: "user", Title: "need help", Content: "content", Type: TicketTypeDefault}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := st.AddTicketReply(ticket.ID, TicketReply{
+		UID:      1,
+		Username: "user",
+		Role:     RoleNormal,
+		Content:  "more detail",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Replies) != 1 {
+		t.Fatalf("test setup expected one user reply, got %#v", updated.Replies)
+	}
+	note := "admin is checking"
+	updated, err = st.UpdateTicket(ticket.ID, TicketUpdate{
+		AdminNote: &note,
+		Reply: &TicketReply{
+			UID:      2,
+			Username: "admin",
+			Role:     RoleAdmin,
+			Content:  note,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AdminNote != note {
+		t.Fatalf("admin note not updated: %#v", updated)
+	}
+	if updated.Status != TicketStatusInProgress {
+		t.Fatalf("admin reply should move open ticket to in_progress, got %q", updated.Status)
+	}
+	if len(updated.Replies) != 2 || updated.Replies[0].Content != "more detail" || updated.Replies[1].Content != note || updated.Replies[1].CreatedAt == 0 {
+		t.Fatalf("reply should be appended with timestamp: %#v", updated.Replies)
+	}
+}
+
+func TestClosedTicketStorePolicyAllowsAdminOnly(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	ticket, err := st.CreateTicket(Ticket{UID: 1, Username: "user", Title: "closed", Content: "content", Type: TicketTypeDefault}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := TicketStatusClosed
+	if _, err := st.UpdateTicket(ticket.ID, TicketUpdate{Status: &closed}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddTicketReply(ticket.ID, TicketReply{UID: 1, Username: "user", Role: RoleNormal, Content: "user reply"}); !errors.Is(err, ErrTicketClosed) {
+		t.Fatalf("expected user reply to closed ticket to fail with ErrTicketClosed, got %v", err)
+	}
+	if _, err := st.AddTicketAttachment(ticket.ID, TicketAttachment{Filename: "a.png"}, RoleNormal); !errors.Is(err, ErrTicketClosed) {
+		t.Fatalf("expected user attachment to closed ticket to fail with ErrTicketClosed, got %v", err)
+	}
+	updated, err := st.AddTicketReply(ticket.ID, TicketReply{UID: 2, Username: "admin", Role: RoleAdmin, Content: "admin note"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != TicketStatusClosed || len(updated.Replies) != 1 {
+		t.Fatalf("admin reply should preserve closed status and append reply: %#v", updated)
+	}
+	if _, err := st.AddTicketAttachment(ticket.ID, TicketAttachment{Filename: "admin.png"}, RoleAdmin); err != nil {
+		t.Fatalf("admin attachment should be allowed on closed ticket: %v", err)
+	}
+}
+
+func TestTicketTypeStoreRejectsInvalidNames(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	before := st.TicketTypes()
+	if err := st.AddTicketType("   "); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid for empty ticket type, got %v", err)
+	}
+	if err := st.AddTicketType(strings.Repeat("x", 51)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid for long ticket type, got %v", err)
+	}
+	if err := st.DeleteTicketType(""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid deleting empty ticket type, got %v", err)
+	}
+	if _, err := st.RenameTicketType(TicketTypeDefault, ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid renaming to empty ticket type, got %v", err)
+	}
+	after := st.TicketTypes()
+	if len(after) != len(before) || after[0] != before[0] {
+		t.Fatalf("invalid type operations should not mutate types, before=%v after=%v", before, after)
+	}
+}
+
+func containsInt64(xs []int64, v int64) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+func TestUpsertRegCodeDoesNotReactivateExistingDisabledCode(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	now := time.Now().Unix()
+	st.mu.Lock()
+	st.state.RegCodes["DISABLED-REG"] = RegCode{Code: "DISABLED-REG", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: false, CreatedAt: now, CreatedTime: now}
+	st.mu.Unlock()
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.UpsertRegCode(RegCode{Code: "DISABLED-REG", Type: 1, Days: 7, ValidityTime: -1, UseCountLimit: 1, Active: false, CreatedAt: now, CreatedTime: now, Note: "edited"}); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, ok := st.RegCode("DISABLED-REG")
+	if !ok {
+		t.Fatal("disabled regcode disappeared after update")
+	}
+	if reg.Active {
+		t.Fatalf("disabled regcode was unexpectedly reactivated: %#v", reg)
+	}
+	if reg.Note != "edited" {
+		t.Fatalf("upsert did not apply update: %#v", reg)
+	}
+}
+
+func TestRegCodesPersistAcrossStoreReopen(t *testing.T) {
+	st, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "PERSIST-REG", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+
+	// reopenTestStore 不重置库：跨重开复读的数据必须仍在 PostgreSQL 里。
+	reopened := reopenTestStore(t)
+	defer reopened.Close()
+	reg, ok := reopened.RegCode("PERSIST-REG")
+	if !ok || reg.Code != "PERSIST-REG" || reg.Type != 1 {
+		t.Fatalf("regcode did not persist correctly: ok=%v reg=%#v", ok, reg)
+	}
+}
+
+func TestCleanupExpiredBindCodesDoesNotDeleteSameValueRegCode(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	now := time.Now().Unix()
+	if err := st.UpsertBindCode(BindCode{Code: "SAMEVALUE123", Scene: "register", CreatedAt: now - 700, ExpiresAt: now - 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRegCode(RegCode{Code: "SAMEVALUE123", Type: 1, Days: 30, ValidityTime: -1, UseCountLimit: 1, Active: true, CreatedAt: now - 700}); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := st.CleanupExpiredBindCodes(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted=%d, want 1", deleted)
+	}
+	if _, ok := st.BindCode("SAMEVALUE123"); ok {
+		t.Fatal("expired bind code was not deleted")
+	}
+	if _, ok := st.RegCode("SAMEVALUE123"); !ok {
+		t.Fatal("regcode with same value as bind code was deleted")
+	}
+}
+
+func TestRepairLegacyTelegramBindResidueClearsPersistedBindCodes(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	if err := st.UpsertBindCode(BindCode{Code: "LEGACYTG1", Scene: "register", Confirmed: true, TelegramID: 12345, CreatedAt: 1, ExpiresAt: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertBindCode(BindCode{Code: "LEGACYTG2", Scene: "user", UID: 99, Confirmed: true, TelegramID: 67890, CreatedAt: 1, ExpiresAt: 2}); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := st.RepairLegacyTelegramBindResidue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted=%d, want 2", deleted)
+	}
+	if _, ok := st.BindCode("LEGACYTG1"); ok {
+		t.Fatal("legacy register bind code should be removed")
+	}
+	if _, ok := st.BindCode("LEGACYTG2"); ok {
+		t.Fatal("legacy user bind code should be removed")
+	}
+	deleted, err = st.RepairLegacyTelegramBindResidue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 0 {
+		t.Fatalf("second repair should be idempotent, deleted=%d", deleted)
+	}
+}
+
+// TestFindAPIKeyByHashIndexLifecycle 锁定 API Key hash 索引的正确性与安全不变量：
+// 创建 / 删除 / 禁用 / 遗留 key / 级联删用户各路径下，索引与鉴权结果都必须与
+// 权威 state 一致；且陈旧索引只能造成「假未命中」，绝不能放行已删 / 已禁用的 key。
+func TestFindAPIKeyByHashIndexLifecycle(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	u, err := st.CreateUser(User{Username: "keyowner", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := st.CreateAPIKey(APIKey{UID: u.UID, Name: "k1", Hash: "HASH-modern-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1) 现代 key 命中：返回的 key/用户必须对得上。
+	if k, gotU, ok := st.FindAPIKeyByHash("HASH-modern-1"); !ok || k.ID != created.ID || gotU.UID != u.UID {
+		t.Fatalf("modern key lookup: ok=%v k.ID=%d gotUID=%d", ok, k.ID, gotU.UID)
+	}
+	// 2) 禁用后必须查不到（hash 仍在索引，但复核 Enabled=false 挡下）。
+	if _, err := st.UpdateAPIKey(u.UID, created.ID, func(k *APIKey) error { k.Enabled = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := st.FindAPIKeyByHash("HASH-modern-1"); ok {
+		t.Fatal("disabled key must not authenticate")
+	}
+	// 3) 重新启用后恢复命中。
+	if _, err := st.UpdateAPIKey(u.UID, created.ID, func(k *APIKey) error { k.Enabled = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := st.FindAPIKeyByHash("HASH-modern-1"); !ok {
+		t.Fatal("re-enabled key must authenticate")
+	}
+	// 4) 删除后查不到，且索引条目被摘除。
+	if err := st.DeleteAPIKey(u.UID, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := st.FindAPIKeyByHash("HASH-modern-1"); ok {
+		t.Fatal("deleted key must not authenticate")
+	}
+	st.mu.RLock()
+	_, stillIndexed := st.apiKeyHashMap["HASH-modern-1"]
+	st.mu.RUnlock()
+	if stillIndexed {
+		t.Fatal("deleted key hash must be removed from index")
+	}
+}
+
+// TestFindAPIKeyByHashLegacyAndStaleSafety 覆盖遗留 key 经 UpdateUser 的索引维护，
+// 并直接注入「悬垂索引条目」验证复核层：陈旧索引绝不能放行已失效的 key。
+func TestFindAPIKeyByHashLegacyAndStaleSafety(t *testing.T) {
+	st := newJSONStoreForTest(t)
+	u, err := st.CreateUser(User{Username: "legacyowner", Role: RoleNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 启用遗留 key：UpdateUser → maintainLegacyAPIKeyIndex 登记 hash。
+	if _, err := st.UpdateUser(u.UID, func(x *User) error {
+		x.LegacyAPIKeyStatus = true
+		x.LegacyAPIKeyHash = "HASH-legacy-1"
+		x.LegacyPermissions = []string{"read"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, gotU, ok := st.FindAPIKeyByHash("HASH-legacy-1"); !ok || gotU.UID != u.UID {
+		t.Fatalf("legacy key lookup: ok=%v gotUID=%d", ok, gotU.UID)
+	}
+	// 关闭遗留 key：必须立刻查不到，且索引摘除。
+	if _, err := st.UpdateUser(u.UID, func(x *User) error { x.LegacyAPIKeyStatus = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := st.FindAPIKeyByHash("HASH-legacy-1"); ok {
+		t.Fatal("disabled legacy key must not authenticate")
+	}
+
+	// 安全不变量：手工往索引塞一个指向「已删除 key / 未启用遗留 key」的悬垂条目，
+	// FindAPIKeyByHash 必须靠回 state 复核挡下，返回 ok=false（假未命中而非假命中）。
+	st.mu.Lock()
+	st.apiKeyHashMap["HASH-ghost"] = 999999         // 无对应 APIKey
+	st.legacyAPIKeyHashMap["HASH-legacy-1"] = u.UID // 用户 Status 已 false
+	st.mu.Unlock()
+	if _, _, ok := st.FindAPIKeyByHash("HASH-ghost"); ok {
+		t.Fatal("stale modern index entry must not authenticate a non-existent key")
+	}
+	if _, _, ok := st.FindAPIKeyByHash("HASH-legacy-1"); ok {
+		t.Fatal("stale legacy index entry must not authenticate a disabled legacy key")
+	}
+}

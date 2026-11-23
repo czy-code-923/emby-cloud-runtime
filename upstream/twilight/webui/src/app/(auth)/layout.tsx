@@ -1,0 +1,100 @@
+"use client";
+
+import { useEffect, useMemo } from "react";
+import { useSystemStore } from "@/store/system";
+import { resolveAuthBackgroundUrl } from "@/lib/auth-background";
+import { API_BASE } from "@/lib/api-request";
+
+// Validate env color against a strict CSS color pattern to prevent injection
+// if this value ever migrates from build-time env to runtime config.
+const rawAuthTextColor = process.env.NEXT_PUBLIC_AUTH_TEXT_COLOR;
+const CSS_COLOR_RE = /^(#[0-9a-fA-F]{3,8}|rgba?\([\d\s,.%]+\)|hsla?\([\d\s,.%/]+\)|[a-z]{3,20})$/;
+const authTextColor = rawAuthTextColor && CSS_COLOR_RE.test(rawAuthTextColor.trim())
+  ? rawAuthTextColor.trim()
+  : undefined;
+
+// 背景图叠加层不透明度，默认 0.4（范围 0-1），通过 NEXT_PUBLIC_AUTH_BG_OVERLAY_OPACITY 控制。
+const rawOverlay = process.env.NEXT_PUBLIC_AUTH_BG_OVERLAY_OPACITY;
+const overlayOpacity = (() => {
+  if (!rawOverlay) return 0.4;
+  const n = Number(rawOverlay);
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0.4;
+})();
+
+// 右侧面板背景不透明度，默认 0.82（范围 0-1），通过 NEXT_PUBLIC_AUTH_PANEL_OPACITY 控制。
+const rawPanel = process.env.NEXT_PUBLIC_AUTH_PANEL_OPACITY;
+const panelOpacity = (() => {
+  if (!rawPanel) return 0.82;
+  const n = Number(rawPanel);
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0.82;
+})();
+
+export default function AuthLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const { info: systemInfo, fetchInfo } = useSystemStore();
+  const bgUrl = systemInfo?.auth_background_url;
+  const safeBg = useMemo(() => resolveAuthBackgroundUrl(bgUrl, API_BASE), [bgUrl]);
+
+  useEffect(() => {
+    void fetchInfo();
+  }, [fetchInfo]);
+
+  const backgroundStyle = safeBg
+    ? {
+        backgroundImage: `url(${JSON.stringify(safeBg)})`,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        backgroundRepeat: "no-repeat",
+      }
+    : undefined;
+
+  return (
+    <>
+      {authTextColor && (
+        <style>{`
+          .auth-custom-color,
+          .auth-custom-color h1, .auth-custom-color h2, .auth-custom-color h3,
+          .auth-custom-color p, .auth-custom-color span, .auth-custom-color label,
+          .auth-custom-color code, .auth-custom-color div, .auth-custom-color li,
+          .auth-custom-color [class*="text-foreground"],
+          .auth-custom-color [class*="text-muted-foreground"] {
+            color: ${authTextColor} !important;
+          }
+        `}</style>
+      )}
+      {/* 注入面板 / 叠加层透明度 CSS 变量 */}
+      <style>{`
+        :root {
+          --auth-panel-opacity: ${panelOpacity};
+          --auth-panel-opacity-has-bg: ${Math.min(1, panelOpacity + 0.08).toFixed(2)};
+        }
+      `}</style>
+      <div
+        className={`relative min-h-dvh bg-background ${safeBg ? "auth-has-bg" : ""}`}
+        style={backgroundStyle}
+      >
+        {!safeBg && (
+          <>
+            <div className="shell-glow shell-glow-left" />
+            <div className="shell-glow shell-glow-right" />
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_10%,hsl(var(--primary)/0.12),transparent_35%),radial-gradient(circle_at_80%_90%,hsl(var(--primary)/0.08),transparent_30%)]" />
+          </>
+        )}
+        {safeBg && (
+          <div
+            className="pointer-events-none absolute inset-0 z-[1] bg-background backdrop-blur-[2px]"
+            style={{ opacity: overlayOpacity }}
+          />
+        )}
+        <main className={`auth-panel auth-card-text ${authTextColor ? "auth-custom-color" : ""}`}>
+          <div className="auth-panel-inner space-y-7">
+            {children}
+          </div>
+        </main>
+      </div>
+    </>
+  );
+}

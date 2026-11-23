@@ -1,0 +1,1435 @@
+package api
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/prejudice-studio/twilight/internal/config"
+	"github.com/prejudice-studio/twilight/internal/store"
+)
+
+const (
+	telegramPanelTTL             = time.Minute
+	telegramPanelMaxEntries      = 256
+	telegramUserSelectionMax     = 8
+	telegramUserSearchQueryLimit = 128
+)
+
+type telegramPanelContext struct {
+	Token            string
+	ChatID           int64
+	MessageID        int64
+	CommandMessageID int64
+	TargetUID        int64
+	Query            string
+	ReplyTelegramID  int64
+	CandidateUIDs    []int64
+	ExpiresAt        int64
+	ConfirmAction    string
+	// timer 是这个 panel 的过期定时器；同一个 panel 全程只对应一个 *time.Timer。
+	// touch 时调 Reset 而非 AfterFunc 新建一个，避免 admin 高频按按钮时 goroutine
+	// 与 closure 累积——历史实现每次 touch 都挂一个新 AfterFunc，旧的从不取消，
+	// 极端场景下单个 panel 能挂出几十个未释放的 closure。结构体被拷贝到栈 / map
+	// 时共享同一个 *Timer 实例，map 内的副本始终是定时器的"主人"。
+	timer *time.Timer
+}
+
+func telegramIsAnonymousGroupMessage(message *telegramMessage) bool {
+	if message == nil {
+		return false
+	}
+	if message.SenderChat.ID != 0 {
+		return true
+	}
+	return message.Chat.ID != 0 && !strings.EqualFold(message.Chat.Type, "private") && message.From.ID == 0
+}
+
+type telegramGroupUserSearch struct {
+	Query      string
+	Field      store.UserIdentitySearchField
+	FieldLabel string
+}
+
+type telegramGroupUserResolution struct {
+	Users     []store.User
+	Search    telegramGroupUserSearch
+	Truncated bool
+	Reason    string
+}
+
+func (a *App) telegramResolveGroupUserTargets(query string, message *telegramMessage) telegramGroupUserResolution {
+	return a.telegramResolveGroupUserTargetValues(query, telegramReplyTelegramID(message))
+}
+
+func (a *App) telegramResolveGroupUserTargetValues(query string, replyTelegramID int64) telegramGroupUserResolution {
+	if strings.TrimSpace(query) == "" {
+		if replyTelegramID != 0 {
+			if u, okUser := a.store().FindUserByTelegramID(replyTelegramID); okUser {
+				return telegramGroupUserResolution{Users: []store.User{u}, Search: telegramGroupUserSearch{FieldLabel: "回复消息"}}
+			}
+			return telegramGroupUserResolution{Reason: "目标 Telegram 尚未绑定 Twilight 账号。"}
+		}
+		return telegramGroupUserResolution{Reason: telegramGroupUserSearchUsage()}
+	}
+	search, reason := telegramParseGroupUserSearch(query)
+	if reason != "" {
+		return telegramGroupUserResolution{Reason: reason}
+	}
+	users := a.store().SearchUsersByIdentity(search.Query, search.Field, telegramUserSelectionMax+1)
+	if len(users) == 0 {
+		return telegramGroupUserResolution{Search: search, Reason: "未找到匹配用户。"}
+	}
+	resolution := telegramGroupUserResolution{Users: users, Search: search}
+	if len(users) > telegramUserSelectionMax {
+		resolution.Users = users[:telegramUserSelectionMax]
+		resolution.Truncated = true
+	}
+	return resolution
+}
+
+func telegramParseGroupUserSearch(raw string) (telegramGroupUserSearch, string) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return telegramGroupUserSearch{}, telegramGroupUserSearchUsage()
+	}
+	fields := strings.Fields(trimmed)
+	search := telegramGroupUserSearch{Query: trimmed, Field: store.UserIdentitySearchAny, FieldLabel: "全部身份字段"}
+	if len(fields) >= 2 {
+		var recognized bool
+		switch strings.ToLower(fields[len(fields)-1]) {
+		case "uid":
+			search.Field, search.FieldLabel, recognized = store.UserIdentitySearchUID, "UID", true
+		case "username":
+			search.Field, search.FieldLabel, recognized = store.UserIdentitySearchUsername, "Web 用户名", true
+		case "tgid":
+			search.Field, search.FieldLabel, recognized = store.UserIdentitySearchTelegramID, "Telegram ID", true
+		case "tgname":
+			search.Field, search.FieldLabel, recognized = store.UserIdentitySearchTelegramUsername, "Telegram 用户名", true
+		}
+		if recognized {
+			search.Query = strings.TrimSpace(strings.Join(fields[:len(fields)-1], " "))
+		}
+	}
+	if search.Query == "" {
+		return telegramGroupUserSearch{}, telegramGroupUserSearchUsage()
+	}
+	if len([]rune(search.Query)) > telegramUserSearchQueryLimit {
+		return telegramGroupUserSearch{}, "查询关键词过长，请缩短后重试。"
+	}
+	if search.Field == store.UserIdentitySearchUID || search.Field == store.UserIdentitySearchTelegramID {
+		value, err := strconv.ParseUint(search.Query, 10, 63)
+		if err != nil || value == 0 {
+			return telegramGroupUserSearch{}, search.FieldLabel + " 查询值必须是正整数。"
+		}
+	}
+	if search.Field == store.UserIdentitySearchTelegramUsername {
+		search.Query = strings.TrimPrefix(search.Query, "@")
+		if search.Query == "" {
+			return telegramGroupUserSearch{}, "Telegram 用户名不能为空。"
+		}
+	}
+	return search, ""
+}
+
+func telegramGroupUserSearchUsage() string {
+	return "请回复目标用户消息后发送 /twguser，或使用：\n" +
+		"/twguser <关键词>\n" +
+		"/twguser <值> uid|username|tgid|tgname"
+}
+
+func (a *App) telegramSendGroupAdminAuth(ctx context.Context, chatID, commandMessageID int64, query string, message *telegramMessage) {
+	// 修复：同一聊天里同一 sender_chat 身份 30 秒内只发一个验证面板，防止刷屏。
+	var senderID int64
+	if message != nil {
+		senderID = message.SenderChat.ID
+		if senderID == 0 {
+			senderID = message.From.ID
+		}
+	}
+	if !a.telegramPanelThrottle.allow(telegramCooldownKey("auth", chatID, senderID), telegramUnauthorizedCooldown) {
+		return
+	}
+	panel := a.telegramCreateAuthPanel(chatID, commandMessageID, query, telegramReplyTelegramID(message))
+	markup := telegramInlineKeyboard([][]telegramInlineButton{
+		{{Text: "验证管理员身份", Data: "gadm:auth:" + panel.Token}},
+		{{Text: "关闭面板", Data: "gadm:act:close:" + panel.Token}},
+	})
+	messageID, err := a.telegramSendMessageWithMarkup(ctx, chatID, "匿名管理员指令需要先验证真实 Telegram 身份。", markup)
+	if err != nil {
+		return
+	}
+	panel.MessageID = messageID
+	a.telegramSavePanel(panel)
+}
+
+func (a *App) telegramSendGroupUserPanel(ctx context.Context, chatID, commandMessageID int64, target store.User, requireAuth bool) bool {
+	panel := a.telegramCreatePanel(chatID, commandMessageID, target)
+	text := a.telegramGroupUserPanelTextForChat(ctx, chatID, target)
+	markup := a.telegramGroupUserPanelMarkup(panel.Token, target, panel.ConfirmAction)
+	messageID, err := a.telegramSendMessageWithMarkup(ctx, chatID, text, markup)
+	if err != nil {
+		return false
+	}
+	panel.MessageID = messageID
+	if requireAuth {
+		panel.ConfirmAction = "auth"
+	}
+	a.telegramSavePanel(panel)
+	return true
+}
+
+func (a *App) telegramSendGroupUserSelection(ctx context.Context, chatID, commandMessageID int64, query string, replyTelegramID int64, resolution telegramGroupUserResolution) bool {
+	panel := a.telegramCreateAuthPanel(chatID, commandMessageID, query, replyTelegramID)
+	panel.CandidateUIDs = telegramUserUIDs(resolution.Users)
+	messageID, err := a.telegramSendMessageWithMarkup(ctx, chatID, telegramGroupUserSelectionText(resolution), telegramGroupUserSelectionMarkup(panel.Token, resolution.Users))
+	if err != nil {
+		return false
+	}
+	panel.MessageID = messageID
+	a.telegramSavePanel(panel)
+	return true
+}
+
+func telegramUserUIDs(users []store.User) []int64 {
+	uids := make([]int64, 0, len(users))
+	for _, user := range users {
+		uids = append(uids, user.UID)
+	}
+	return uids
+}
+
+func telegramGroupUserSelectionText(resolution telegramGroupUserResolution) string {
+	text := fmt.Sprintf("找到 %d 个匹配用户，请选择目标。\n查询方式：%s\n选择时会重新验证管理员权限。", len(resolution.Users), resolution.Search.FieldLabel)
+	if resolution.Truncated {
+		text += fmt.Sprintf("\n仅显示前 %d 项，请缩小关键词以查看更多结果。", telegramUserSelectionMax)
+	}
+	return text
+}
+
+func telegramGroupUserSelectionMarkup(token string, users []store.User) any {
+	rows := make([][]telegramInlineButton, 0, len(users)+1)
+	for _, user := range users {
+		label := fmt.Sprintf("UID %d · %s", user.UID, user.Username)
+		if username := strings.TrimPrefix(strings.TrimSpace(user.TelegramUsername), "@"); username != "" {
+			label += " · @" + username
+		}
+		rows = append(rows, []telegramInlineButton{{Text: truncateString(label, 64), Data: fmt.Sprintf("gadm:act:select_%d:%s", user.UID, token)}})
+	}
+	rows = append(rows, []telegramInlineButton{{Text: "关闭面板", Data: "gadm:act:close:" + token}})
+	return telegramInlineKeyboard(rows)
+}
+
+func (a *App) telegramDeleteGroupUserCommandMessage(ctx context.Context, chatID, commandMessageID int64) {
+	if chatID == 0 || commandMessageID == 0 {
+		return
+	}
+	_ = a.telegramDeleteMessage(ctx, chatID, commandMessageID)
+}
+
+func (a *App) telegramCreatePanel(chatID, commandMessageID int64, target store.User) telegramPanelContext {
+	token := telegramRandomToken()
+	return telegramPanelContext{
+		Token:            token,
+		ChatID:           chatID,
+		CommandMessageID: commandMessageID,
+		TargetUID:        target.UID,
+		ExpiresAt:        time.Now().Add(telegramPanelTTL).Unix(),
+	}
+}
+
+func (a *App) telegramCreateAuthPanel(chatID, commandMessageID int64, query string, replyTelegramID int64) telegramPanelContext {
+	token := telegramRandomToken()
+	return telegramPanelContext{
+		Token:            token,
+		ChatID:           chatID,
+		CommandMessageID: commandMessageID,
+		Query:            strings.TrimSpace(query),
+		ReplyTelegramID:  replyTelegramID,
+		ExpiresAt:        time.Now().Add(telegramPanelTTL).Unix(),
+	}
+}
+
+func (a *App) telegramSavePanel(panel telegramPanelContext) {
+	a.telegramPanelMu.Lock()
+	if a.telegramPanels == nil {
+		a.telegramPanels = map[string]telegramPanelContext{}
+	}
+	// 既存 panel（同 token 极少见，但 token 复用 / 错误重发场景下要清理）：
+	// 先停掉旧 timer 再覆盖，避免泄露。
+	if existing, ok := a.telegramPanels[panel.Token]; ok && existing.timer != nil {
+		existing.timer.Stop()
+	}
+	a.pruneTelegramPanelsLocked(panel.Token, time.Now().Unix())
+	delay := telegramPanelTTL + time.Second
+	token := panel.Token
+	panel.timer = time.AfterFunc(delay, func() { a.telegramExpirePanel(token) })
+	a.telegramPanels[panel.Token] = panel
+	a.telegramPanelMu.Unlock()
+}
+
+// pruneTelegramPanelsLocked bounds short-lived panel state and its timers.
+// Caller must hold telegramPanelMu.
+func (a *App) pruneTelegramPanelsLocked(incomingToken string, now int64) {
+	for token, panel := range a.telegramPanels {
+		if token != incomingToken && panel.ExpiresAt < now {
+			if panel.timer != nil {
+				panel.timer.Stop()
+			}
+			delete(a.telegramPanels, token)
+		}
+	}
+	if _, replacing := a.telegramPanels[incomingToken]; replacing || len(a.telegramPanels) < telegramPanelMaxEntries {
+		return
+	}
+	oldestToken := ""
+	oldestExpiry := int64(0)
+	for token, panel := range a.telegramPanels {
+		if token != incomingToken && (oldestToken == "" || panel.ExpiresAt < oldestExpiry) {
+			oldestToken, oldestExpiry = token, panel.ExpiresAt
+		}
+	}
+	if oldest, ok := a.telegramPanels[oldestToken]; ok {
+		if oldest.timer != nil {
+			oldest.timer.Stop()
+		}
+		delete(a.telegramPanels, oldestToken)
+	}
+}
+
+// telegramSchedulePanelExpiry 仅在 telegramExpirePanel 发现 panel 仍未到期
+// 时被调用，用 Reset 续上当前 panel 的 timer。touch 路径不再走这里。
+func (a *App) telegramSchedulePanelExpiry(token string, delay time.Duration) {
+	if delay <= 0 {
+		delay = time.Second
+	}
+	a.telegramPanelMu.Lock()
+	panel, ok := a.telegramPanels[token]
+	if !ok {
+		a.telegramPanelMu.Unlock()
+		return
+	}
+	if panel.timer != nil {
+		panel.timer.Reset(delay)
+	} else {
+		panel.timer = time.AfterFunc(delay, func() { a.telegramExpirePanel(token) })
+		a.telegramPanels[token] = panel
+	}
+	a.telegramPanelMu.Unlock()
+}
+
+func (a *App) telegramExpirePanel(token string) {
+	a.telegramPanelMu.Lock()
+	panel, ok := a.telegramPanels[token]
+	if !ok {
+		a.telegramPanelMu.Unlock()
+		return
+	}
+	if panel.ExpiresAt > time.Now().Unix() {
+		// 还没到点（被 touch 过）——续上 timer 并退出，本次回调不删消息。
+		delay := time.Until(time.Unix(panel.ExpiresAt, 0)) + time.Second
+		if delay <= 0 {
+			delay = time.Second
+		}
+		if panel.timer != nil {
+			panel.timer.Reset(delay)
+		} else {
+			panel.timer = time.AfterFunc(delay, func() { a.telegramExpirePanel(token) })
+			a.telegramPanels[token] = panel
+		}
+		a.telegramPanelMu.Unlock()
+		return
+	}
+	delete(a.telegramPanels, token)
+	if panel.timer != nil {
+		panel.timer.Stop()
+	}
+	a.telegramPanelMu.Unlock()
+	_ = a.telegramDeleteMessage(context.Background(), panel.ChatID, panel.MessageID)
+}
+
+func (a *App) telegramPanel(token string) (telegramPanelContext, bool) {
+	a.telegramPanelMu.Lock()
+	defer a.telegramPanelMu.Unlock()
+	panel, ok := a.telegramPanels[token]
+	if !ok || panel.ExpiresAt < time.Now().Unix() {
+		if ok {
+			if panel.timer != nil {
+				panel.timer.Stop()
+			}
+			delete(a.telegramPanels, token)
+		}
+		return telegramPanelContext{}, false
+	}
+	return panel, true
+}
+
+func (a *App) telegramTouchPanel(panel telegramPanelContext) telegramPanelContext {
+	panel.ExpiresAt = time.Now().Add(telegramPanelTTL).Unix()
+	delay := telegramPanelTTL + time.Second
+	a.telegramPanelMu.Lock()
+	a.pruneTelegramPanelsLocked(panel.Token, time.Now().Unix())
+	if existing, ok := a.telegramPanels[panel.Token]; ok && existing.timer != nil {
+		// 复用 map 里那把 timer：Reset 即可，不再每次 AfterFunc 新建 closure。
+		existing.timer.Reset(delay)
+		panel.timer = existing.timer
+	} else if panel.timer != nil {
+		panel.timer.Reset(delay)
+	} else {
+		token := panel.Token
+		panel.timer = time.AfterFunc(delay, func() { a.telegramExpirePanel(token) })
+	}
+	a.telegramPanels[panel.Token] = panel
+	a.telegramPanelMu.Unlock()
+	return panel
+}
+
+func (a *App) telegramDeletePanel(token string) {
+	a.telegramPanelMu.Lock()
+	if existing, ok := a.telegramPanels[token]; ok && existing.timer != nil {
+		existing.timer.Stop()
+	}
+	delete(a.telegramPanels, token)
+	a.telegramPanelMu.Unlock()
+}
+
+func (a *App) telegramHandleCallback(ctx context.Context, callback *telegramCallbackQuery) {
+	if callback == nil {
+		return
+	}
+	mode, action, token, parsed := telegramParsePanelCallback(callback.Data)
+	if !parsed {
+		return
+	}
+	callbackID := callback.ID
+	// 修复：enable_tg_panel=false 时，已发出的旧面板按钮也不能再执行任何操作。
+	if !a.cfg().TelegramEnablePanel {
+		_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "群组用户管理面板未启用。", true)
+		return
+	}
+	actorID := callback.From.ID
+	message := callback.Message
+	var chatID, messageID int64
+	if message != nil {
+		chatID = message.Chat.ID
+		messageID = message.MessageID
+	}
+	panel, ok := a.telegramPanel(token)
+	if !ok {
+		_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "面板已过期，请重新发送 /twguser。", true)
+		_ = a.telegramDeleteMessage(ctx, chatID, messageID)
+		return
+	}
+	if panel.MessageID == 0 && messageID != 0 {
+		panel.MessageID = messageID
+	}
+	if panel.ChatID == 0 && chatID != 0 {
+		panel.ChatID = chatID
+	}
+	if (panel.ChatID != 0 && chatID != 0 && panel.ChatID != chatID) || (panel.MessageID != 0 && messageID != 0 && panel.MessageID != messageID) {
+		_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "面板来源不匹配，请重新打开。", true)
+		return
+	}
+	if !a.telegramAdminID(actorID) {
+		// 修复：非管理员点击只弹出 callback 提示，不再往群里发消息、挂定时器。
+		_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "没有管理员权限。", true)
+		return
+	}
+	if mode == "auth" {
+		panel.ConfirmAction = ""
+		panel = a.telegramTouchPanel(panel)
+		_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "身份验证通过。", false)
+		if panel.TargetUID == 0 {
+			resolution := a.telegramResolveGroupUserTargetValues(panel.Query, panel.ReplyTelegramID)
+			if resolution.Reason != "" {
+				_ = a.telegramEditMessageText(ctx, panel.ChatID, panel.MessageID, resolution.Reason, nil)
+				a.telegramDeletePanel(panel.Token)
+				return
+			}
+			if len(resolution.Users) > 1 {
+				panel.CandidateUIDs = telegramUserUIDs(resolution.Users)
+				panel = a.telegramTouchPanel(panel)
+				_ = a.telegramEditMessageText(ctx, panel.ChatID, panel.MessageID, telegramGroupUserSelectionText(resolution), telegramGroupUserSelectionMarkup(panel.Token, resolution.Users))
+				a.telegramDeleteGroupUserCommandMessage(ctx, panel.ChatID, panel.CommandMessageID)
+				return
+			}
+			panel.TargetUID = resolution.Users[0].UID
+			panel.CandidateUIDs = nil
+			panel = a.telegramTouchPanel(panel)
+		}
+		if a.telegramEditPanel(ctx, panel) {
+			a.telegramDeleteGroupUserCommandMessage(ctx, panel.ChatID, panel.CommandMessageID)
+		}
+		return
+	}
+	if mode != "act" {
+		return
+	}
+	if action == "close" {
+		a.telegramDeletePanel(panel.Token)
+		_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "面板已关闭。", false)
+		_ = a.telegramDeleteMessage(ctx, panel.ChatID, panel.MessageID)
+		return
+	}
+	if selectedUID, selected := telegramSelectionActionUID(action); selected {
+		if !telegramPanelCandidateAllowed(panel, selectedUID) {
+			_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "候选用户无效或已过期，请重新搜索。", true)
+			return
+		}
+		if _, exists := a.store().User(selectedUID); !exists {
+			_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "目标用户已不存在，请重新搜索。", true)
+			return
+		}
+		panel.TargetUID = selectedUID
+		panel.CandidateUIDs = nil
+		panel.Query = ""
+		panel.ReplyTelegramID = 0
+		panel.ConfirmAction = ""
+		panel = a.telegramTouchPanel(panel)
+		_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "已选择目标用户。", false)
+		_ = a.telegramEditPanel(ctx, panel)
+		return
+	}
+	panel = a.telegramTouchPanel(panel)
+	_ = a.telegramAnswerCallbackQuery(ctx, callbackID, "操作处理中。", false)
+	a.telegramApplyPanelAction(ctx, panel, action, actorID)
+}
+
+func telegramSelectionActionUID(action string) (int64, bool) {
+	raw, found := strings.CutPrefix(action, "select_")
+	if !found {
+		return 0, false
+	}
+	uid, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || uid <= 0 || strconv.FormatInt(uid, 10) != raw {
+		return 0, true
+	}
+	return uid, true
+}
+
+func telegramPanelCandidateAllowed(panel telegramPanelContext, uid int64) bool {
+	for _, candidateUID := range panel.CandidateUIDs {
+		if candidateUID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func telegramParsePanelCallback(data string) (mode, action, token string, ok bool) {
+	prefix, rest, found := strings.Cut(data, ":")
+	if !found || prefix != "gadm" {
+		return "", "", "", false
+	}
+	mode, rest, found = strings.Cut(rest, ":")
+	if !found {
+		return "", "", "", false
+	}
+	switch mode {
+	case "auth":
+		if rest == "" || strings.Contains(rest, ":") {
+			return "", "", "", false
+		}
+		return mode, "", rest, true
+	case "act":
+		action, token, found = strings.Cut(rest, ":")
+		if !found || action == "" || token == "" || strings.Contains(token, ":") {
+			return "", "", "", false
+		}
+		return mode, action, token, true
+	default:
+		return "", "", "", false
+	}
+}
+
+func (a *App) telegramApplyPanelAction(ctx context.Context, panel telegramPanelContext, action string, actorID int64) {
+	target, ok := a.store().User(panel.TargetUID)
+	if !ok {
+		a.telegramDeletePanel(panel.Token)
+		_ = a.telegramEditMessageText(ctx, panel.ChatID, panel.MessageID, "目标用户不存在或已被删除。", nil)
+		return
+	}
+	switch action {
+	case "refresh":
+		panel.ConfirmAction = ""
+		a.telegramTouchPanel(panel)
+		a.telegramEditPanel(ctx, panel)
+	case "danger":
+		panel.ConfirmAction = "danger"
+		a.telegramTouchPanel(panel)
+		a.telegramEditPanel(ctx, panel)
+	case "back":
+		panel.ConfirmAction = ""
+		a.telegramTouchPanel(panel)
+		a.telegramEditPanel(ctx, panel)
+	case "enable", "disable":
+		enabled := action == "enable"
+		if !enabled && a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "管理员账号禁止通过 Telegram 面板禁用。")
+			return
+		}
+		updated, err := a.store().SetUserActiveAtomic(target.UID, enabled)
+		if err != nil {
+			a.auditTelegramFailure(actorID, "telegram_panel_"+action+"_user", target.UID, err, map[string]any{"chat_id": panel.ChatID})
+			a.telegramEditPanelWithNotice(ctx, panel, target, "更新用户状态失败: "+err.Error())
+			return
+		}
+		detail := map[string]any{
+			"chat_id": panel.ChatID,
+			"enabled": enabled,
+		}
+		if !enabled {
+			a.sessions().DeleteUser(ctx, updated.UID)
+			// 修复：Emby 同步结果写进审计，失败不再被吞掉。
+			synced, syncErr := a.disableRemoteEmbyForWebState(ctx, updated)
+			detail["emby_synced"] = synced
+			if syncErr != nil {
+				detail["emby_error"] = telegramAuditError(syncErr)
+			}
+		}
+		a.auditTelegramAction(actorID, "telegram_panel_"+action+"_user", "admin", target.UID, detail)
+		a.telegramEditPanelWithNotice(ctx, panel, updated, "用户状态已更新。")
+	case "emby_disable", "emby_enable":
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "受保护账号禁止通过 Telegram 面板修改 Emby 状态。")
+			return
+		}
+		if target.EmbyID == "" {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "目标用户未绑定 Emby 账号。")
+			return
+		}
+		if !a.embyConfigured() {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "Emby URL 或 API Token 未配置，无法操作远端账号。")
+			return
+		}
+		enableEmby := action == "emby_enable"
+		if enableEmby && !a.embyShouldEnableUser(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "Web 账号已禁用或已过期，禁止绕过有效期直接启用 Emby。")
+			return
+		}
+		if err := a.embyApplyEnabledState(ctx, target.UID, target.EmbyID, enableEmby); err != nil {
+			a.auditTelegramFailure(actorID, "telegram_panel_"+action, target.UID, err, map[string]any{"chat_id": panel.ChatID})
+			a.telegramEditPanelWithNotice(ctx, panel, target, "Emby 状态更新失败: "+telegramPanelSafeError(err))
+			return
+		}
+		verb := "禁用"
+		if enableEmby {
+			verb = "启用"
+		}
+		a.auditTelegramAction(actorID, "telegram_panel_"+action, "admin", target.UID, map[string]any{
+			"chat_id":      panel.ChatID,
+			"emby_enabled": enableEmby,
+			"emby_id":      target.EmbyID,
+		})
+		a.telegramEditPanelWithNotice(ctx, panel, target, "Emby 账号已"+verb+"。")
+	case "grant_register", "grant_register_7", "grant_register_30", "grant_register_365", "grant_register_perm":
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "管理员或受保护账号不需要通过群组面板授予注册资格。")
+			return
+		}
+		if target.EmbyID != "" {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "目标用户已绑定 Emby，无需授予注册资格。")
+			return
+		}
+		if reached, current, limit := a.embyCapacityReached(target.UID); reached {
+			a.telegramEditPanelWithNotice(ctx, panel, target, fmt.Sprintf("Emby 名额已满: %d/%d。", current, limit))
+			return
+		}
+		days := a.telegramGrantRegisterDays(action)
+		updated, err := a.store().UpdateUser(target.UID, func(u *store.User) error {
+			u.PendingEmby = true
+			u.PendingEmbyDays = &days
+			markRegistrationGrant(u, registrationSourceTelegramGrant, "")
+			if u.Role == store.RoleUnrecognized {
+				u.Role = store.RoleNormal
+			}
+			return nil
+		})
+		if err != nil {
+			a.auditTelegramFailure(actorID, "telegram_panel_grant_register", target.UID, err, map[string]any{"chat_id": panel.ChatID, "days": days})
+			a.telegramEditPanelWithNotice(ctx, panel, target, "授予注册资格失败: "+err.Error())
+			return
+		}
+		a.auditTelegramAction(actorID, "telegram_panel_grant_register", "admin", target.UID, map[string]any{
+			"chat_id": panel.ChatID,
+			"days":    days,
+		})
+		a.telegramEditPanelWithNotice(ctx, panel, updated, "已授予 Emby 注册资格，有效天数: "+telegramGrantRegisterDaysLabel(days)+"。")
+	case "delete":
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "管理员账号禁止通过 Telegram 面板删除。")
+			return
+		}
+		panel.ConfirmAction = "delete"
+		panel = a.telegramTouchPanel(panel)
+		a.telegramEditPanel(ctx, panel)
+	case "delete_confirm":
+		if panel.ConfirmAction != "delete" {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "请先点击删除按钮确认风险。")
+			return
+		}
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "管理员账号禁止通过 Telegram 面板删除。")
+			return
+		}
+		if err := a.deleteLocalUser(ctx, target); err != nil {
+			a.auditTelegramFailure(actorID, "telegram_panel_delete_user", target.UID, err, map[string]any{"chat_id": panel.ChatID, "target_username": target.Username})
+			a.telegramEditPanelWithNotice(ctx, panel, target, "删除用户失败: "+err.Error())
+			return
+		}
+		a.auditTelegramAction(actorID, "telegram_panel_delete_user", "admin", target.UID, map[string]any{
+			"chat_id":         panel.ChatID,
+			"target_username": target.Username,
+		})
+		a.telegramDeletePanel(panel.Token)
+		_ = a.telegramEditMessageText(ctx, panel.ChatID, panel.MessageID, fmt.Sprintf("已删除用户 %s。", target.Username), nil)
+	case "emby_delete":
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "受保护账号禁止通过 Telegram 面板删除 Emby 账号。")
+			return
+		}
+		if a.userHasEmbyGrantHistory(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "该账号的 Emby 注册资格来自注册码、邀请码或管理员授予，禁止通过 Telegram 面板删除 Emby 后重复注册。")
+			return
+		}
+		if target.EmbyID == "" {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "目标用户未绑定 Emby 账号。")
+			return
+		}
+		panel.ConfirmAction = "emby_delete"
+		panel = a.telegramTouchPanel(panel)
+		a.telegramEditPanel(ctx, panel)
+	case "emby_delete_confirm":
+		if panel.ConfirmAction != "emby_delete" {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "请先点击删除 Emby 按钮确认风险。")
+			return
+		}
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "受保护账号禁止通过 Telegram 面板删除 Emby 账号。")
+			return
+		}
+		if a.userHasEmbyGrantHistory(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "该账号的 Emby 注册资格来自注册码、邀请码或管理员授予，禁止通过 Telegram 面板删除 Emby 后重复注册。")
+			return
+		}
+		updated, err := a.telegramDeleteTargetEmby(ctx, target)
+		if err != nil {
+			a.auditTelegramFailure(actorID, "telegram_panel_delete_emby", target.UID, err, map[string]any{"chat_id": panel.ChatID})
+			a.telegramEditPanelWithNotice(ctx, panel, target, "删除 Emby 账号失败: "+telegramPanelSafeError(err))
+			return
+		}
+		a.auditTelegramAction(actorID, "telegram_panel_delete_emby", "admin", target.UID, map[string]any{
+			"chat_id": panel.ChatID,
+			"emby_id": target.EmbyID,
+		})
+		a.telegramEditPanelWithNotice(ctx, panel, updated, "Emby 账号已删除，本地账号保留。")
+	case "whitelist_add", "whitelist_remove":
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "管理员账号无需白名单操作。")
+			return
+		}
+		whitelisted := action == "whitelist_add"
+		updated, err := a.store().UpdateUser(target.UID, func(u *store.User) error {
+			if whitelisted {
+				u.Role = store.RoleWhitelist
+			} else if u.Role == store.RoleWhitelist {
+				u.Role = store.RoleNormal
+			}
+			return nil
+		})
+		if err != nil {
+			a.auditTelegramFailure(actorID, "telegram_panel_"+action, target.UID, err, map[string]any{"chat_id": panel.ChatID})
+			a.telegramEditPanelWithNotice(ctx, panel, target, "更新白名单状态失败: "+err.Error())
+			return
+		}
+		verb := "移出白名单"
+		if whitelisted {
+			verb = "加入白名单"
+		}
+		a.auditTelegramAction(actorID, "telegram_panel_"+action, "admin", target.UID, map[string]any{
+			"chat_id":     panel.ChatID,
+			"whitelisted": whitelisted,
+		})
+		a.telegramEditPanelWithNotice(ctx, panel, updated, "已"+verb+"。")
+	case "kick", "ban":
+		if target.TelegramID == 0 {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "目标用户未绑定 Telegram，无法执行群组操作。")
+			return
+		}
+		if a.telegramProtectedTarget(target) {
+			a.telegramEditPanelWithNotice(ctx, panel, target, "管理员账号禁止通过 Telegram 面板移出或封禁。")
+			return
+		}
+		var err error
+		if action == "kick" {
+			err = a.telegramKickChatMember(ctx, fmt.Sprint(panel.ChatID), target.TelegramID)
+		} else {
+			err = a.telegramBanChatMember(ctx, fmt.Sprint(panel.ChatID), target.TelegramID)
+		}
+		if err != nil {
+			a.auditTelegramFailure(actorID, "telegram_panel_"+action+"_telegram_group", target.UID, fmt.Errorf("%s", a.telegramSanitizeError(err)), map[string]any{"chat_id": panel.ChatID})
+			a.telegramEditPanelWithNotice(ctx, panel, target, "Telegram 群组操作失败: "+a.telegramSanitizeError(err))
+			return
+		}
+		a.auditTelegramAction(actorID, "telegram_panel_"+action+"_telegram_group", "admin", target.UID, map[string]any{
+			"chat_id":            panel.ChatID,
+			"target_telegram_id": target.TelegramID,
+		})
+		a.telegramEditPanelWithNotice(ctx, panel, target, "Telegram 群组操作已完成。")
+	default:
+		a.telegramEditPanelWithNotice(ctx, panel, target, "未知操作。")
+	}
+}
+
+func (a *App) telegramEditPanel(ctx context.Context, panel telegramPanelContext) bool {
+	target, ok := a.store().User(panel.TargetUID)
+	if !ok {
+		_ = a.telegramEditMessageText(ctx, panel.ChatID, panel.MessageID, "目标用户不存在或已被删除。", nil)
+		return false
+	}
+	return a.telegramEditMessageText(ctx, panel.ChatID, panel.MessageID, a.telegramGroupUserPanelTextForChat(ctx, panel.ChatID, target), a.telegramGroupUserPanelMarkup(panel.Token, target, panel.ConfirmAction)) == nil
+}
+
+func (a *App) telegramEditPanelWithNotice(ctx context.Context, panel telegramPanelContext, target store.User, notice string) {
+	panel.ConfirmAction = ""
+	panel = a.telegramTouchPanel(panel)
+	text := a.telegramGroupUserPanelTextForChat(ctx, panel.ChatID, target)
+	if strings.TrimSpace(notice) != "" {
+		text += "\n\n" + notice
+	}
+	_ = a.telegramEditMessageText(ctx, panel.ChatID, panel.MessageID, text, a.telegramGroupUserPanelMarkup(panel.Token, target, panel.ConfirmAction))
+}
+
+func (a *App) telegramGroupUserPanelText(ctx context.Context, u store.User) string {
+	return a.telegramGroupUserPanelTextForChat(ctx, 0, u)
+}
+
+func (a *App) telegramGroupUserPanelTextForChat(ctx context.Context, chatID int64, u store.User) string {
+	template := strings.TrimSpace(a.cfg().TelegramGroupUserPanelTemplate)
+	if template == "" {
+		template = config.DefaultTelegramGroupUserPanelTemplate
+	}
+	text := telegramRenderPanelTemplate(template, a.telegramGroupUserPanelPlaceholders(ctx, chatID, u, template))
+	text = strings.TrimRight(text, "\n")
+	if len([]rune(text)) > 3900 {
+		text = truncateString(text, 3900) + "\n...(面板模板输出过长，已截断)"
+	}
+	return text
+}
+
+func telegramRenderPanelTemplate(template string, values map[string]string) string {
+	var out strings.Builder
+	lastWritten := 0
+	searchFrom := 0
+	for searchFrom < len(template) {
+		relativeOpen := strings.IndexByte(template[searchFrom:], '{')
+		if relativeOpen < 0 {
+			break
+		}
+		open := searchFrom + relativeOpen
+		relativeClose := strings.IndexByte(template[open+1:], '}')
+		if relativeClose < 0 {
+			break
+		}
+		close := open + 1 + relativeClose
+		value, known := values[template[open+1:close]]
+		if !known {
+			// Move one byte forward so a known placeholder nested inside malformed
+			// custom text can still be rendered, matching strings.Replacer.
+			searchFrom = open + 1
+			continue
+		}
+		if out.Cap() == 0 {
+			out.Grow(len(template))
+		}
+		out.WriteString(template[lastWritten:open])
+		out.WriteString(value)
+		lastWritten = close + 1
+		searchFrom = close + 1
+	}
+	if out.Cap() == 0 {
+		return template
+	}
+	out.WriteString(template[lastWritten:])
+	return out.String()
+}
+
+func (a *App) telegramGroupUserPanelPlaceholders(ctx context.Context, chatID int64, u store.User, template string) map[string]string {
+	remote := telegramPanelRemoteInfo{
+		Block:        "",
+		Status:       "-",
+		Username:     "-",
+		Enabled:      "-",
+		Role:         "-",
+		Hidden:       "-",
+		LastActivity: "-",
+	}
+	if telegramPanelTemplateNeedsRemote(template) {
+		remote = a.telegramGroupUserPanelRemoteInfo(ctx, u)
+	}
+	telegramUsername := a.telegramPanelUsername(ctx, chatID, u, template)
+	if telegramUsername == "" {
+		telegramUsername = "None"
+	} else {
+		telegramUsername = "@" + telegramUsername
+	}
+	telegramUserID := "None"
+	if u.TelegramID != 0 {
+		telegramUserID = strconv.FormatInt(u.TelegramID, 10)
+	}
+	embyUsername := strings.TrimSpace(u.EmbyUsername)
+	if embyUsername == "" {
+		embyUsername = "-"
+	}
+	bgmSyncStatus := "未启用"
+	if u.BGMMode && u.BGMToken == "" {
+		bgmSyncStatus = "缺少个人 Token"
+	} else if u.BGMMode {
+		bgmSyncStatus = "可同步"
+	}
+	// 修复：面板发在群里，所有群成员可见；{email} 只给遮罩后的邮箱，
+	// {registration_code} 只给卡码前缀（多次使用码可能仍有效，不能完整外泄）。
+	email := maskEmail(strings.TrimSpace(u.Email))
+	if email == "" {
+		email = "-"
+	}
+	emailVerified := telegramYesNoLabel(u.EmailVerified)
+	whitelistStatus := telegramYesNoLabel(u.Role == store.RoleWhitelist)
+	return map[string]string{
+		"server_name":          a.cfg().AppName,
+		"username":             u.Username,
+		"uid":                  strconv.FormatInt(u.UID, 10),
+		"email":                email,
+		"email_verified":       emailVerified,
+		"whitelisted":          whitelistStatus,
+		"role":                 roleName(u.Role),
+		"role_id":              strconv.Itoa(u.Role),
+		"is_admin":             telegramYesNoLabel(u.Role == store.RoleAdmin),
+		"is_protected":         telegramYesNoLabel(a.telegramProtectedTarget(u)),
+		"web_status":           telegramActiveLabel(u.Active),
+		"web_active":           telegramYesNoLabel(u.Active),
+		"expire_status":        expireStatus(u.ExpiredAt),
+		"expired_at":           telegramExpiryTimeLabel(u.ExpiredAt),
+		"register_time":        telegramUnixTimeLabel(firstNonZeroInt64(u.RegisterTime, u.CreatedAt)),
+		"created_at":           telegramUnixTimeLabel(u.CreatedAt),
+		"telegram_status":      telegramTelegramBindingLabel(u),
+		"telegram_username":    telegramUsername,
+		"telegram_userid":      telegramUserID,
+		"emby_status":          telegramLocalEmbyLabel(u),
+		"emby_bound_status":    telegramLocalEmbyBindingStatusLabel(u),
+		"emby_bound":           telegramYesNoLabel(u.EmbyID != ""),
+		"emby_enabled_status":  telegramEmbyEnabledStatusLabel(u),
+		"emby_username":        embyUsername,
+		"emby_unbind_allowed":  telegramYesNoLabel(a.userCanSelfUnbindEmby(u)),
+		"registration_source":  registrationSourceLabel(u.RegistrationSource),
+		"registration_code":    telegramMaskedRegistrationCode(u.RegistrationCode),
+		"pending_emby":         telegramYesNoLabel(u.PendingEmby),
+		"pending_emby_days":    telegramPendingEmbyDaysLabel(u.PendingEmbyDays),
+		"emby_remote_block":    remote.Block,
+		"emby_remote_status":   remote.Status,
+		"emby_remote_username": remote.Username,
+		"emby_remote_enabled":  remote.Enabled,
+		"emby_remote_role":     remote.Role,
+		"emby_remote_hidden":   remote.Hidden,
+		"emby_last_activity":   remote.LastActivity,
+		"bgm_mode":             telegramEnabledLabel(u.BGMMode),
+		"bgm_token_status":     telegramConfiguredLabel(u.BGMToken != ""),
+		"bgm_sync_status":      bgmSyncStatus,
+		"api_key_status":       telegramEnabledLabel(u.LegacyAPIKeyStatus),
+		"panel_ttl":            "1 分钟",
+		"panel_ttl_seconds":    strconv.Itoa(int(telegramPanelTTL.Seconds())),
+	}
+}
+
+func (a *App) telegramPanelUsername(ctx context.Context, chatID int64, u store.User, template string) string {
+	username := strings.TrimPrefix(strings.TrimSpace(u.TelegramUsername), "@")
+	if username != "" || u.TelegramID == 0 || chatID == 0 || !a.telegramAvailable() || !telegramPanelTemplateNeedsTelegramIdentity(template) {
+		return username
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	member, err := a.telegramGetChatMember(lookupCtx, fmt.Sprint(chatID), u.TelegramID)
+	if err != nil {
+		return username
+	}
+	username = strings.TrimPrefix(strings.TrimSpace(member.User.Username), "@")
+	if username == "" {
+		return ""
+	}
+	_, _ = a.store().UpdateUser(u.UID, func(current *store.User) error {
+		if current.TelegramID == u.TelegramID && strings.TrimPrefix(strings.TrimSpace(current.TelegramUsername), "@") != username {
+			current.TelegramUsername = username
+		}
+		return nil
+	})
+	return username
+}
+
+func telegramPanelTemplateNeedsTelegramIdentity(template string) bool {
+	return strings.Contains(template, "{telegram_username}")
+}
+
+func telegramPanelTemplateNeedsRemote(template string) bool {
+	for _, key := range []string{
+		"{emby_remote_block}",
+		"{emby_remote_status}",
+		"{emby_remote_username}",
+		"{emby_remote_enabled}",
+		"{emby_remote_role}",
+		"{emby_remote_hidden}",
+		"{emby_last_activity}",
+	} {
+		if strings.Contains(template, key) {
+			return true
+		}
+	}
+	return false
+}
+
+type telegramPanelRemoteInfo struct {
+	Block        string
+	Status       string
+	Username     string
+	Enabled      string
+	Role         string
+	Hidden       string
+	LastActivity string
+}
+
+func (a *App) telegramGroupUserPanelEmbyLines(ctx context.Context, u store.User) []string {
+	return strings.Split(a.telegramGroupUserPanelRemoteInfo(ctx, u).Block, "\n")
+}
+
+func (a *App) telegramGroupUserPanelRemoteInfo(ctx context.Context, u store.User) telegramPanelRemoteInfo {
+	lines := []string{"", "== Emby 远端 =="}
+	info := telegramPanelRemoteInfo{Status: "-", Username: "-", Enabled: "-", Role: "-", Hidden: "-", LastActivity: "-"}
+	finish := func(lines []string) telegramPanelRemoteInfo {
+		info.Block = strings.Join(lines, "\n")
+		return info
+	}
+	if u.EmbyID == "" {
+		if u.PendingEmby {
+			info.Status = "待用户创建 Emby 账号"
+			lines = append(lines, "状态: "+info.Status, "授权天数: "+telegramPendingEmbyDaysLabel(u.PendingEmbyDays))
+		} else {
+			info.Status = "未绑定"
+			lines = append(lines, "状态: "+info.Status)
+		}
+		return finish(lines)
+	}
+	if !a.embyConfigured() {
+		info.Status = "本地已绑定，远端未配置或 Token 缺失，无法查询"
+		return finish(append(lines, "状态: "+info.Status))
+	}
+	remote, found, err := a.embyUserByID(ctx, u.EmbyID)
+	if err != nil {
+		info.Status = "查询失败（详情见后端日志）"
+		return finish(append(lines, "状态: "+info.Status))
+	}
+	if !found {
+		info.Status = "远端未找到，本地仍保留绑定"
+		return finish(append(lines, "状态: "+info.Status))
+	}
+	policy := embyPolicy(remote)
+	remoteName := firstNonEmpty(asString(remote["Name"]), u.EmbyUsername, "-")
+	remoteStatus := "启用"
+	if boolish(policy["IsDisabled"]) {
+		remoteStatus = "禁用"
+	}
+	adminState := "普通用户"
+	if boolish(policy["IsAdministrator"]) {
+		adminState = "管理员"
+	}
+	info.Status = "已找到"
+	info.Username = remoteName
+	info.Enabled = remoteStatus
+	info.Role = adminState
+	info.Hidden = telegramYesNoLabel(boolish(policy["IsHidden"]))
+	info.LastActivity = telegramActivityTimeLabel(remote["LastActivityDate"], remote["DateLastActivity"], remote["LastLoginDate"])
+	return finish(append(lines,
+		"远端用户名: "+remoteName,
+		"远端状态: "+remoteStatus,
+		"远端权限: "+adminState,
+		"隐藏状态: "+info.Hidden,
+		"最近活动: "+info.LastActivity,
+	))
+}
+
+func (a *App) telegramGroupUserPanelMarkup(token string, u store.User, confirmAction string) any {
+	if a.telegramProtectedTarget(u) {
+		return telegramInlineKeyboard([][]telegramInlineButton{{
+			{Text: "🔄 刷新", Data: "gadm:act:refresh:" + token},
+			{Text: "❌ 关闭", Data: "gadm:act:close:" + token},
+		}})
+	}
+	// Destructive actions live behind a dedicated second level, so the primary
+	// panel stays short and an accidental tap cannot delete or ban anyone.
+	switch confirmAction {
+	case "danger", "delete", "emby_delete":
+		return telegramDangerPanelMarkup(token, u, confirmAction)
+	}
+	return telegramMainPanelMarkup(token, u)
+}
+
+func telegramMainPanelMarkup(token string, u store.User) any {
+	panelRows := [][]telegramInlineButton{{
+		{Text: "🔄 刷新", Data: "gadm:act:refresh:" + token},
+		{Text: "❌ 关闭", Data: "gadm:act:close:" + token},
+	}}
+	if u.Active {
+		panelRows = append(panelRows, []telegramInlineButton{{Text: "⏸ 禁用 Web 账号", Data: "gadm:act:disable:" + token}})
+	} else {
+		panelRows = append(panelRows, []telegramInlineButton{{Text: "▶️ 启用 Web 账号", Data: "gadm:act:enable:" + token}})
+	}
+	if u.EmbyID != "" {
+		panelRows = append(panelRows, []telegramInlineButton{
+			{Text: "⏹ 禁用 Emby", Data: "gadm:act:emby_disable:" + token},
+			{Text: "📺 启用 Emby", Data: "gadm:act:emby_enable:" + token},
+		})
+	} else {
+		panelRows = append(panelRows,
+			[]telegramInlineButton{
+				{Text: "🎁 授予 7 天", Data: "gadm:act:grant_register_7:" + token},
+				{Text: "🎁 授予 30 天", Data: "gadm:act:grant_register_30:" + token},
+			},
+			[]telegramInlineButton{
+				{Text: "🎁 授予 365 天", Data: "gadm:act:grant_register_365:" + token},
+				{Text: "🎁 授予永久", Data: "gadm:act:grant_register_perm:" + token},
+			},
+		)
+	}
+	if u.Role == store.RoleWhitelist {
+		panelRows = append(panelRows, []telegramInlineButton{{Text: "⭐ 取消白名单", Data: "gadm:act:whitelist_remove:" + token}})
+	} else {
+		panelRows = append(panelRows, []telegramInlineButton{{Text: "⭐ 加入白名单", Data: "gadm:act:whitelist_add:" + token}})
+	}
+	panelRows = append(panelRows, []telegramInlineButton{{Text: "⚠️ 危险操作 ▸", Data: "gadm:act:danger:" + token}})
+	return telegramInlineKeyboard(panelRows)
+}
+
+// telegramDangerPanelMarkup renders the second-level panel holding every
+// irreversible action (delete user, delete Emby, kick, ban). Confirmations for
+// "delete" and "emby_delete" are shown here too so the operator never loses the
+// context of which destructive branch they are in.
+func telegramDangerPanelMarkup(token string, u store.User, confirmAction string) any {
+	rows := make([][]telegramInlineButton, 0, 5)
+	if confirmAction == "delete" {
+		rows = append(rows, []telegramInlineButton{
+			{Text: "🗑 确认删除用户", Data: "gadm:act:delete_confirm:" + token},
+			{Text: "◀ 取消", Data: "gadm:act:back:" + token},
+		})
+	} else {
+		rows = append(rows, []telegramInlineButton{{Text: "🗑 删除用户", Data: "gadm:act:delete:" + token}})
+	}
+	if u.EmbyID != "" {
+		if confirmAction == "emby_delete" {
+			rows = append(rows, []telegramInlineButton{
+				{Text: "🗑 确认删除 Emby", Data: "gadm:act:emby_delete_confirm:" + token},
+				{Text: "◀ 取消", Data: "gadm:act:back:" + token},
+			})
+		} else {
+			rows = append(rows, []telegramInlineButton{{Text: "🗑 删除 Emby 账号", Data: "gadm:act:emby_delete:" + token}})
+		}
+	}
+	if u.TelegramID != 0 {
+		rows = append(rows, []telegramInlineButton{
+			{Text: "👢 移出群组", Data: "gadm:act:kick:" + token},
+			{Text: "🚫 封禁群组", Data: "gadm:act:ban:" + token},
+		})
+	}
+	rows = append(rows, []telegramInlineButton{{Text: "◀ 返回主面板", Data: "gadm:act:back:" + token}})
+	return telegramInlineKeyboard(rows)
+}
+
+// telegramInlineGrid lays buttons out into fixed-width rows. Panel code used to
+// hand-build every row, which is why wide lists degraded into a single column.
+func telegramInlineGrid(buttons []telegramInlineButton, perRow int) [][]telegramInlineButton {
+	if perRow < 1 {
+		perRow = 2
+	}
+	rows := make([][]telegramInlineButton, 0, (len(buttons)+perRow-1)/perRow)
+	for i := 0; i < len(buttons); i += perRow {
+		end := i + perRow
+		if end > len(buttons) {
+			end = len(buttons)
+		}
+		rows = append(rows, buttons[i:end])
+	}
+	return rows
+}
+
+func (a *App) telegramGrantRegisterDays(action string) int {
+	switch action {
+	case "grant_register_7":
+		return 7
+	case "grant_register_30":
+		return 30
+	case "grant_register_365":
+		return 365
+	case "grant_register_perm":
+		return -1
+	}
+	days := a.cfg().InviteDefaultDays
+	if days == 0 {
+		days = a.cfg().EmbyDirectRegisterDays
+	}
+	if days == 0 {
+		days = 30
+	}
+	if days < -1 {
+		return -1
+	}
+	return days
+}
+
+func telegramGrantRegisterDaysLabel(days int) string {
+	if days < 0 {
+		return "永久"
+	}
+	return fmt.Sprintf("%d 天", days)
+}
+
+func (a *App) telegramProtectedTarget(u store.User) bool {
+	return a.userIsProtected(u) || (u.TelegramID != 0 && a.telegramAdminID(u.TelegramID))
+}
+
+func (a *App) telegramDeleteTargetEmby(ctx context.Context, target store.User) (store.User, error) {
+	if target.EmbyID == "" {
+		return target, fmt.Errorf("target user has no Emby account")
+	}
+	if !a.embyConfigured() {
+		return target, fmt.Errorf("Emby URL or API Token is not configured")
+	}
+	if err := a.embyDelete(ctx, "/Users/"+urlPathEscape(target.EmbyID)); err != nil && !strings.Contains(err.Error(), "remote status 404") {
+		return target, err
+	}
+	return a.store().UpdateUser(target.UID, func(u *store.User) error {
+		u.EmbyID = ""
+		u.EmbyUsername = ""
+		u.PendingEmby = false
+		u.PendingEmbyDays = nil
+		return nil
+	})
+}
+
+func telegramPanelSafeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return truncateString(redactSensitiveText(err.Error()), 120)
+}
+
+func telegramTelegramBindingLabel(u store.User) string {
+	if u.TelegramID == 0 {
+		return "未绑定"
+	}
+	if strings.TrimSpace(u.TelegramUsername) != "" {
+		return "已绑定 (@" + strings.TrimPrefix(u.TelegramUsername, "@") + ")"
+	}
+	return "已绑定"
+}
+
+func telegramLocalEmbyLabel(u store.User) string {
+	if u.EmbyID != "" {
+		if strings.TrimSpace(u.EmbyUsername) != "" {
+			return "已绑定 (" + u.EmbyUsername + ")"
+		}
+		return "已绑定"
+	}
+	if u.PendingEmby {
+		return "待开通 (" + telegramPendingEmbyDaysLabel(u.PendingEmbyDays) + ")"
+	}
+	return "未绑定"
+}
+
+func telegramLocalEmbyBindingStatusLabel(u store.User) string {
+	if u.EmbyID != "" {
+		return "已绑定"
+	}
+	if u.PendingEmby {
+		return "待开通"
+	}
+	return "未绑定"
+}
+
+func telegramPendingEmbyDaysLabel(days *int) string {
+	if days == nil {
+		return "未设置"
+	}
+	if *days < 0 {
+		return "永久"
+	}
+	return fmt.Sprintf("%d 天", *days)
+}
+
+func telegramEmbyEnabledStatusLabel(u store.User) string {
+	if u.EmbyID == "" || u.EmbyDisabled {
+		return "已禁用"
+	}
+	if !u.Active {
+		return "已禁用 (Web 禁用)"
+	}
+	if embyAccessExpired(u) {
+		return "已禁用 (已过期)"
+	}
+	return "已启用"
+}
+
+func telegramEnabledLabel(ok bool) string {
+	if ok {
+		return "开启"
+	}
+	return "关闭"
+}
+
+func telegramUnixTimeLabel(ts int64) string {
+	if ts <= 0 {
+		return "-"
+	}
+	return time.Unix(ts, 0).Format("2006-01-02 15:04")
+}
+
+func telegramExpiryTimeLabel(ts int64) string {
+	if expiryIsPermanent(ts) {
+		return "永久"
+	}
+	return telegramUnixTimeLabel(ts)
+}
+
+func telegramActivityTimeLabel(values ...any) string {
+	for _, value := range values {
+		raw := strings.TrimSpace(asString(value))
+		if raw == "" {
+			continue
+		}
+		if t, ok := telegramParseActivityTime(raw); ok {
+			return telegramTimeLabel(t)
+		}
+		return truncateString(raw, 80)
+	}
+	return "-"
+}
+
+func telegramParseActivityTime(raw string) (time.Time, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "null") {
+		return time.Time{}, true
+	}
+	if n, err := strconv.ParseFloat(trimmed, 64); err == nil {
+		if n <= 0 {
+			return time.Time{}, true
+		}
+		return telegramUnixNumberTime(n), true
+	}
+
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+	} {
+		var (
+			t   time.Time
+			err error
+		)
+		if strings.Contains(layout, "Z07") {
+			t, err = time.Parse(layout, trimmed)
+		} else {
+			t, err = time.ParseInLocation(layout, trimmed, time.Local)
+		}
+		if err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func telegramUnixNumberTime(value float64) time.Time {
+	switch {
+	case value >= 1e18:
+		return time.Unix(0, int64(value)).UTC()
+	case value >= 1e15:
+		return time.UnixMicro(int64(value)).UTC()
+	case value >= 1e12:
+		return time.UnixMilli(int64(value)).UTC()
+	default:
+		seconds := int64(value)
+		nanos := int64((value - float64(seconds)) * 1e9)
+		return time.Unix(seconds, nanos).UTC()
+	}
+}
+
+func telegramTimeLabel(t time.Time) string {
+	if t.IsZero() || t.Year() <= 1 {
+		return "-"
+	}
+	return t.Format("2006-01-02 15:04")
+}
+
+func firstNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func (a *App) telegramSendUnauthorizedAndCleanup(ctx context.Context, chatID, sourceMessageID int64) {
+	warnID, _ := a.telegramSendMessageWithMarkup(ctx, chatID, "没有管理员权限。此提示和越权指令将在 30 秒后自动删除。", nil)
+	time.AfterFunc(30*time.Second, func() {
+		_ = a.telegramDeleteMessage(context.Background(), chatID, warnID)
+		_ = a.telegramDeleteMessage(context.Background(), chatID, sourceMessageID)
+	})
+}
+
+type telegramInlineButton struct {
+	Text string
+	Data string
+}
+
+func telegramInlineKeyboard(rows [][]telegramInlineButton) any {
+	keyboard := make([][]map[string]string, 0, len(rows))
+	for _, row := range rows {
+		items := make([]map[string]string, 0, len(row))
+		for _, button := range row {
+			items = append(items, map[string]string{"text": button.Text, "callback_data": button.Data})
+		}
+		keyboard = append(keyboard, items)
+	}
+	return map[string]any{"inline_keyboard": keyboard}
+}
+
+func telegramReplyTelegramID(message *telegramMessage) int64 {
+	if message != nil && message.ReplyToMessage != nil {
+		return message.ReplyToMessage.From.ID
+	}
+	return 0
+}
+
+func telegramRandomToken() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}
+
+// telegramMaskedRegistrationCode 只保留卡码前 4 个字符，其余用 *** 代替。
+func telegramMaskedRegistrationCode(code string) string {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return "-"
+	}
+	runes := []rune(code)
+	if len(runes) <= 4 {
+		return "***"
+	}
+	return string(runes[:4]) + "***"
+}

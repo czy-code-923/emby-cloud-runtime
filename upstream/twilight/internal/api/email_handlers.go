@@ -1,0 +1,434 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/prejudice-studio/twilight/internal/store"
+	"github.com/prejudice-studio/twilight/internal/validate"
+)
+
+// maskEmail 在响应里对邮箱做局部遮蔽（保留首尾少量字符），用于发码后的回显，
+// 避免在共享屏幕 / 日志里完整暴露邮箱。
+func maskEmail(email string) string {
+	email = strings.TrimSpace(email)
+	at := strings.LastIndex(email, "@")
+	if at <= 0 {
+		return email
+	}
+	local, domain := email[:at], email[at:]
+	if len(local) <= 2 {
+		return local[:1] + "***" + domain
+	}
+	return local[:2] + "***" + domain
+}
+
+// requireEmailVerified 是价值型接口的强制门：强制策略下未验证邮箱的普通/白名单
+// 用户被 403 拦截（前端守卫只做体验，这里是不可绕过的服务端防线）。返回 true
+// 表示已写出失败响应，调用方应直接 return。
+func (a *App) requireEmailVerified(w http.ResponseWriter, user store.User) bool {
+	if a.emailVerificationRequired(user) {
+		failWithCode(w, http.StatusForbidden, ErrEmailVerificationRequired, "请先在个人中心绑定并验证邮箱后再继续操作")
+		return true
+	}
+	return false
+}
+
+// consumePasswordChangeEmailCode 在强制邮箱验证时校验改密所需的邮箱验证码。
+// 未强制时直接放行（向后兼容直接改密）。强制时要求 verification_id + email_code
+// 命中一条属于本人(uid)、用途匹配的验证记录。返回 true 表示通过。
+func (a *App) consumePasswordChangeEmailCode(w http.ResponseWriter, payload map[string]any, user store.User, purpose string) bool {
+	if !a.passwordChangeEmailRequired(user, purpose) {
+		return true
+	}
+	if !user.EmailVerified || strings.TrimSpace(user.Email) == "" {
+		failWithCode(w, http.StatusForbidden, ErrEmailVerificationRequired, "请先在个人中心绑定并验证邮箱")
+		return false
+	}
+	id := stringValue(payload, "verification_id")
+	code := firstNonEmpty(stringValue(payload, "email_code"), stringValue(payload, "code"))
+	if id == "" || code == "" {
+		failWithCode(w, http.StatusBadRequest, ErrEmailCodeRequired, "请先获取并填写邮箱验证码")
+		return false
+	}
+	rec, status, ec, msg := a.verifyEmailCodeByID(id, code)
+	if ec != "" {
+		failWithCode(w, status, ec, msg)
+		return false
+	}
+	// 防越权：码必须是本人为该用途申请的，避免拿 bind / 其它用途的码改密。
+	if rec.UID != user.UID || rec.Purpose != purpose {
+		failWithCode(w, http.StatusBadRequest, ErrEmailCodeInvalid, "验证码无效或已失效，请重新获取")
+		return false
+	}
+	return true
+}
+
+func (a *App) passwordChangeEmailRequired(user store.User, purpose string) bool {
+	if a.emailGateActive(user) {
+		return true
+	}
+	switch purpose {
+	case emailPurposeChangePass:
+		return user.RequireEmailForPasswordChange
+	case emailPurposeChangeEmby:
+		// 当前 Web 密码是 Emby 改密的明确身份凭据时，不再叠加邮箱验证码。
+		// 兼容历史上两个开关同时为 true 的数据，旧 Web 密码保护优先。
+		return user.RequireEmailForEmbyPasswordChange && !user.RequireOldPasswordForEmbyPasswordChange
+	default:
+		return false
+	}
+}
+
+// handleSendEmailCode 登录态发码：purpose=bind 给新邮箱发码，change_password /
+// change_emby_password 给已绑定邮箱发码。
+func (a *App) handleSendEmailCode(w http.ResponseWriter, r *http.Request, _ Params) {
+	p := current(r)
+	payload := decodeMap(r)
+	purpose := strings.TrimSpace(stringValue(payload, "purpose"))
+	if purpose == "" {
+		purpose = emailPurposeBind
+	}
+	var targetEmail string
+	switch purpose {
+	case emailPurposeBind:
+		targetEmail = strings.TrimSpace(stringValue(payload, "email"))
+		if targetEmail == "" {
+			failWithCode(w, http.StatusBadRequest, ErrEmailInvalid, "请填写邮箱")
+			return
+		}
+		if _, ok := a.store().EmailVerifiedOwner(targetEmail, p.User.UID); ok {
+			failWithCode(w, http.StatusConflict, ErrEmailConflict, "该邮箱已被其他账号绑定")
+			return
+		}
+	case emailPurposeChangePass:
+		if !p.User.EmailVerified || strings.TrimSpace(p.User.Email) == "" {
+			failWithCode(w, http.StatusForbidden, ErrEmailNotBound, "请先绑定并验证邮箱")
+			return
+		}
+		targetEmail = p.User.Email
+	case emailPurposeChangeEmby:
+		if p.User.EmbyID == "" {
+			failWithCode(w, http.StatusBadRequest, ErrEmbyAccountUnlinked, "当前账号未关联 Emby")
+			return
+		}
+		if p.User.RequireOldPasswordForEmbyPasswordChange && !a.emailGateActive(p.User) {
+			failWithCode(w, http.StatusConflict, ErrConflict, "当前已启用 Web 密码验证，无需邮箱验证码")
+			return
+		}
+		if !p.User.EmailVerified || strings.TrimSpace(p.User.Email) == "" {
+			failWithCode(w, http.StatusForbidden, ErrEmailNotBound, "请先绑定并验证邮箱")
+			return
+		}
+		targetEmail = p.User.Email
+	default:
+		failWithCode(w, http.StatusBadRequest, ErrEmailPurposeInvalid, "验证用途无效")
+		return
+	}
+	id, status, ec, msg := a.issueEmailCode(r.Context(), a.clientIP(r), purpose, targetEmail, p.User.UID)
+	if ec != "" {
+		failWithCode(w, status, ec, msg)
+		return
+	}
+	a.audit(r, "send_email_verification", "user", p.User.UID, map[string]any{"purpose": purpose, "email": maskEmail(targetEmail)})
+	ok(w, "验证码已发送", map[string]any{
+		"verification_id": id,
+		"email":           maskEmail(targetEmail),
+		"expires_in":      a.cfg().EmailCodeTTLMinutes * 60,
+		"resend_after":    a.cfg().EmailResendCooldownSeconds,
+	})
+}
+
+// handleVerifyEmailCode 登录态校验 bind 验证码并完成邮箱绑定 + 标记已验证。
+func (a *App) handleVerifyEmailCode(w http.ResponseWriter, r *http.Request, _ Params) {
+	p := current(r)
+	if !emailConfigured(a.cfg()) {
+		failWithCode(w, http.StatusServiceUnavailable, ErrEmailDisabled, "邮箱功能未启用")
+		return
+	}
+	payload := decodeMap(r)
+	id := stringValue(payload, "verification_id")
+	code := firstNonEmpty(stringValue(payload, "code"), stringValue(payload, "email_code"))
+	rec, status, ec, msg := a.verifyEmailCodeByID(id, code)
+	if ec != "" {
+		failWithCode(w, status, ec, msg)
+		return
+	}
+	if rec.Purpose != emailPurposeBind || rec.UID != p.User.UID {
+		failWithCode(w, http.StatusBadRequest, ErrEmailCodeInvalid, "验证码无效或已失效，请重新获取")
+		return
+	}
+	u, err := a.store().SetUserEmailVerifiedAtomic(p.User.UID, rec.Email, true, false, time.Now().Unix())
+	if errors.Is(err, store.ErrConflict) {
+		failWithCode(w, http.StatusConflict, ErrEmailConflict, "该邮箱已被其他账号绑定")
+		return
+	}
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "verify_email", "user", u.UID, map[string]any{"email": auditFromTo(maskEmail(p.User.Email), maskEmail(u.Email))})
+	ok(w, "邮箱验证成功", publicUser(u))
+}
+
+// handleForgotPasswordEmailRequest 登出态找回第一步：向已验证邮箱发送重置验证码。
+// 防枚举：无论邮箱是否对应账号，都回统一成功（仅 IP 级限流可见）。
+func (a *App) handleForgotPasswordEmailRequest(w http.ResponseWriter, r *http.Request, _ Params) {
+	a.handleEmailPasswordResetRequestResource(w, r)
+}
+
+func (a *App) handleForgotPasswordEmailReset(w http.ResponseWriter, r *http.Request, _ Params) {
+	a.handleEmailPasswordResetResource(w, r)
+}
+
+func (a *App) handleAdminBindUserEmail(w http.ResponseWriter, r *http.Request, params Params) {
+	uid, err := int64Param(params, "uid")
+	if err != nil {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "用户 ID 无效")
+		return
+	}
+	before, found := a.store().User(uid)
+	if !found {
+		failWithCode(w, http.StatusNotFound, ErrUserNotFound, userNotFoundMessage)
+		return
+	}
+	payload := decodeMap(r)
+	email := strings.TrimSpace(stringValue(payload, "email"))
+	markVerified := boolValue(payload, "mark_verified", true)
+	force := boolValue(payload, "force", false)
+	if email == "" {
+		failWithCode(w, http.StatusBadRequest, ErrEmailInvalid, "请填写邮箱")
+		return
+	}
+	if err := validate.ValidateEmailFormat(email); err != nil {
+		failWithCode(w, http.StatusBadRequest, ErrEmailInvalid, err.Error())
+		return
+	}
+	if !force {
+		if len(a.cfg().EmailBlacklist) > 0 && validate.CheckEmailBlacklist(email, a.cfg().EmailBlacklist) {
+			failWithCode(w, http.StatusBadRequest, ErrEmailInvalid, "该邮箱域名不在允许范围内（可勾选强制覆盖）")
+			return
+		}
+		if len(a.cfg().EmailWhitelist) > 0 && !validate.CheckEmailWhitelist(email, a.cfg().EmailWhitelist) {
+			failWithCode(w, http.StatusBadRequest, ErrEmailInvalid, "该邮箱域名不在允许范围内（可勾选强制覆盖）")
+			return
+		}
+	}
+	u, err := a.store().SetUserEmailVerifiedAtomic(uid, email, markVerified, force, time.Now().Unix())
+	if errors.Is(err, store.ErrConflict) {
+		failWithCode(w, http.StatusConflict, ErrEmailConflict, "该邮箱已被其他账号验证绑定（可勾选强制覆盖）")
+		return
+	}
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "admin_bind_email", "admin", uid, map[string]any{
+		"old_email_masked": maskEmail(before.Email),
+		"new_email_masked": maskEmail(u.Email),
+		"mark_verified":    markVerified,
+		"force":            force,
+	})
+	ok(w, "已绑定邮箱", publicUser(u))
+}
+
+// handleAdminSetUserEmailVerified 管理员手动置/撤销某用户的邮箱验证状态（不改邮箱）。
+func (a *App) handleAdminSetUserEmailVerified(w http.ResponseWriter, r *http.Request, params Params) {
+	uid, err := int64Param(params, "uid")
+	if err != nil {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "用户 ID 无效")
+		return
+	}
+	target, exists := a.store().User(uid)
+	if !exists {
+		failWithCode(w, http.StatusNotFound, ErrUserNotFound, userNotFoundMessage)
+		return
+	}
+	payload := decodeMap(r)
+	verified := boolValue(payload, "verified", false)
+	force := boolValue(payload, "force", false)
+	if verified && strings.TrimSpace(target.Email) == "" {
+		failWithCode(w, http.StatusBadRequest, ErrEmailNotBound, "该用户尚未绑定邮箱，无法标记为已验证")
+		return
+	}
+	u, err := a.store().SetUserEmailVerifiedAtomic(uid, "", verified, force, time.Now().Unix())
+	if errors.Is(err, store.ErrConflict) {
+		failWithCode(w, http.StatusConflict, ErrEmailConflict, "该邮箱已被其他账号验证绑定（可勾选强制覆盖）")
+		return
+	}
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "admin_set_email_verified", "admin", uid, map[string]any{"verified": verified, "old_verified": target.EmailVerified, "force": force})
+	ok(w, "已更新邮箱验证状态", publicUser(u))
+}
+
+// handleAdminEmailTest 管理员发送测试邮件，验证 SMTP 配置是否可用。
+func (a *App) handleAdminEmailTest(w http.ResponseWriter, r *http.Request, _ Params) {
+	cfg := a.cfg()
+	results := []map[string]any{}
+	if !emailConfigured(cfg) {
+		results = append(results, map[string]any{"target": "配置", "success": false, "error": "邮箱功能未启用或 SMTP 未配置完整"})
+		ok(w, "测试完成", map[string]any{"results": results})
+		return
+	}
+	payload := decodeMap(r)
+	to := strings.TrimSpace(stringValue(payload, "to"))
+	if to == "" {
+		to = firstNonEmpty(cfg.SMTPFromAddress, cfg.SMTPUsername)
+	}
+	if err := validate.ValidateEmailFormat(to); err != nil {
+		failWithCode(w, http.StatusBadRequest, ErrEmailInvalid, "收件邮箱格式不正确")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	site := firstNonEmpty(cfg.AppName, "Twilight")
+	subject := site + " 邮件发送测试"
+	body := "这是一封来自 " + site + " 的 SMTP 测试邮件。\n\n如果你收到了它，说明邮件发送配置正常。"
+	if err := smtpDeliver(ctx, *cfg, to, subject, body); err != nil {
+		a.audit(r, "admin_test_email", "admin", 0, map[string]any{"to_masked": maskEmail(to), "success": false})
+		results = append(results, map[string]any{"target": "SMTP 发信", "success": false, "error": err.Error()})
+		ok(w, "测试完成", map[string]any{"results": results})
+		return
+	}
+	a.audit(r, "admin_test_email", "admin", 0, map[string]any{"to_masked": maskEmail(to), "success": true})
+	results = append(results, map[string]any{"target": "SMTP 发信", "success": true, "to": maskEmail(to)})
+	ok(w, "测试完成", map[string]any{"results": results})
+}
+
+// emailVerificationDTO 把一条在用验证码记录脱敏成管理员可见的审查 DTO：
+// 永不下发 CodeHash（HMAC 摘要也不外泄），解析关联本地账号用户名，标注是否已过期。
+func (a *App) emailVerificationDTO(v store.EmailVerification, now int64, username string) map[string]any {
+	return map[string]any{
+		"id":           v.ID,
+		"purpose":      v.Purpose,
+		"email":        v.Email,
+		"email_masked": maskEmail(v.Email),
+		"uid":          nullableInt(v.UID),
+		"username":     emptyNil(username),
+		"attempts":     v.Attempts,
+		"max_attempts": v.MaxAttempts,
+		"created_at":   v.CreatedAt,
+		"expires_at":   v.ExpiresAt,
+		"last_sent_at": v.LastSentAt,
+		"expired":      v.ExpiresAt > 0 && v.ExpiresAt <= now,
+	}
+}
+
+// handleAdminEmailVerifications 汇总邮箱管理审查数据。默认保留旧客户端的完整响应；
+// 新客户端传 view=pending|accounts|summary 时只返回当前视图所需页，避免大账号量下
+// 每次切换筛选都传输全部邮箱和验证码记录。
+func (a *App) handleAdminEmailVerifications(w http.ResponseWriter, r *http.Request, _ Params) {
+	cfg := a.cfg()
+	now := time.Now().Unix()
+	query := r.URL.Query()
+	view := strings.ToLower(strings.TrimSpace(query.Get("view")))
+	if view != "" && view != "pending" && view != "accounts" && view != "summary" {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "无效的邮箱管理视图")
+		return
+	}
+	page := max(1, queryInt(r, "page", 1))
+	perPage := clamp(queryInt(r, "per_page", 25), 1, 100)
+	search := truncateString(strings.TrimSpace(query.Get("search")), 120)
+	verified := strings.ToLower(strings.TrimSpace(query.Get("verified")))
+	if verified != "" && verified != "all" && verified != "verified" && verified != "unverified" {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "无效的邮箱验证筛选")
+		return
+	}
+	if view == "" {
+		perPage = 0
+		page = 1
+	}
+
+	snapshot := a.store().EmailVerificationAdminView(now, store.EmailVerificationAdminQuery{
+		View:     view,
+		Search:   search,
+		Verified: verified,
+		Offset:   (page - 1) * perPage,
+		Limit:    perPage,
+	})
+	pending := make([]map[string]any, 0, len(snapshot.Records))
+	for _, v := range snapshot.Records {
+		username := ""
+		if snapshot.UsernamesByUID != nil {
+			username = snapshot.UsernamesByUID[v.UID]
+		}
+		pending = append(pending, a.emailVerificationDTO(v, now, username))
+	}
+
+	accounts := make([]map[string]any, 0, len(snapshot.Accounts))
+	for _, u := range snapshot.Accounts {
+		accounts = append(accounts, map[string]any{
+			"uid":               u.UID,
+			"username":          u.Username,
+			"email":             u.Email,
+			"email_verified":    u.EmailVerified,
+			"email_verified_at": zeroNil(u.EmailVerifiedAt),
+			"telegram_id":       nullableInt(u.TelegramID),
+			"telegram_username": emptyNil(u.TelegramUsername),
+			"role":              u.Role,
+			"active":            u.Active,
+		})
+	}
+
+	ok(w, "OK", map[string]any{
+		"view":            view,
+		"page":            page,
+		"per_page":        perPage,
+		"total":           map[string]int{"pending": snapshot.PendingTotal, "accounts": snapshot.AccountTotal},
+		"pages":           map[string]int{"pending": pages(snapshot.PendingTotal, perPage), "accounts": pages(snapshot.AccountTotal, perPage)},
+		"smtp_configured": emailConfigured(cfg),
+		"email_enabled":   cfg.EmailEnabled,
+		"force_bind":      cfg.EmailForceBind,
+		"pending":         pending,
+		"accounts":        accounts,
+		"summary": map[string]any{
+			"total_pending":    snapshot.TotalPending,
+			"expired_pending":  snapshot.ExpiredPending,
+			"total_with_email": snapshot.TotalWithEmail,
+			"verified":         snapshot.Verified,
+			"unverified":       snapshot.TotalWithEmail - snapshot.Verified,
+		},
+	})
+}
+
+// handleAdminDeleteEmailVerification 撤销一条在用验证码记录（让对应验证码立即失效）。仅 AuthAdmin。
+func (a *App) handleAdminDeleteEmailVerification(w http.ResponseWriter, r *http.Request, params Params) {
+	id := strings.TrimSpace(params["id"])
+	if id == "" {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "缺少验证记录 id")
+		return
+	}
+	record, found := a.store().EmailVerification(id)
+	if !found {
+		failWithCode(w, http.StatusNotFound, ErrNotFound, "验证记录不存在")
+		return
+	}
+	if err := a.store().DeleteEmailVerification(id); statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "revoke_email_verification", "admin", record.UID, map[string]any{"purpose": record.Purpose})
+	ok(w, "已撤销验证记录", map[string]any{"id": id})
+}
+
+// handleAdminCleanupEmailVerifications 手动清理所有已过期的在用验证码（与调度任务同口径）。仅 AuthAdmin。
+func (a *App) handleAdminCleanupEmailVerifications(w http.ResponseWriter, r *http.Request, _ Params) {
+	deleted, err := a.store().CleanupExpiredEmailVerifications(time.Now().Unix())
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "cleanup_email_verifications", "admin", 0, map[string]any{"deleted": deleted})
+	ok(w, "已清理过期验证码", map[string]any{"deleted": deleted})
+}
+
+// handleAdminClearUnverifiedEmails 一键清空所有未验证邮箱的用户的 Email 字段。
+func (a *App) handleAdminClearUnverifiedEmails(w http.ResponseWriter, r *http.Request, _ Params) {
+	total, cleared, err := a.store().ClearUnverifiedEmails()
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "clear_unverified_emails", "admin", 0, map[string]any{"total": total, "cleared": cleared})
+	ok(w, "已清空未验证邮箱", map[string]any{"total": total, "cleared": cleared})
+}

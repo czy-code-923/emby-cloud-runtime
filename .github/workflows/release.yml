@@ -1,0 +1,76 @@
+name: Verify and release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: twilight_test
+          POSTGRES_PASSWORD: ci_disposable_only
+          POSTGRES_DB: twilight_test
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U twilight_test -d twilight_test" --health-interval 5s --health-retries 12
+    env:
+      TWILIGHT_TEST_DSN: postgres://twilight_test:ci_disposable_only@127.0.0.1:5432/twilight_test?sslmode=disable
+      TWILIGHT_DATABASE_URL: postgres://twilight_test:ci_disposable_only@127.0.0.1:5432/twilight_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: upstream/twilight/go.mod
+          cache-dependency-path: upstream/twilight/go.sum
+      - name: Validate deployment files
+        run: |
+          bash -n scripts/install.sh scripts/backup.sh
+          cp .env.example .env
+          sed -i 's/^POSTGRES_PASSWORD=$/POSTGRES_PASSWORD=ci_disposable_only/;s/^TWILIGHT_TWO_FACTOR_KEY=$/TWILIGHT_TWO_FACTOR_KEY=ci_only/;s/^BOT_INTERNAL_SECRET=$/BOT_INTERNAL_SECRET=ci_only/' .env
+          docker compose config --quiet
+          docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Core database, configuration and authentication tests
+        working-directory: upstream/twilight
+        run: |
+          go mod verify
+          go vet ./...
+          go test -p 1 ./internal/security ./internal/store ./internal/api -run 'Test.*(Setup|Login|Session|Config|TwoFactor|Register|Password)' -count=1 -timeout=25m
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - name: Build application images
+        run: |
+          version=$(cat VERSION)
+          docker build -f deploy/backend.Dockerfile -t "emby-cloud-backend:$version" .
+          docker build -f deploy/webui.Dockerfile -t "emby-cloud-webui:$version" .
+          mkdir -p dist
+          docker save "emby-cloud-backend:$version" | gzip -1 > "dist/backend-$version-amd64.tar.gz"
+          docker save "emby-cloud-webui:$version" | gzip -1 > "dist/webui-$version-amd64.tar.gz"
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Stage a draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cat VERSION)
+          gh release create "v$version" --draft --prerelease --title "v$version · 隔离管理基础版" --notes-file docs/release-notes.md
+          gh release upload "v$version" dist/*
+  publish:
+    needs: [verify, images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - name: Publish verified build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v$(cat VERSION)" --draft=false

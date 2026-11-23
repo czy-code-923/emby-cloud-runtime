@@ -1,0 +1,1471 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/prejudice-studio/twilight/internal/config"
+	"github.com/prejudice-studio/twilight/internal/store"
+	"go.uber.org/zap"
+)
+
+// handleMyTickets 返回当前用户的紧凑工单列表。对话正文和附件 URL 只在
+// handleMyTicket 的单条详情中返回，避免长期用户每次打开工单页都下载全部历史。
+func (a *App) handleMyTickets(w http.ResponseWriter, r *http.Request, _ Params) {
+	cfg := a.cfg()
+	if !cfg.TicketSystemEnabled {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	p := current(r)
+	page := clamp(queryInt(r, "page", 1), 1, 1000000)
+	perPage := clamp(queryInt(r, "per_page", 20), 1, 100)
+	result := a.store().ListTicketsPage(store.TicketFilter{UID: p.User.UID}, page, perPage)
+	ok(w, "OK", map[string]any{
+		"tickets":      userTicketListDTOs(result.Tickets),
+		"total":        result.Total,
+		"page":         page,
+		"per_page":     perPage,
+		"ticket_types": a.store().TicketTypes(),
+	})
+}
+
+// handleMyTicket 返回当前登录用户的一条完整工单会话。即使调用者本身也是
+// 管理员，这个用户侧端点也只允许读取自己的工单；管理员查看他人工单必须走
+// /admin/tickets/:ticket_id，确保对象归属和审计入口清晰。
+func (a *App) handleMyTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	if !a.cfg().TicketSystemEnabled {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	id, err := int64Param(params, "ticket_id")
+	if err != nil || id <= 0 {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "无效的工单编号")
+		return
+	}
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	p := current(r)
+	ticket, found := a.store().Ticket(id)
+	if !found || ticket.UID != p.User.UID {
+		// 不区分不存在与非本人资源，避免枚举其他用户的工单编号。
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+	ok(w, "OK", map[string]any{"ticket": ticketDTO(ticket, false), "ticket_types": a.store().TicketTypes()})
+}
+
+// handleCreateTicket 用户提交工单。
+func (a *App) handleCreateTicket(w http.ResponseWriter, r *http.Request, _ Params) {
+	cfg := a.cfg()
+	if !cfg.TicketSystemEnabled {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	p := current(r)
+	if !a.allowRate(r.Context(), rateKey("ticket:uid:", p.User.UID), 10, 10*time.Minute) {
+		failWithCode(w, http.StatusTooManyRequests, ErrTicketRateLimited, "提交工单过于频繁，请稍后再试")
+		return
+	}
+	payload := decodeMap(r)
+	title := strings.TrimSpace(stringValue(payload, "title"))
+	content := strings.TrimSpace(stringValue(payload, "content"))
+	ticketType := store.NormalizeTicketType(a.store().TicketTypes(), firstNonEmpty(stringValue(payload, "type"), store.TicketTypeDefault))
+	priority := store.NormalizeTicketPriority(firstNonEmpty(stringValue(payload, "priority"), store.TicketPriorityMedium))
+
+	if title == "" {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "请填写工单标题")
+		return
+	}
+	if len(title) > 200 {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "工单标题过长")
+		return
+	}
+	if content == "" {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "请填写工单内容")
+		return
+	}
+	if len(content) > 10000 {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "工单内容过长")
+		return
+	}
+	var notifyTG *bool
+	if _, ok := payload["notify_telegram"]; ok {
+		b, valid := payload["notify_telegram"].(bool)
+		if !valid {
+			failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "notify_telegram 必须为布尔值")
+			return
+		}
+		notifyTG = &b
+	}
+
+	ticket, err := a.store().CreateTicket(store.Ticket{
+		UID:            p.User.UID,
+		Username:       p.User.Username,
+		Title:          title,
+		Content:        content,
+		Type:           ticketType,
+		Priority:       priority,
+		Status:         store.TicketStatusOpen,
+		NotifyTelegram: notifyTG,
+	}, cfg.TicketUserOpenLimit, cfg.TicketGlobalOpenLimit)
+	if errors.Is(err, store.ErrTicketUserOpenLimit) {
+		failWithCode(w, http.StatusConflict, ErrTicketUserLimit, "您当前待处理 / 处理中的工单已达上限，请先关闭部分工单后再提交")
+		return
+	}
+	if errors.Is(err, store.ErrTicketGlobalOpenLimit) {
+		failWithCode(w, http.StatusConflict, ErrTicketGlobalLimit, "系统当前待处理 / 处理中的工单已达上限，请稍后再提交")
+		return
+	}
+	if statusFromError(w, err) {
+		return
+	}
+	zap.L().Info("工单已创建",
+		zap.Int64("ticket_id", ticket.ID),
+		zap.Int64("uid", ticket.UID),
+		zap.String("username", ticket.Username),
+		zap.String("type", ticket.Type),
+		zap.String("priority", ticket.Priority),
+	)
+	a.audit(r, "create_ticket", "user", p.User.UID, map[string]any{"ticket_id": ticket.ID, "type": ticketType, "priority": priority})
+	a.notifyTicketAdmins(r.Context(), "created", ticket, p.User)
+	created(w, "工单已提交", ticketResponseDTO(r, ticket, false))
+}
+
+// handleCloseOwnTicket 用户关闭自己的工单。
+func (a *App) handleCloseOwnTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	if !a.cfg().TicketSystemEnabled {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	id, _ := int64Param(params, "ticket_id")
+	p := current(r)
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	existing, found := a.store().Ticket(id)
+	if !found || existing.UID != p.User.UID {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+	if !store.TicketStatusAllowsConversation(existing.Status) {
+		failWithCode(w, http.StatusBadRequest, ErrTicketAlreadyClosed, "工单已关闭")
+		return
+	}
+	status := store.TicketStatusClosed
+	ticket, err := a.store().UpdateTicket(id, store.TicketUpdate{Status: &status, OwnerUID: p.User.UID})
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "close_ticket", "user", 0, map[string]any{"ticket_id": id})
+	a.notifyTicketAdmins(r.Context(), "closed", ticket, p.User)
+	ok(w, "工单已关闭", ticketResponseDTO(r, ticket, false))
+}
+
+// handleReopenOwnTicket 用户重开自己的已关闭工单。
+func (a *App) handleReopenOwnTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	if !a.cfg().TicketSystemEnabled {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	id, _ := int64Param(params, "ticket_id")
+	p := current(r)
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	existing, found := a.store().Ticket(id)
+	if !found || existing.UID != p.User.UID {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+	if store.NormalizeTicketStatus(existing.Status) != store.TicketStatusClosed {
+		failWithCode(w, http.StatusBadRequest, ErrTicketNotClosed, "只有已关闭的工单可以重开")
+		return
+	}
+	cfg := a.cfg()
+	// 重开与建单同一配额口径：原子复核 user/global open limit，堵住「关掉再重开」越过上限。
+	ticket, err := a.store().ReopenTicket(id, p.User.UID, cfg.TicketUserOpenLimit, cfg.TicketGlobalOpenLimit)
+	if errors.Is(err, store.ErrTicketNotClosed) {
+		failWithCode(w, http.StatusBadRequest, ErrTicketNotClosed, "只有已关闭的工单可以重开")
+		return
+	}
+	if errors.Is(err, store.ErrTicketUserOpenLimit) {
+		failWithCode(w, http.StatusConflict, ErrTicketUserLimit, "您当前待处理 / 处理中的工单已达上限，请先关闭部分工单后再重开")
+		return
+	}
+	if errors.Is(err, store.ErrTicketGlobalOpenLimit) {
+		failWithCode(w, http.StatusConflict, ErrTicketGlobalLimit, "当前系统待处理工单已达全局上限，请稍后再重开")
+		return
+	}
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "reopen_ticket", "user", 0, map[string]any{"ticket_id": id})
+	a.notifyTicketAdmins(r.Context(), "reopened", ticket, p.User)
+	ok(w, "工单已重开", ticketResponseDTO(r, ticket, false))
+}
+
+// handleToggleTicketNotify 切换单个工单的 Telegram 通知开关。
+func (a *App) handleToggleTicketNotify(w http.ResponseWriter, r *http.Request, params Params) {
+	if !a.cfg().TicketSystemEnabled {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	id, _ := int64Param(params, "ticket_id")
+	p := current(r)
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	existing, found := a.store().Ticket(id)
+	if !found || existing.UID != p.User.UID {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+	payload := decodeMap(r)
+	if _, ok := payload["enabled"]; !ok {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "缺少 enabled 字段")
+		return
+	}
+	enabled, valid := payload["enabled"].(bool)
+	if !valid {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "enabled 必须为布尔值")
+		return
+	}
+	ticket, err := a.store().SetTicketNotify(id, enabled, p.User.UID)
+	if statusFromError(w, err) {
+		return
+	}
+	a.audit(r, "toggle_ticket_notify", "user", 0, map[string]any{"ticket_id": id, "enabled": enabled})
+	ok(w, "通知设置已更新", ticketResponseDTO(r, ticket, false))
+}
+
+// ---- 管理员工单接口 ----
+
+// handleAdminTickets 管理员查看所有工单（支持筛选）。管理端接口不受 TicketSystemEnabled 开关限制。
+// 默认仅显示未解决的工单（open / in_progress），传 ?all=1 可查看全部包括已解决/已关闭。
+func (a *App) handleAdminTickets(w http.ResponseWriter, r *http.Request, _ Params) {
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	filter, page, perPage, invalid := a.adminTicketPageQuery(r)
+	if invalid != "" {
+		failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, invalid)
+		return
+	}
+	result := a.store().ListTicketsPage(filter, page, perPage)
+	ok(w, "OK", map[string]any{
+		"tickets":      ticketListDTOs(result.Tickets),
+		"total":        result.Total,
+		"page":         page,
+		"per_page":     perPage,
+		"ticket_types": a.store().TicketTypes(),
+	})
+}
+
+// handleAdminTicket 返回单个工单及完整对话。管理端接口不受 TicketSystemEnabled 开关限制。
+func (a *App) handleAdminTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	id, _ := int64Param(params, "ticket_id")
+	ticket, found := a.store().Ticket(id)
+	if !found {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+	ok(w, "OK", map[string]any{"ticket": ticketDTO(ticket, true), "ticket_types": a.store().TicketTypes()})
+}
+
+// handleAdminUpdateTicket 管理员更新工单状态、优先级、类型和处理摘要。
+// 聊天回复必须走 POST /admin/tickets/:ticket_id/reply，避免元数据表单把双方对话覆盖或伪造成回复。
+func (a *App) handleAdminUpdateTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	id, _ := int64Param(params, "ticket_id")
+	payload := decodeMap(r)
+
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	existing, foundTicket := a.store().Ticket(id)
+	if !foundTicket {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+
+	// 仅对 payload 显式提供的字段建指针（patch 语义）。未提供的字段在 store 的
+	// mutateAndSaveLocked 闭包里保持最新落库值不变——闭包在版本守卫 + 冲突重试后基于
+	// 最新 state 重跑，因此并发编辑同一工单时不会用请求时读到的陈旧 existing 快照把
+	// 他人刚改的字段回退（last-writer-wins）。此前无条件回填 status/priority/type，
+	// 两个管理员各改一字段时后写者会覆盖对方的改动。
+	var statusPtr, priorityPtr, typePtr, adminNote *string
+	if _, ok := payload["status"]; ok {
+		value := strings.TrimSpace(stringValue(payload, "status"))
+		if !store.ValidTicketStatus(value) {
+			failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "无效的工单状态")
+			return
+		}
+		value = store.NormalizeTicketStatus(value)
+		statusPtr = &value
+	}
+	if _, ok := payload["priority"]; ok {
+		value := strings.TrimSpace(stringValue(payload, "priority"))
+		if !store.ValidTicketPriority(value) {
+			failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "无效的优先级")
+			return
+		}
+		value = store.NormalizeTicketPriority(value)
+		priorityPtr = &value
+	}
+	if _, ok := payload["type"]; ok {
+		value := strings.TrimSpace(stringValue(payload, "type"))
+		if !validTicketType(a.store().TicketTypes(), value) {
+			failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "无效的工单类型")
+			return
+		}
+		value = store.NormalizeTicketType(a.store().TicketTypes(), value)
+		typePtr = &value
+	}
+	if _, ok := payload["admin_note"]; ok {
+		value := strings.TrimSpace(stringValue(payload, "admin_note"))
+		if len(value) > store.TicketReplyMaxBytes {
+			failWithCode(w, http.StatusBadRequest, ErrInvalidPayload, "内部备注过长")
+			return
+		}
+		adminNote = &value
+	}
+
+	revision, validRevision := ticketExpectedRevision(w, payload)
+	if !validRevision {
+		return
+	}
+	ticket, err := a.store().UpdateTicket(id, store.TicketUpdate{
+		ExpectedRevision: revision,
+		Status:           statusPtr,
+		Priority:         priorityPtr,
+		Type:             typePtr,
+		AdminNote:        adminNote,
+	})
+	if writeTicketConflict(w, err) || statusFromError(w, err) {
+		return
+	}
+	noteChanged := adminNote != nil && strings.TrimSpace(existing.AdminNote) != ticket.AdminNote
+	// 工单变动后通知工单所属用户（如果用户开启了 TG 通知）。
+	// admin_note 已收敛为纯内部备注：仅当本请求显式改动了所有者可见字段（状态/优先级/类型）
+	// 且值确有变化时才通知，单纯编辑内部备注不再向用户推送「工单更新」，避免内部动作外溢成噪声。
+	ownerVisibleChanged := (statusPtr != nil && ticket.Status != store.NormalizeTicketStatus(existing.Status)) ||
+		(priorityPtr != nil && ticket.Priority != store.NormalizeTicketPriority(existing.Priority)) ||
+		(typePtr != nil && ticket.Type != store.NormalizeTicketType(a.store().TicketTypes(), existing.Type))
+		// 空保存（表单未改动任何字段，或仅提交了与原值相同的 no-op）不应产生审计与通知噪声：
+		// 既不写 update_ticket 审计，也不向管理员广播「已更新」。仅当所有者可见字段或内部备注确有变化时才触发。
+	if !ownerVisibleChanged && !noteChanged {
+		markRequestAuditWritten(r)
+		ok(w, "工单无变化", ticketResponseDTO(r, ticket, true))
+		return
+	}
+	a.audit(r, "update_ticket", "admin", ticket.UID, map[string]any{
+		"ticket_id":    ticket.ID,
+		"old_status":   existing.Status,
+		"new_status":   ticket.Status,
+		"old_priority": existing.Priority,
+		"new_priority": ticket.Priority,
+		"old_type":     existing.Type,
+		"new_type":     ticket.Type,
+		"note_changed": noteChanged,
+	})
+	if ownerVisibleChanged {
+		a.notifyTicketOwner(r.Context(), ticket, existing)
+	}
+	a.notifyTicketAdmins(r.Context(), "updated", ticket, current(r).User)
+
+	ok(w, "工单已更新", ticketResponseDTO(r, ticket, true))
+}
+
+// handleAdminReplyTicket 追加管理员文字回复，不要求提交状态 / 类型 / 优先级表单。
+func (a *App) handleAdminReplyTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	id, _ := int64Param(params, "ticket_id")
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	payload := decodeMap(r)
+	content := strings.TrimSpace(stringValue(payload, "content"))
+	p := current(r)
+	ticket, existing, err := a.appendTicketReply(id, p.User, content)
+	if writeTicketReplyFailure(w, err) {
+		return
+	}
+	a.audit(r, "reply_ticket", "admin", ticket.UID, map[string]any{"ticket_id": id, "reply_len": len(content)})
+	a.notifyTicketOwner(r.Context(), ticket, existing)
+	a.notifyTicketAdmins(r.Context(), "admin_replied", ticket, p.User)
+	ok(w, "回复成功", map[string]any{
+		"ticket_id": id,
+		"ticket":    ticketDTO(ticket, true),
+		"replies":   ticketReplyDTOs(ticket.Replies),
+	})
+}
+
+// handleAdminDeleteTicket 管理员删除工单。管理端接口不受 TicketSystemEnabled 开关限制。
+func (a *App) handleAdminDeleteTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	id, _ := int64Param(params, "ticket_id")
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	existing, found := a.store().Ticket(id)
+	if statusFromError(w, a.store().DeleteTicket(id)) {
+		return
+	}
+	a.audit(r, "delete_ticket", "admin", 0, map[string]any{"ticket_id": id})
+	if found {
+		a.notifyTicketAdmins(r.Context(), "deleted", existing, current(r).User)
+	}
+	// 工单删除后立即清掉其图片目录，避免遗留孤儿附件。删除失败仅记日志，
+	// 不影响工单删除结果（store 层已删除记录，文件可由清理任务兜底）。
+	a.removeTicketAttachmentDir(id)
+	ok(w, "工单已删除", nil)
+}
+
+// ---- 工单图片附件 ----
+
+// ticketImageFilenamePattern 工单图片文件名白名单：随机 16 hex + 已知图片扩展名。
+var ticketImageFilenamePattern = regexp.MustCompile(`^[a-f0-9]{16}\.(jpg|png|gif|webp|bmp)$`)
+
+// ticketAttachmentDir 返回某工单的图片目录绝对路径（约束在 uploads/tickets/<id> 内）。
+func (a *App) ticketAttachmentDir(ticketID int64) (string, error) {
+	uploadRoot := firstNonEmpty(a.cfg().UploadDir, "uploads")
+	return ResolveWithinRoot(uploadRoot, filepath.Join("tickets", strconv.FormatInt(ticketID, 10)))
+}
+
+// removeTicketAttachmentDir 删除某工单的整个图片目录。删除失败仅记日志。
+func (a *App) removeTicketAttachmentDir(ticketID int64) {
+	dir, err := a.ticketAttachmentDir(ticketID)
+	if err != nil {
+		zap.L().Warn("解析工单图片目录失败", zap.Int64("ticket_id", ticketID), zap.Error(err))
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		zap.L().Warn("删除工单图片目录失败", zap.Int64("ticket_id", ticketID), zap.Error(err))
+	}
+}
+
+// ticketAccessible 校验当前用户能否访问该工单（本人或管理员）。
+func (a *App) ticketAccessible(p principal, ticketID int64) (store.Ticket, bool) {
+	ticket, found := a.store().Ticket(ticketID)
+	if !found {
+		return store.Ticket{}, false
+	}
+	if ticket.UID != p.User.UID && p.User.Role != store.RoleAdmin {
+		return store.Ticket{}, false
+	}
+	return ticket, true
+}
+
+// handleUploadTicketImage 为工单上传交流图片。本人或管理员可上传。
+func (a *App) handleUploadTicketImage(w http.ResponseWriter, r *http.Request, params Params) {
+	cfg := a.cfg()
+	if !cfg.TicketSystemEnabled && current(r).User.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	p := current(r)
+	if !a.allowRate(r.Context(), rateKey("ticket-img:", p.User.UID), 30, 10*time.Minute) {
+		failWithCode(w, http.StatusTooManyRequests, ErrTicketRateLimited, "上传过于频繁，请稍后再试")
+		return
+	}
+	id, _ := int64Param(params, "ticket_id")
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	ticket, allowed := a.ticketAccessible(p, id)
+	if !allowed {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+	// 已关闭工单冻结普通用户侧变更；管理员仍可补充排查图片。
+	if !store.TicketStatusAllowsConversation(ticket.Status) && p.User.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusBadRequest, ErrTicketAlreadyClosed, "工单已关闭，无法上传图片")
+		return
+	}
+
+	maxSize := cfg.TicketImageMaxSize
+	if maxSize <= 0 {
+		maxSize = 5 * 1024 * 1024
+	}
+	maxCount := cfg.TicketImageMaxCount
+	if maxCount <= 0 {
+		maxCount = 5
+	}
+	if len(ticket.Attachments) >= maxCount {
+		failWithCode(w, http.StatusConflict, ErrTicketImageTooMany, fmt.Sprintf("每个工单最多上传 %d 张图片", maxCount))
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxSize+(1<<20))
+	if err := r.ParseMultipartForm(maxSize + 1024); err != nil {
+		failWithCode(w, http.StatusBadRequest, ErrUploadInvalidPayload, "上传内容无效")
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		failWithCode(w, http.StatusBadRequest, ErrUploadFileMissing, "缺少文件")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxSize+1))
+	if err != nil {
+		failWithCode(w, http.StatusBadRequest, ErrUploadInvalidPayload, "读取文件失败")
+		return
+	}
+	if int64(len(data)) > maxSize {
+		failWithCode(w, http.StatusRequestEntityTooLarge, ErrTicketImageTooLarge, fmt.Sprintf("单张图片不能超过 %d MB", maxSize/(1024*1024)))
+		return
+	}
+	if len(data) == 0 {
+		failWithCode(w, http.StatusBadRequest, ErrTicketImageInvalid, "图片内容为空")
+		return
+	}
+	// 通过真实内容嗅探图片类型，而不是信任扩展名 / Content-Type 头。
+	contentType := strings.ToLower(strings.Split(http.DetectContentType(data), ";")[0])
+	ext, okImage := uploadImageExtension(contentType)
+	if !okImage {
+		failWithCode(w, http.StatusBadRequest, ErrTicketImageInvalid, "只允许上传 jpg / png / gif / webp / bmp 图片")
+		return
+	}
+
+	filename := randomCode(16) + ext
+	if !ticketImageFilenamePattern.MatchString(filename) {
+		failWithCode(w, http.StatusInternalServerError, ErrUploadSaveFailed, "保存图片失败")
+		return
+	}
+	dir, err := a.ticketAttachmentDir(id)
+	if err != nil {
+		failWithCode(w, http.StatusInternalServerError, ErrUploadDirInvalid, "图片目录无效")
+		return
+	}
+	target, err := ResolveWithinRoot(dir, filename)
+	if err != nil {
+		failWithCode(w, http.StatusInternalServerError, ErrUploadDirInvalid, "图片目录无效")
+		return
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		failWithCode(w, http.StatusInternalServerError, ErrUploadDirCreateFailed, "创建图片目录失败")
+		return
+	}
+	// MkdirAll 后再 lstat，挡住把目录替换成 symlink 的 TOCTOU。
+	if info, lerr := os.Lstat(dir); lerr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		failWithCode(w, http.StatusInternalServerError, ErrUploadDirInvalid, "图片目录无效")
+		return
+	}
+	if err := store.WriteFileAtomicSync(target, data, 0o600); err != nil {
+		failWithCode(w, http.StatusInternalServerError, ErrUploadSaveFailed, "保存图片失败")
+		return
+	}
+
+	att := store.TicketAttachment{
+		Filename:    filename,
+		ContentType: contentType,
+		Size:        int64(len(data)),
+		UploadedUID: p.User.UID,
+	}
+	updated, err := a.store().CommitTicketAttachment(id, att, p.User, maxCount)
+	if err != nil {
+		// 落库失败则回滚已写入的文件，避免产生孤儿文件。
+		_ = os.Remove(target)
+		if errors.Is(err, store.ErrTicketAttachmentLimit) {
+			failWithCode(w, http.StatusConflict, ErrTicketImageTooMany, "图片数量已达上限")
+			return
+		}
+		if errors.Is(err, store.ErrTicketClosed) {
+			failWithCode(w, http.StatusBadRequest, ErrTicketAlreadyClosed, "工单已关闭，无法上传图片")
+			return
+		}
+		if statusFromError(w, err) {
+			return
+		}
+	}
+	a.audit(r, "upload_ticket_image", auditCategoryForRole(p.User.Role), ticket.UID, map[string]any{"ticket_id": id, "filename": filename})
+	if p.User.Role == store.RoleAdmin {
+		a.notifyTicketOwner(r.Context(), updated, ticket)
+	} else {
+		a.notifyTicketAdmins(r.Context(), "image_uploaded", updated, p.User)
+	}
+	created(w, "图片已上传", map[string]any{
+		"ticket_id":   id,
+		"revision":    store.TicketRevision(updated),
+		"ticket":      ticketAttachmentMutationSnapshot(r, updated, p.User.Role == store.RoleAdmin),
+		"attachment":  ticketAttachmentResponseDTO(r, id, updated.Attachments[len(updated.Attachments)-1]),
+		"attachments": ticketAttachmentResponseDTOs(r, id, updated.Attachments),
+	})
+}
+
+// handleGetTicketImage 提供工单图片访问。本人或管理员可访问。
+func (a *App) handleGetTicketImage(w http.ResponseWriter, r *http.Request, params Params) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	p := current(r)
+	if !a.cfg().TicketSystemEnabled && p.User.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	id, _ := int64Param(params, "ticket_id")
+	filename := params["filename"]
+	if !ticketImageFilenamePattern.MatchString(filename) {
+		failWithCode(w, http.StatusNotFound, ErrAssetNotFound, "resource not found")
+		return
+	}
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	ticket, allowed := a.ticketAccessible(p, id)
+	if !allowed {
+		failWithCode(w, http.StatusNotFound, ErrAssetNotFound, "resource not found")
+		return
+	}
+	if !ticketHasAttachment(ticket, filename) {
+		failWithCode(w, http.StatusNotFound, ErrAssetNotFound, "resource not found")
+		return
+	}
+	dir, err := a.ticketAttachmentDir(id)
+	if err != nil {
+		failWithCode(w, http.StatusNotFound, ErrAssetNotFound, "resource not found")
+		return
+	}
+	target, err := ResolveWithinRoot(dir, filename)
+	if err != nil {
+		failWithCode(w, http.StatusNotFound, ErrAssetNotFound, "resource not found")
+		return
+	}
+	info, lerr := os.Lstat(target)
+	if lerr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		failWithCode(w, http.StatusNotFound, ErrAssetNotFound, "resource not found")
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeFile(w, r, target)
+}
+
+// handleDeleteTicketImage 删除工单图片。工单关闭前本人或管理员可删除；
+// 关闭后仅管理员可删除（冻结用户侧的历史图片）。
+func (a *App) handleDeleteTicketImage(w http.ResponseWriter, r *http.Request, params Params) {
+	cfg := a.cfg()
+	if !cfg.TicketSystemEnabled && current(r).User.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	p := current(r)
+	id, _ := int64Param(params, "ticket_id")
+	filename := params["filename"]
+	if !ticketImageFilenamePattern.MatchString(filename) {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "图片不存在")
+		return
+	}
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	ticket, allowed := a.ticketAccessible(p, id)
+	if !allowed {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+		return
+	}
+	// 工单关闭后冻结历史图片：普通用户不能再删除自己的图片，仅管理员可清理。
+	if !store.TicketStatusAllowsConversation(ticket.Status) && p.User.Role != store.RoleAdmin {
+		failWithCode(w, http.StatusForbidden, ErrTicketAlreadyClosed, "工单已关闭，无法删除图片")
+		return
+	}
+	if !ticketHasAttachment(ticket, filename) {
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "图片不存在")
+		return
+	}
+	updated, err := a.store().RemoveTicketAttachment(id, filename, p.User.Role, p.User.UID)
+	if errors.Is(err, store.ErrTicketClosed) {
+		failWithCode(w, http.StatusForbidden, ErrTicketAlreadyClosed, "工单已关闭，无法删除图片")
+		return
+	}
+	if statusFromError(w, err) {
+		return
+	}
+	// 落库成功后再删文件；删文件失败仅记日志，清理任务可兜底。
+	if dir, derr := a.ticketAttachmentDir(id); derr == nil {
+		if target, terr := ResolveWithinRoot(dir, filename); terr == nil {
+			if rerr := os.Remove(target); rerr != nil && !os.IsNotExist(rerr) {
+				zap.L().Warn("删除工单图片文件失败", zap.Int64("ticket_id", id), zap.String("filename", filename), zap.Error(rerr))
+			}
+		}
+	}
+	a.audit(r, "delete_ticket_image", auditCategoryForRole(p.User.Role), ticket.UID, map[string]any{"ticket_id": id, "filename": filename})
+	if p.User.Role != store.RoleAdmin {
+		a.notifyTicketAdmins(r.Context(), "image_deleted", updated, p.User)
+	} else {
+		a.notifyTicketOwner(r.Context(), updated, ticket)
+	}
+	ok(w, "图片已删除", map[string]any{
+		"ticket_id":   id,
+		"revision":    store.TicketRevision(updated),
+		"ticket":      ticketAttachmentMutationSnapshot(r, updated, p.User.Role == store.RoleAdmin),
+		"attachments": ticketAttachmentResponseDTOs(r, id, updated.Attachments),
+	})
+}
+
+// handleReplyToTicket 用户或管理员向工单追加文字回复。每次回复独立追加到 Replies 数组中。
+func (a *App) handleReplyToTicket(w http.ResponseWriter, r *http.Request, params Params) {
+	if !a.cfg().TicketSystemEnabled {
+		failWithCode(w, http.StatusServiceUnavailable, ErrTicketDisabled, "工单系统未启用")
+		return
+	}
+	p := current(r)
+	if !a.allowRate(r.Context(), rateKey("ticket-reply:uid:", p.User.UID), 20, 10*time.Minute) {
+		failWithCode(w, http.StatusTooManyRequests, ErrTicketRateLimited, "回复过于频繁，请稍后再试")
+		return
+	}
+	id, _ := int64Param(params, "ticket_id")
+	if a.refreshStoreForRequest(w, r) {
+		return
+	}
+	payload := decodeMap(r)
+	content := strings.TrimSpace(stringValue(payload, "content"))
+	updated, ticket, err := a.appendTicketReply(id, p.User, content)
+	if writeTicketReplyFailure(w, err) {
+		return
+	}
+	category := auditCategoryForRole(p.User.Role)
+	a.audit(r, "reply_ticket", category, ticket.UID, map[string]any{"ticket_id": id, "reply_len": len(content)})
+	if p.User.Role == store.RoleAdmin {
+		a.notifyTicketOwner(r.Context(), updated, ticket)
+	} else {
+		a.notifyTicketAdmins(r.Context(), "replied", updated, p.User)
+	}
+	ok(w, "回复成功", map[string]any{
+		"ticket_id": id,
+		"ticket":    ticketDTO(updated, p.User.Role == store.RoleAdmin),
+		"replies":   ticketReplyDTOs(updated.Replies),
+	})
+}
+
+func writeTicketReplyFailure(w http.ResponseWriter, err error) bool {
+	if writeTicketConflict(w, err) {
+		return true
+	}
+	switch {
+	case errors.Is(err, store.ErrTicketUserOpenLimit):
+		failWithCode(w, http.StatusConflict, ErrTicketUserLimit, "待处理工单已达上限，请先关闭部分工单")
+	case errors.Is(err, store.ErrTicketGlobalOpenLimit):
+		failWithCode(w, http.StatusConflict, ErrTicketGlobalLimit, "系统待处理工单已达上限")
+	case errors.Is(err, errTicketReplyEmpty):
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "回复内容不能为空")
+	case errors.Is(err, errTicketReplyTooLong):
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "回复内容过长（上限 5000 字符）")
+	case errors.Is(err, errTicketReplyForbidden):
+		failWithCode(w, http.StatusForbidden, ErrForbidden, "无权回复此工单")
+	case errors.Is(err, store.ErrTicketClosed):
+		failWithCode(w, http.StatusBadRequest, ErrTicketAlreadyClosed, "工单已关闭，无法回复")
+	case errors.Is(err, store.ErrNotFound):
+		failWithCode(w, http.StatusNotFound, ErrTicketNotFound, "工单不存在")
+	default:
+		return statusFromError(w, err)
+	}
+	return true
+}
+
+func ticketHasAttachment(ticket store.Ticket, filename string) bool {
+	for _, att := range ticket.Attachments {
+		if att.Filename == filename {
+			return true
+		}
+	}
+	return false
+}
+
+func ticketImageURL(ticketID int64, filename string) string {
+	return "/api/v1/tickets/" + strconv.FormatInt(ticketID, 10) + "/images/" + filename
+}
+
+func ticketAttachmentDTO(ticketID int64, att store.TicketAttachment) map[string]any {
+	return map[string]any{
+		"filename":     att.Filename,
+		"url":          ticketImageURL(ticketID, att.Filename),
+		"content_type": att.ContentType,
+		"size":         att.Size,
+		"uploaded_uid": att.UploadedUID,
+		"created_at":   att.CreatedAt,
+	}
+}
+
+func ticketAttachmentDTOs(ticketID int64, atts []store.TicketAttachment) []map[string]any {
+	out := make([]map[string]any, 0, len(atts))
+	for _, att := range atts {
+		out = append(out, ticketAttachmentDTO(ticketID, att))
+	}
+	return out
+}
+
+// ticketReplyDTO 序列化一条工单回复。
+// is_admin 是「这条回复是不是管理员发的」的唯一权威字段：客户端此前只能拿 role
+// 去猜，而 role 的取值（RoleAdmin=0 / RoleNormal=1）是服务端的内部枚举，前端按
+// 「数字大小」理解就会把管理员和普通用户判反。author 与 role 保留仅为兼容老客户端。
+func ticketReplyDTO(reply store.TicketReply) map[string]any {
+	return map[string]any{
+		"id":         reply.ID,
+		"uid":        reply.UID,
+		"username":   reply.Username,
+		"role":       reply.Role,
+		"is_admin":   reply.Role == store.RoleAdmin,
+		"author":     ticketReplyAuthor(reply.Role),
+		"content":    reply.Content,
+		"created_at": reply.CreatedAt,
+	}
+}
+
+func ticketReplyDTOs(replies []store.TicketReply) []map[string]any {
+	out := make([]map[string]any, 0, len(replies))
+	for index, reply := range replies {
+		if reply.ID <= 0 {
+			reply.ID = int64(index + 1)
+		}
+		out = append(out, ticketReplyDTO(reply))
+	}
+	return out
+}
+
+func ticketReplyAuthor(role int) string {
+	if role == store.RoleAdmin {
+		return "admin"
+	}
+	return "user"
+}
+
+// ticketDTO 把单个工单序列化为响应 map，并为每张附件补上可访问的 url 字段。
+// includeAdminNote 控制是否输出 admin_note：admin_note 是「内部处理备注」，仅管理端可见。
+// 面向工单所有者的沟通一律走 Replies[]（双向对话通道），备注与对话彻底分离，
+// 避免管理员误把内部备注当作对用户可见的留言写入而泄露。
+func ticketDTO(t store.Ticket, includeAdminNote bool) map[string]any {
+	notifyTelegram := true
+	if t.NotifyTelegram != nil {
+		notifyTelegram = *t.NotifyTelegram
+	}
+	dto := map[string]any{
+		"id":              t.ID,
+		"revision":        store.TicketRevision(t),
+		"reply_count":     len(t.Replies),
+		"uid":             t.UID,
+		"username":        t.Username,
+		"title":           t.Title,
+		"content":         t.Content,
+		"type":            t.Type,
+		"status":          t.Status,
+		"priority":        t.Priority,
+		"replies":         ticketReplyDTOs(t.Replies),
+		"attachments":     ticketAttachmentDTOs(t.ID, t.Attachments),
+		"notify_telegram": notifyTelegram,
+		"created_at":      t.CreatedAt,
+		"updated_at":      t.UpdatedAt,
+		"resolved_at":     t.ResolvedAt,
+		"closed_at":       t.ClosedAt,
+	}
+	if includeAdminNote {
+		dto["admin_note"] = t.AdminNote
+	}
+	return dto
+}
+
+// ticketDTOs 批量序列化工单列表。includeAdminNote 含义同 ticketDTO。
+func ticketDTOs(tickets []store.Ticket, includeAdminNote bool) []map[string]any {
+	out := make([]map[string]any, 0, len(tickets))
+	for _, t := range tickets {
+		out = append(out, ticketDTO(t, includeAdminNote))
+	}
+	return out
+}
+
+// adminTicketListDTO keeps the administration queue compact and avoids the
+// per-field interface allocations of the full map-based detail DTO.
+type adminTicketListDTO struct {
+	ID              int64  `json:"id"`
+	UID             int64  `json:"uid"`
+	Username        string `json:"username"`
+	Title           string `json:"title"`
+	Content         string `json:"content"`
+	Type            string `json:"type"`
+	Status          string `json:"status"`
+	Priority        string `json:"priority"`
+	AdminNote       string `json:"admin_note"`
+	ReplyCount      int    `json:"reply_count"`
+	AttachmentCount int    `json:"attachment_count"`
+	NotifyTelegram  bool   `json:"notify_telegram"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
+	ResolvedAt      int64  `json:"resolved_at"`
+	ClosedAt        int64  `json:"closed_at"`
+}
+
+// userTicketListDTO 是普通用户工单首页的摘要。它有意不含 Content、Replies
+// 和 Attachments：这些可能包含大量文本和图片 URL，应按需读取单条详情。
+type userTicketListDTO struct {
+	ID              int64  `json:"id"`
+	Title           string `json:"title"`
+	Type            string `json:"type"`
+	Status          string `json:"status"`
+	Priority        string `json:"priority"`
+	ReplyCount      int    `json:"reply_count"`
+	AttachmentCount int    `json:"attachment_count"`
+	NotifyTelegram  bool   `json:"notify_telegram"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
+	ResolvedAt      int64  `json:"resolved_at"`
+	ClosedAt        int64  `json:"closed_at"`
+}
+
+func userTicketListItem(t store.Ticket) userTicketListDTO {
+	notifyTelegram := true
+	if t.NotifyTelegram != nil {
+		notifyTelegram = *t.NotifyTelegram
+	}
+	return userTicketListDTO{
+		ID:              t.ID,
+		Title:           t.Title,
+		Type:            t.Type,
+		Status:          t.Status,
+		Priority:        t.Priority,
+		ReplyCount:      len(t.Replies),
+		AttachmentCount: len(t.Attachments),
+		NotifyTelegram:  notifyTelegram,
+		CreatedAt:       t.CreatedAt,
+		UpdatedAt:       t.UpdatedAt,
+		ResolvedAt:      t.ResolvedAt,
+		ClosedAt:        t.ClosedAt,
+	}
+}
+
+func userTicketListDTOs(tickets []store.Ticket) []userTicketListDTO {
+	out := make([]userTicketListDTO, 0, len(tickets))
+	for _, ticket := range tickets {
+		out = append(out, userTicketListItem(ticket))
+	}
+	return out
+}
+
+// ticketListDTO deliberately excludes reply bodies and attachment URLs. Those
+// fields belong to the single-ticket conversation endpoint.
+func ticketListDTO(t store.Ticket) adminTicketListDTO {
+	notifyTelegram := true
+	if t.NotifyTelegram != nil {
+		notifyTelegram = *t.NotifyTelegram
+	}
+	return adminTicketListDTO{
+		ID:              t.ID,
+		UID:             t.UID,
+		Username:        t.Username,
+		Title:           t.Title,
+		Content:         t.Content,
+		Type:            t.Type,
+		Status:          t.Status,
+		Priority:        t.Priority,
+		AdminNote:       t.AdminNote,
+		ReplyCount:      len(t.Replies),
+		AttachmentCount: len(t.Attachments),
+		NotifyTelegram:  notifyTelegram,
+		CreatedAt:       t.CreatedAt,
+		UpdatedAt:       t.UpdatedAt,
+		ResolvedAt:      t.ResolvedAt,
+		ClosedAt:        t.ClosedAt,
+	}
+}
+
+func ticketListDTOs(tickets []store.Ticket) []adminTicketListDTO {
+	out := make([]adminTicketListDTO, 0, len(tickets))
+	for _, ticket := range tickets {
+		out = append(out, ticketListDTO(ticket))
+	}
+	return out
+}
+
+func auditCategoryForRole(role int) string {
+	if role == store.RoleAdmin {
+		return "admin"
+	}
+	return "user"
+}
+
+// ---- 校验工具 ----
+
+func validTicketType(types []string, input string) bool {
+	for _, t := range types {
+		if strings.EqualFold(t, input) {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- 工单类型管理 ----
+
+func (a *App) handleAdminTicketTypes(w http.ResponseWriter, r *http.Request, _ Params) {
+	types := a.store().TicketTypes()
+	ok(w, "OK", map[string]any{"types": types})
+}
+
+func (a *App) handleAdminAddTicketType(w http.ResponseWriter, r *http.Request, _ Params) {
+	payload := decodeMap(r)
+	name := strings.TrimSpace(stringValue(payload, "name"))
+	if name == "" || len(name) > 50 {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "类型名称需为 1-50 个字符")
+		return
+	}
+	if err := a.store().AddTicketType(name); statusFromError(w, err) {
+		return
+	}
+	persistStatus := a.persistTicketTypesFromStore()
+	a.audit(r, "add_ticket_type", "admin", 0, map[string]any{"name": name})
+	if persistStatus != http.StatusOK {
+		failWithCode(w, persistStatus, ErrConfigSaveFailed, "工单类型已修改，但配置保存失败，请重新加载并检查配置")
+		return
+	}
+	ok(w, "类型已添加", map[string]any{"name": name, "types": a.store().TicketTypes()})
+}
+
+func (a *App) handleAdminDeleteTicketType(w http.ResponseWriter, r *http.Request, _ Params) {
+	payload := decodeMap(r)
+	name := strings.TrimSpace(stringValue(payload, "name"))
+	if name == "" {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "类型名称不能为空")
+		return
+	}
+	if err := a.store().DeleteTicketType(name); statusFromError(w, err) {
+		return
+	}
+	persistStatus := a.persistTicketTypesFromStore()
+	a.audit(r, "delete_ticket_type", "admin", 0, map[string]any{"name": name})
+	if persistStatus != http.StatusOK {
+		failWithCode(w, persistStatus, ErrConfigSaveFailed, "工单类型已修改，但配置保存失败，请重新加载并检查配置")
+		return
+	}
+	ok(w, "类型已删除", map[string]any{"name": name, "types": a.store().TicketTypes()})
+}
+
+func (a *App) handleAdminRenameTicketType(w http.ResponseWriter, r *http.Request, _ Params) {
+	payload := decodeMap(r)
+	oldName := strings.TrimSpace(stringValue(payload, "old_name"))
+	newName := strings.TrimSpace(stringValue(payload, "new_name"))
+	if oldName == "" || newName == "" || len(newName) > 50 {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "类型名称需为 1-50 个字符")
+		return
+	}
+	if strings.EqualFold(oldName, newName) {
+		failWithCode(w, http.StatusBadRequest, ErrBadRequest, "新旧名称相同")
+		return
+	}
+	count, err := a.store().RenameTicketType(oldName, newName)
+	if statusFromError(w, err) {
+		return
+	}
+	persistStatus := a.persistTicketTypesFromStore()
+	a.audit(r, "rename_ticket_type", "admin", 0, map[string]any{"old": oldName, "new": newName, "tickets_renamed": count})
+	if persistStatus != http.StatusOK {
+		failWithCode(w, persistStatus, ErrConfigSaveFailed, "工单类型已修改，但配置保存失败，请重新加载并检查配置")
+		return
+	}
+	ok(w, "类型已重命名", map[string]any{"old_name": oldName, "new_name": newName, "types": a.store().TicketTypes()})
+}
+
+func (a *App) persistTicketTypesFromStore() int {
+	_, status, _ := a.editConfig("", func(snapshot configEditSnapshot) (string, error) {
+		// Read after the shared file lock so a slower editor cannot overwrite a
+		// newer type list; only the primary-file Ticket section is modified.
+		if err := a.store().Refresh(); err != nil {
+			return "", err
+		}
+		values := configValues(snapshot.file)
+		values["Ticket"]["types"] = a.store().TicketTypes()
+		return mergeConfigTOML(snapshot.content, values)
+	})
+	if status != http.StatusOK {
+		zap.L().Warn("failed to persist ticket types to config.toml", zap.Int("status", status))
+	}
+	return status
+}
+
+const ticketNotificationTimeout = 12 * time.Second
+
+type ticketNotificationResult struct {
+	Targets  int
+	Failures int
+	Skipped  string
+}
+
+func (a *App) enqueueTicketNotification(scope, event string, ticketID, targetUID int64, send func(context.Context) ticketNotificationResult) {
+	if send == nil {
+		return
+	}
+	// 所有通知管道关闭或未配置时直接不启协程，避免每次工单动作都
+	// 空跑一个「已跳过」通知并产生无意义的运行日志写入。
+	if !(a.cfg().TicketNotifyTelegramEnabled && a.telegramAvailable()) && !(a.cfg().TicketNotifyEmailEnabled && emailConfigured(a.cfg())) {
+		return
+	}
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				zap.L().Warn("工单通知任务异常", zap.Int64("ticket_id", ticketID), zap.String("scope", scope), zap.String("event", event), zap.String("panic", redactSensitiveText(fmt.Sprint(recovered))))
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), ticketNotificationTimeout)
+		defer cancel()
+		result := send(ctx)
+		fields := []zap.Field{
+			zap.Int64("ticket_id", ticketID),
+			zap.Int64("target_uid", targetUID),
+			zap.String("scope", scope),
+			zap.String("event", event),
+			zap.Int("targets", result.Targets),
+			zap.Int("failures", result.Failures),
+		}
+		// 通知发送是对外副作用而非状态变更：结果只进 zap 运行日志，不写审计库。
+		// 否则通知尝试会把有界审计历史刷满"已跳过"噪声、挤掉真正的变更记录。
+		// 成功 / 跳过属于常态非事件，降到 Debug 以免刷屏；运行日志 sink 仍会持久化
+		// Debug 供排障。只有真正失败才以 Warn 输出到默认级别控制台。
+		switch {
+		case result.Failures > 0:
+			zap.L().Warn("工单通知部分失败", fields...)
+		case result.Skipped != "":
+			zap.L().Debug("工单通知已跳过", append(fields, zap.String("skipped", result.Skipped))...)
+		default:
+			zap.L().Debug("工单通知已发送", fields...)
+		}
+	}()
+}
+
+// notifyTicketAdmins 在新工单 / 工单变动后向已在个人设置中开启工单 TG 通知的管理员推送。
+func (a *App) notifyTicketAdmins(ctx context.Context, event string, ticket store.Ticket, actor store.User) {
+	a.notifyTicketAdminsEmail(event, ticket, actor)
+	if !a.cfg().TicketNotifyTelegramEnabled {
+		return
+	}
+	a.enqueueTicketNotification("admin", event, ticket.ID, ticket.UID, func(sendCtx context.Context) ticketNotificationResult {
+		if !a.telegramAvailable() {
+			return ticketNotificationResult{Skipped: "telegram_unavailable"}
+		}
+		admins := a.ticketAdminNotificationTargets(actor)
+		if len(admins) == 0 {
+			return ticketNotificationResult{Skipped: "no_admin_targets"}
+		}
+		html := a.ticketAdminNotificationText(event, ticket, actor)
+		plain := stripTelegramHTML(html)
+		var photoName, photoType string
+		var photoData []byte
+		if event == "image_uploaded" {
+			photoName, photoType, photoData = a.ticketNotificationPhoto(ticket)
+		}
+		result := ticketNotificationResult{Targets: len(admins)}
+		for _, admin := range admins {
+			if len(photoData) > 0 {
+				// 图片通知：HTML 富文本 caption 随图一起送达；失败再退到纯文本消息。
+				if err := a.telegramSendPhoto(sendCtx, admin.TelegramID, photoName, photoType, photoData, html, "HTML"); err == nil {
+					continue
+				} else {
+					zap.L().Warn("发送管理员工单图片通知失败，降级为纯文本", zap.Int64("ticket_id", ticket.ID), zap.Int64("admin_uid", admin.UID), zap.Error(err))
+				}
+			}
+			if err := a.telegramSendRichMessage(sendCtx, admin.TelegramID, html, plain); err != nil {
+				result.Failures++
+				zap.L().Warn("发送管理员工单通知失败", zap.Int64("ticket_id", ticket.ID), zap.Int64("admin_uid", admin.UID), zap.Error(err))
+			}
+		}
+		return result
+	})
+}
+
+func (a *App) ticketAdminNotificationTargets(actor store.User) []store.User {
+	adminUIDs, _ := a.store().UserUIDsMatching(0, func(user store.User) bool {
+		if user.Role != store.RoleAdmin || !user.Active || !user.NotifyOnTicketTelegram || user.TelegramID == 0 {
+			return false
+		}
+		return !(actor.Role == store.RoleAdmin && actor.UID != 0 && user.UID == actor.UID)
+	})
+	usersByUID := a.store().UsersByUIDs(adminUIDs)
+	admins := make([]store.User, 0, len(adminUIDs))
+	for _, uid := range adminUIDs {
+		if user, ok := usersByUID[uid]; ok {
+			admins = append(admins, user)
+		}
+	}
+	return admins
+}
+
+// ticketAdminNotificationText 拼装管理员工单通知的 HTML 富文本。所有动态字段
+// （标题、用户名、摘要等）都经 telegramEscapeHTML 转义后再嵌入，杜绝用户可控内容
+// 破坏 HTML 结构 / 注入标签。返回内容交给 telegramSendRichMessage 以 HTML 模式发送。
+func (a *App) ticketAdminNotificationText(event string, ticket store.Ticket, actor store.User) string {
+	esc := telegramEscapeHTML
+	title := strings.TrimSpace(ticket.Title)
+	if title == "" {
+		title = "(无标题)"
+	}
+	var b strings.Builder
+	b.WriteString("🎫 <b>工单" + esc(ticketEventLabel(event)) + "</b>\n")
+	b.WriteString("<b>" + esc(a.cfg().AppName) + "</b>\n")
+	b.WriteString("━━━━━━━━━━━━━━\n")
+	b.WriteString("🆔 <b>#" + strconv.FormatInt(ticket.ID, 10) + "</b>  " + esc(title) + "\n")
+	b.WriteString("📊 状态：" + esc(statusLabelWithEmoji(ticket.Status)) + "\n")
+	b.WriteString("⚑ 优先级：" + esc(ticketPriorityLabel(ticket.Priority)) + "\n")
+	if t := strings.TrimSpace(ticket.Type); t != "" {
+		b.WriteString("🏷 类型：" + esc(t) + "\n")
+	}
+	b.WriteString("👤 提交人：" + esc(ticket.Username) + " <code>UID " + strconv.FormatInt(ticket.UID, 10) + "</code>\n")
+	if actor.UID != 0 {
+		b.WriteString("🛠 操作人：" + esc(actor.Username) + " <code>UID " + strconv.FormatInt(actor.UID, 10) + "</code>\n")
+	}
+	if label, summary := ticketAdminNotificationSummary(event, ticket); summary != "" {
+		b.WriteString("\n💬 <b>" + esc(label) + "</b>\n")
+		b.WriteString("<blockquote>" + esc(truncateString(summary, 220)) + "</blockquote>\n")
+	}
+	if len(ticket.Attachments) > 0 {
+		b.WriteString("🖼 附件：" + strconv.Itoa(len(ticket.Attachments)) + " 张\n")
+	}
+	b.WriteString("🕒 <i>" + esc(time.Now().Format("2006-01-02 15:04:05")) + "</i>")
+	return b.String()
+}
+
+func ticketAdminNotificationSummary(event string, ticket store.Ticket) (string, string) {
+	switch event {
+	case "replied":
+		if reply, ok := latestTicketReplyByRole(ticket, store.RoleNormal); ok {
+			return "用户回复摘要", reply.Content
+		}
+	case "admin_replied":
+		if reply, ok := latestTicketReplyByRole(ticket, store.RoleAdmin); ok {
+			return "管理员回复摘要", reply.Content
+		}
+	case "updated":
+		if note := strings.TrimSpace(ticket.AdminNote); note != "" {
+			return "处理摘要", note
+		}
+	}
+	if content := strings.TrimSpace(ticket.Content); content != "" {
+		return "内容摘要", content
+	}
+	return "", ""
+}
+
+func latestTicketReplyByRole(ticket store.Ticket, role int) (store.TicketReply, bool) {
+	for i := len(ticket.Replies) - 1; i >= 0; i-- {
+		reply := ticket.Replies[i]
+		if reply.Role == role && strings.TrimSpace(reply.Content) != "" {
+			return reply, true
+		}
+	}
+	return store.TicketReply{}, false
+}
+
+func ticketEventLabel(event string) string {
+	switch event {
+	case "created":
+		return "新工单"
+	case "updated":
+		return "工单更新"
+	case "closed":
+		return "用户关闭"
+	case "reopened":
+		return "用户重开"
+	case "image_uploaded":
+		return "新增图片"
+	case "image_deleted":
+		return "删除图片"
+	case "replied":
+		return "用户回复"
+	case "admin_replied":
+		return "管理员回复"
+	case "deleted":
+		return "工单删除"
+	default:
+		return "工单变动"
+	}
+}
+
+func (a *App) ticketNotificationPhoto(ticket store.Ticket) (string, string, []byte) {
+	if len(ticket.Attachments) == 0 {
+		return "", "", nil
+	}
+	att := ticket.Attachments[len(ticket.Attachments)-1]
+	if !ticketImageFilenamePattern.MatchString(att.Filename) {
+		return "", "", nil
+	}
+	dir, err := a.ticketAttachmentDir(ticket.ID)
+	if err != nil {
+		return "", "", nil
+	}
+	target, err := ResolveWithinRoot(dir, att.Filename)
+	if err != nil {
+		return "", "", nil
+	}
+	info, err := os.Lstat(target)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > 10*1024*1024 {
+		return "", "", nil
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return "", "", nil
+	}
+	return att.Filename, att.ContentType, data
+}
+
+// notifyTicketOwner 工单变动后向工单所属用户发送 Telegram 通知。
+func (a *App) notifyTicketOwner(ctx context.Context, updated, existing store.Ticket) {
+	a.notifyTicketOwnerEmail(updated, existing)
+	if !a.cfg().TicketNotifyTelegramEnabled {
+		return
+	}
+	a.enqueueTicketNotification("owner", "updated", updated.ID, updated.UID, func(sendCtx context.Context) ticketNotificationResult {
+		owner, found := a.store().User(updated.UID)
+		if !found {
+			return ticketNotificationResult{Skipped: "owner_missing"}
+		}
+		if !a.telegramAvailable() || owner.TelegramID == 0 {
+			return ticketNotificationResult{Skipped: "telegram_unavailable"}
+		}
+		// 推送需同时满足「用户全局设置」与「工单级别设置」：用户全局 NotifyOnTicketTelegram
+		// 是主开关，工单级别 NotifyTelegram 只能在其之上进一步收窄（对某张工单单独静音），
+		// 不能反向覆盖已关闭的全局开关。NotifyTelegram 为 nil 表示未单独设置，沿用全局。
+		notify := owner.NotifyOnTicketTelegram
+		if updated.NotifyTelegram != nil {
+			notify = notify && *updated.NotifyTelegram
+		}
+		if !notify {
+			return ticketNotificationResult{Skipped: "owner_disabled"}
+		}
+		now := time.Now().Format("2006-01-02 15:04:05")
+		adminNote := ticketOwnerNotificationNote(updated, existing)
+		esc := telegramEscapeHTML
+
+		baseParams := a.NewTemplateParams(sendCtx, owner).BuildAll()
+
+		ticketParams := map[string]string{
+			"ticket_id":  strconv.FormatInt(updated.ID, 10),
+			"title":      firstNonEmpty(strings.TrimSpace(updated.Title), "(无标题)"),
+			"status":     statusLabel(updated.Status),
+			"priority":   ticketPriorityLabel(updated.Priority),
+			"type":       strings.TrimSpace(updated.Type),
+			"admin_note": adminNote,
+			"time":       now,
+		}
+
+		// HTML 版本参数（带转义和富文本内容）
+		htmlNoteContent := ""
+		if adminNote != "" {
+			htmlNoteContent = "\n💬 <b>回复内容</b>\n<blockquote>" + esc(truncateString(adminNote, 500)) + "</blockquote>"
+		}
+		htmlParams := make(map[string]string, len(baseParams)+len(ticketParams))
+		for k, v := range baseParams {
+			htmlParams[k] = esc(v)
+		}
+		for k, v := range ticketParams {
+			htmlParams[k] = esc(v)
+		}
+		htmlParams["status"] = esc(statusLabelWithEmoji(updated.Status))
+		htmlParams["admin_note_content"] = htmlNoteContent
+
+		// 纯文本版本参数
+		plainNoteContent := ""
+		if adminNote != "" {
+			plainNoteContent = "回复内容：\n" + adminNote
+		}
+		plainParams := make(map[string]string, len(baseParams)+len(ticketParams))
+		for k, v := range baseParams {
+			plainParams[k] = v
+		}
+		for k, v := range ticketParams {
+			plainParams[k] = v
+		}
+		plainParams["admin_note_content"] = plainNoteContent
+
+		tmpl := a.cfg().TicketNotifyTelegramTemplate
+		usingDefault := strings.TrimSpace(tmpl) == ""
+		if usingDefault {
+			tmpl = config.DefaultTicketNotifyTelegramTemplate
+		}
+		htmlText := RenderTemplate(tmpl, htmlParams)
+		var plainText string
+		if usingDefault {
+			plainText = stripTelegramHTML(RenderTemplate(tmpl, plainParams))
+		} else {
+			plainText = RenderTemplate(tmpl, plainParams)
+		}
+		result := ticketNotificationResult{Targets: 1}
+		if err := a.telegramSendRichMessage(sendCtx, owner.TelegramID, htmlText, plainText); err != nil {
+			result.Failures = 1
+			zap.L().Warn("发送工单变动通知失败", zap.Int64("ticket_id", updated.ID), zap.Int64("uid", owner.UID), zap.Error(err))
+		}
+		return result
+	})
+}
+
+// ticketOwnerNotificationNote 取本次变动中要展示给工单所有者的「回复内容」。
+// 只认新增的管理员回复（Replies[]）——面向用户的唯一沟通通道。admin_note 是内部处理备注，
+// 与用户端彻底解耦，绝不出现在所有者通知里（此前会把 admin_note 变更推给用户，属泄露）。
+func ticketOwnerNotificationNote(updated, existing store.Ticket) string {
+	if len(updated.Replies) > len(existing.Replies) {
+		for i := len(updated.Replies) - 1; i >= len(existing.Replies); i-- {
+			reply := updated.Replies[i]
+			if reply.Role == store.RoleAdmin && strings.TrimSpace(reply.Content) != "" {
+				return strings.TrimSpace(reply.Content)
+			}
+		}
+	}
+	return ""
+}
+
+// statusLabel 返回工单状态的中文描述。
+func statusLabel(status string) string {
+	switch status {
+	case store.TicketStatusOpen:
+		return "待处理"
+	case store.TicketStatusInProgress:
+		return "处理中"
+	case store.TicketStatusResolved:
+		return "已解决"
+	case store.TicketStatusClosed:
+		return "已关闭"
+	}
+	return status
+}
+
+// statusLabelWithEmoji 在中文状态前加一个状态色点，用于 Telegram 富文本通知排版。
+func statusLabelWithEmoji(status string) string {
+	emoji := "⚪"
+	switch store.NormalizeTicketStatus(status) {
+	case store.TicketStatusOpen:
+		emoji = "🟡"
+	case store.TicketStatusInProgress:
+		emoji = "🔵"
+	case store.TicketStatusResolved:
+		emoji = "🟢"
+	case store.TicketStatusClosed:
+		emoji = "⚫"
+	}
+	return emoji + " " + statusLabel(status)
+}
+
+// ticketPriorityLabel 把原始优先级（low/medium/high/urgent）翻译成带图标的中文，
+// 通知里不再直接暴露英文枚举值。
+func ticketPriorityLabel(priority string) string {
+	switch store.NormalizeTicketPriority(priority) {
+	case store.TicketPriorityLow:
+		return "🟢 低"
+	case store.TicketPriorityHigh:
+		return "🟠 高"
+	case store.TicketPriorityUrgent:
+		return "🔴 紧急"
+	default:
+		return "🟡 中"
+	}
+}

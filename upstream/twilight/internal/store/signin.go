@@ -1,0 +1,159 @@
+package store
+
+import (
+	"errors"
+	"strings"
+	"time"
+)
+
+const signinDateLayout = "2006-01-02"
+
+// maxSigninRecords bounds the per-user sign-in history kept inside the single
+// twilight_state JSONB document. Every record is marshalled on each write, so
+// the old 730-entry window was the largest single contributor to state size
+// (about 80 KB per user, i.e. 80 MB at 1000 users). 90 days still covers the
+// history UI and any operational query, and older rows are cheap to rebuild.
+const maxSigninRecords = 90 // 最多保留 90 天签到记录，超出的旧记录自动裁剪
+
+func (s *Store) Signin(uid int64) Signin {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.Signin[uid]
+}
+
+func (s *Store) SigninHistoryRecords(uid int64, limit int) []SigninRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > maxSigninRecords {
+		limit = 30
+	}
+	records := s.state.Signin[uid].Records
+	if len(records) == 0 {
+		return nil
+	}
+	if limit > len(records) {
+		limit = len(records)
+	}
+	out := make([]SigninRecord, 0, limit)
+	for i := len(records) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, records[i])
+	}
+	return out
+}
+
+func (s *Store) AddSignin(uid int64, points int) (Signin, bool, error) {
+	return s.AddSigninWithOptions(uid, points, nil, true)
+}
+
+func (s *Store) AddSigninWithOptions(uid int64, dailyPoints int, bonusForStreak func(int) int, resetAfterMiss bool) (Signin, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 走 mutateAndSaveLocked：旧实现 refreshLocked + saveLocked，多进程写入撞版本
+	// 冲突时直接报错而不重放；非冲突类错误（超时等）时内存仍保留"今日已签到"，
+	// 可能随下一笔写入落盘或在下次刷新时消失。闭包内的结果变量每次重放都重新计算。
+	var result Signin
+	var awarded bool
+	err := s.mutateAndSaveLocked(func() error {
+		result, awarded = Signin{}, false
+		now := time.Now()
+		today := now.Format(signinDateLayout)
+		yesterday := now.AddDate(0, 0, -1).Format(signinDateLayout)
+		si := s.state.Signin[uid]
+		if si.UID == 0 {
+			si.UID = uid
+		}
+		if si.LongestStreak < si.Streak {
+			si.LongestStreak = si.Streak
+		}
+		if si.LastSignin == today {
+			result = si
+			return errSigninAlreadyToday
+		}
+		if si.LastSignin == yesterday {
+			si.Streak++
+		} else if si.LastSignin != "" && !resetAfterMiss {
+			si.Streak++
+		} else {
+			si.Streak = 1
+		}
+		if si.Streak > si.LongestStreak {
+			si.LongestStreak = si.Streak
+		}
+		bonusPoints := 0
+		if bonusForStreak != nil {
+			bonusPoints = bonusForStreak(si.Streak)
+		}
+		totalPoints := dailyPoints + bonusPoints
+		si.LastSignin = today
+		si.Points += totalPoints
+		// 新建切片再追加，避免写入与锁外持有的 Signin 副本共享底层数组。
+		records := make([]SigninRecord, 0, len(si.Records)+1)
+		records = append(records, si.Records...)
+		records = append(records, SigninRecord{Date: today, Points: dailyPoints, BonusPoints: bonusPoints, Total: totalPoints, Streak: si.Streak, CreatedAt: now.Unix()})
+		if len(records) > maxSigninRecords {
+			records = compactTail(records, maxSigninRecords)
+		}
+		si.Records = records
+		s.state.Signin[uid] = si
+		result, awarded = si, true
+		return nil
+	})
+	if errors.Is(err, errSigninAlreadyToday) {
+		// 今日已签到：不写入（mutateAndSaveLocked 已回滚到快照，本来也未改动）。
+		return result, false, nil
+	}
+	if err != nil {
+		return Signin{}, false, err
+	}
+	return result, awarded, nil
+}
+
+// errSigninAlreadyToday 仅用于让 mutateAndSaveLocked 跳过落盘的内部哨兵。
+var errSigninAlreadyToday = errors.New("signin already today")
+
+func (s *Store) SpendSigninPointsAndUpdateUser(uid int64, cost int, fn func(*User) error) (User, Signin, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var updated User
+	var updatedSignin Signin
+	err := s.mutateAndSaveLocked(func() error {
+		u, ok := s.state.Users[uid]
+		if !ok {
+			return ErrNotFound
+		}
+		if strings.TrimSpace(u.EmbyID) == "" || u.PendingEmby {
+			return ErrEmbyRequired
+		}
+		si := s.state.Signin[uid]
+		if si.UID == 0 {
+			si.UID = uid
+		}
+		if cost <= 0 {
+			return ErrConflict
+		}
+		if si.Points < cost {
+			return ErrInsufficientPoints
+		}
+		old := u
+		si.Points -= cost
+		if fn != nil {
+			if err := fn(&u); err != nil {
+				return err
+			}
+			normalizeUserStateMarkers(old, &u)
+		}
+		if err := s.userIdentityConflictLocked(old, u, uid); err != nil {
+			return ErrConflict
+		}
+		s.state.Signin[uid] = si
+		s.state.Users[uid] = u
+		s.maintainUserIndexes(old, u, uid)
+		updated = u
+		updatedSignin = si
+		return nil
+	})
+	if err != nil {
+		return User{}, Signin{}, err
+	}
+	return updated, updatedSignin, nil
+}

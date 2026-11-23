@@ -1,0 +1,1262 @@
+package api
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"go.uber.org/zap"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/prejudice-studio/twilight/internal/store"
+)
+
+const (
+	telegramBotConfigCheckInterval = time.Second
+	telegramEmbyHealthTimeout      = 1500 * time.Millisecond
+	telegramEmbyHealthSuccessTTL   = 30 * time.Second
+	telegramEmbyHealthFailureTTL   = 5 * time.Second
+	delAccountPendingMaxEntries    = 1024
+)
+
+type telegramBotConfigKey struct {
+	apiURL string
+	token  string
+}
+
+type telegramEmbyHealthCache struct {
+	key   [sha256.Size]byte
+	ok    bool
+	until time.Time
+}
+
+func (a *App) telegramCurrentBotConfigKey() telegramBotConfigKey {
+	cfg := a.cfg()
+	return telegramBotConfigKey{
+		apiURL: strings.TrimRight(firstNonEmpty(cfg.TelegramAPIURL, "https://api.telegram.org"), "/"),
+		token:  strings.TrimSpace(cfg.TelegramBotToken),
+	}
+}
+
+// delAccountPendingState 记录 /delAccount emby 两步验证的中间状态。
+type delAccountPendingState struct {
+	TelegramID  int64
+	ChatID      int64
+	UserUID     int64
+	WebVerified bool
+	SkipEmby    bool
+	ExpiresAt   int64
+	Reason      string // 用户可选的删除原因
+	// Stage 为 delAccountStageEmail 时只用于在「发码 → 验码」之间保存删除原因，
+	// 不拦截普通文本（不会把用户随手发的消息当成密码）。
+	Stage string
+}
+
+const delAccountStageEmail = "email"
+
+func delAccountPendingKey(chatID, fromID int64) string {
+	return fmt.Sprintf("%d:%d", chatID, fromID)
+}
+
+func (a *App) saveDelAccountPending(state *delAccountPendingState) {
+	a.delAccountPendingMu.Lock()
+	defer a.delAccountPendingMu.Unlock()
+	if a.delAccountPending == nil {
+		a.delAccountPending = map[string]*delAccountPendingState{}
+	}
+	now := time.Now().Unix()
+	key := delAccountPendingKey(state.ChatID, state.TelegramID)
+	for existingKey, existing := range a.delAccountPending {
+		if existing == nil || existing.ExpiresAt < now {
+			delete(a.delAccountPending, existingKey)
+		}
+	}
+	if _, replacing := a.delAccountPending[key]; !replacing && len(a.delAccountPending) >= delAccountPendingMaxEntries {
+		oldestKey := ""
+		oldestExpiry := int64(0)
+		for existingKey, existing := range a.delAccountPending {
+			if existing != nil && (oldestKey == "" || existing.ExpiresAt < oldestExpiry) {
+				oldestKey, oldestExpiry = existingKey, existing.ExpiresAt
+			}
+		}
+		delete(a.delAccountPending, oldestKey)
+	}
+	a.delAccountPending[key] = state
+}
+
+func (a *App) takeDelAccountPending(chatID, telegramID int64) *delAccountPendingState {
+	key := delAccountPendingKey(chatID, telegramID)
+	a.delAccountPendingMu.Lock()
+	defer a.delAccountPendingMu.Unlock()
+	state, ok := a.delAccountPending[key]
+	if !ok || state.ExpiresAt < time.Now().Unix() {
+		delete(a.delAccountPending, key)
+		return nil
+	}
+	delete(a.delAccountPending, key)
+	return state
+}
+
+func (a *App) peekDelAccountPending(chatID, telegramID int64) *delAccountPendingState {
+	key := delAccountPendingKey(chatID, telegramID)
+	a.delAccountPendingMu.Lock()
+	defer a.delAccountPendingMu.Unlock()
+	state, ok := a.delAccountPending[key]
+	if !ok || state.ExpiresAt < time.Now().Unix() {
+		delete(a.delAccountPending, key)
+		return nil
+	}
+	return state
+}
+
+func (a *App) clearDelAccountPending(chatID, telegramID int64) {
+	key := delAccountPendingKey(chatID, telegramID)
+	a.delAccountPendingMu.Lock()
+	defer a.delAccountPendingMu.Unlock()
+	delete(a.delAccountPending, key)
+}
+
+func (a *App) RunTelegramBot(ctx context.Context) error {
+	// 协程入口加 panic recover：单条 update 处理崩溃不应让整个 bot 退出。
+	defer func() {
+		if r := recover(); r != nil {
+			// 改用 zap.String：panic value 反射 dump 可能含 token / chat 私密内容；
+			// 走脱敏分支保证不绕过 sensitiveLogKey / redactSensitiveText 链路。
+			zap.L().Error("telegram bot panic", zap.String("panic", redactSensitiveText(fmt.Sprintf("%v", r))))
+		}
+	}()
+	// 启动时从 store 恢复上一次成功 ack 的 offset，避免进程重启后把 24h 内
+	// 已经处理过的 update 重新分发一遍（telegramConfirmBindCode 这类有副作用
+	// 的命令会被重放）。0 = 历史 state / 新部署，按 getUpdates 默认行为走。
+	offset, err := a.store().TelegramBotOffset()
+	if err != nil {
+		return fmt.Errorf("load Telegram update offset: %w", err)
+	}
+	activeBot := ""
+	var verifiedConfig telegramBotConfigKey
+	configVerified := false
+	nextConfigCheck := time.Time{}
+	waitingForConfig := false
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		now := time.Now()
+		if !now.Before(nextConfigCheck) {
+			a.reloadConfigIfChanged()
+			nextConfigCheck = now.Add(telegramBotConfigCheckInterval)
+		}
+		if !a.telegramAvailable() {
+			if !waitingForConfig {
+				a.setTelegramRuntimeStatus(false, fmt.Errorf("Telegram bot is disabled or token is not configured"))
+				zap.L().Info("Telegram bot configuration disabled; waiting before next config check")
+				waitingForConfig = true
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(3 * time.Second):
+				continue
+			}
+		}
+		waitingForConfig = false
+		botConfig := a.telegramCurrentBotConfigKey()
+		if !configVerified || botConfig != verifiedConfig {
+			// botIdentity = 当前 bot 的 username。token 改了但 bot 实体（同一
+			// @bot_name）不变时复用旧 offset 是正确的；只有 bot 实体真的换了才
+			// 必须 reset，否则会把新 bot 的真实 update 当成"已处理"丢掉。
+			me, err := a.telegramGetMe(ctx)
+			if err != nil {
+				a.setTelegramRuntimeStatus(false, err)
+				zap.L().Warn("Telegram bot initialization failed", zap.Error(err))
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(3 * time.Second):
+					continue
+				}
+			}
+			botIdentity := strings.TrimSpace(me.Username)
+			// 修复：offset 绑定 Bot 数字 id 持久化在库里；换了 Bot（包括停机换
+			// Token 后重启）就归零，否则会把新 Bot 的真实 update 当成已处理丢掉。
+			storedOffset, reset, bindErr := a.store().BindTelegramBotOffset(me.ID)
+			if bindErr != nil {
+				zap.L().Warn("bind telegram offset to bot identity failed", zap.Error(bindErr))
+			} else if reset {
+				zap.L().Info("Telegram bot identity changed; update offset reset", zap.Int64("bot_id", me.ID))
+				offset = 0
+			} else if storedOffset > offset {
+				offset = storedOffset
+			}
+			if bindErr == nil && !reset && botIdentity != "" && activeBot != "" && botIdentity != activeBot && me.ID <= 0 {
+				// 拿不到数字 id 时退回旧逻辑：同进程内 username 变化才 reset。
+				if err := a.store().ResetTelegramBotOffset(); err != nil {
+					zap.L().Warn("reset telegram offset failed", zap.Error(err))
+				}
+				offset = 0
+			}
+			verifiedConfig = botConfig
+			configVerified = true
+			if botIdentity != "" && botIdentity != activeBot {
+				activeBot = botIdentity
+				a.setTelegramRuntimeStatus(true, nil)
+				zap.L().Info("Telegram bot polling started", zap.String("username", botIdentity), zap.Int64("resume_offset", offset))
+			}
+		}
+		updates, err := a.telegramGetUpdates(ctx, offset)
+		if err != nil {
+			a.setTelegramRuntimeStatus(true, err)
+			zap.L().Warn("Telegram getUpdates failed", zap.Error(err))
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(3 * time.Second):
+				continue
+			}
+		}
+		a.setTelegramRuntimeStatus(true, nil)
+		batchOffset := offset
+		for i := range updates {
+			if updates[i].UpdateID >= offset {
+				offset = updates[i].UpdateID + 1
+			}
+		}
+		if !a.handleTelegramUpdateBatch(ctx, updates) {
+			offset = batchOffset
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		// 整个 batch 处理完成才推进持久化 offset：一旦写入成功，下一次重启
+		// 不会再分发到已 ack 的 update。SetTelegramBotOffset 内部做单调防退化，
+		// 偶尔的 store 写失败只是不更新 disk，下一轮 batch 会再尝试。
+		if len(updates) > 0 {
+			if err := a.store().SetTelegramBotOffset(offset); err != nil {
+				zap.L().Warn("persist telegram offset failed", zap.Error(err), zap.Int64("offset", offset))
+			}
+		}
+	}
+}
+
+func (a *App) telegramGetUpdates(ctx context.Context, offset int64) ([]telegramUpdate, error) {
+	body := telegramGetUpdatesRequest{Offset: offset, Timeout: 30, AllowedUpdates: telegramAllowedUpdates}
+	return telegramPostResult[[]telegramUpdate](a, ctx, "getUpdates", body, 45*time.Second)
+}
+
+func (a *App) handleTelegramUpdate(ctx context.Context, update *telegramUpdate) {
+	if update == nil {
+		return
+	}
+	a.observeTelegramRoster(update)
+	if callback := update.CallbackQuery; callback != nil {
+		if a.telegramHandleLoginCallback(ctx, callback) {
+			return
+		}
+		if a.telegramHandleDeveloperJSCallback(ctx, callback) {
+			return
+		}
+		a.telegramHandleCallback(ctx, callback)
+		return
+	}
+	message := update.Message
+	if message == nil {
+		return
+	}
+	text := strings.TrimSpace(message.Text)
+	if text == "" {
+		return
+	}
+	chatID := message.Chat.ID
+	fromID := message.From.ID
+	if chatID == 0 {
+		chatID = fromID
+	}
+	username := strings.TrimPrefix(message.From.Username, "@")
+	privateChat := chatID == fromID || strings.EqualFold(message.Chat.Type, "private")
+	if a.telegramConsumeDeveloperJSWaiter(ctx, chatID, fromID, text) {
+		return
+	}
+	// 拦截非命令文本：delAccount 两步验证（Web密码→Emby密码）
+	isCommand := text[0] == '/'
+	if !isCommand && a.telegramConsumeDelAccountPending(ctx, chatID, fromID, text) {
+		return
+	}
+	if !isCommand {
+		// 私聊里直接粘贴签发的 32 位 token 也能完成绑定；其它闲聊文本不响应。
+		if privateChat && telegramLinkIDPattern.MatchString(text) {
+			a.telegramConfirmLinkFromChat(ctx, chatID, fromID, username, text)
+		}
+		return
+	}
+	command, args := telegramParseCommandText(text)
+	if command == "" {
+		return
+	}
+
+	// 先把"私聊 + 普通 gating"的标准命令交给注册表统一分发，dispatcher 内部
+	// 集中处理 private/admin 校验，避免每个 case 重复 telegramRequirePrivate +
+	// telegramAdminID 模板。
+	cmdCtx := telegramCommandCtx{ChatID: chatID, FromID: fromID, Username: username, Command: command, Args: args}
+	if a.telegramDispatchRegistry(ctx, command, cmdCtx, privateChat) {
+		return
+	}
+
+	switch command {
+	case "/start", "/help", "/twihelp":
+		// 群聊里这三个命令转发"请私聊"提示而不是 gating 失败，
+		// /help 还要根据是否管理员渲染不同文本，所以保留 switch 单独处理。
+		if !privateChat {
+			_ = a.telegramSendMessage(ctx, chatID, a.telegramGroupPrompt())
+			return
+		}
+		if command == "/start" {
+			if len(args) > 0 && strings.HasPrefix(args[0], "login_") {
+				if !message.From.IsBot && chatID == fromID {
+					a.telegramScanLogin(ctx, fromID, strings.TrimPrefix(args[0], "login_"))
+				}
+				return
+			}
+			// deep link：t.me/<bot>?start=<token> 会以 "/start <token>" 送达。
+			if len(args) > 0 && telegramLinkTokenPattern.MatchString(args[0]) {
+				a.telegramConfirmLinkFromChat(ctx, chatID, fromID, username, args[0])
+				return
+			}
+			_ = a.telegramSendMessage(ctx, chatID, a.telegramStartText())
+			return
+		}
+		_ = a.telegramSendMessage(ctx, chatID, a.telegramHelpText(a.telegramAdminID(fromID)))
+	case "/twguser":
+		// 群组管理命令：群内匿名管理员要走 inline 按钮二次鉴权，
+		// 私聊也允许，gating 逻辑和注册表的"private + admin"模式不一样。
+		// 修复：enable_tg_panel=false 时面板（含删除/封禁等写操作）整体停用。
+		// 群聊里静默忽略，避免任何人借此刷屏；私聊给一句提示。
+		if !a.cfg().TelegramEnablePanel {
+			if privateChat {
+				_ = a.telegramSendMessage(ctx, chatID, "群组用户管理面板未启用（enable_tg_panel = false）。")
+			}
+			return
+		}
+		a.telegramHandleGroupUser(ctx, chatID, fromID, args, message)
+	default:
+		if a.telegramHandleCustomCommand(ctx, command, cmdCtx, privateChat) {
+			return
+		}
+		if privateChat {
+			_ = a.telegramSendMessage(ctx, chatID, "未知命令。发送 /help 查看可用命令。")
+		}
+	}
+}
+
+func (a *App) observeTelegramRoster(update *telegramUpdate) {
+	if update == nil {
+		return
+	}
+	if message := update.Message; message != nil {
+		chatID := message.Chat.ID
+		fromID := message.From.ID
+		// 私聊 + 群聊都顺手刷新已绑定用户的 Telegram 用户名（无额外 API 调用）。
+		a.refreshTelegramUsername(fromID, message.From.Username)
+		if chatID != 0 && fromID > 0 && chatID != fromID && a.telegramRosterChatConfigured(message.Chat) {
+			_ = a.store().UpsertTelegramRoster(fmt.Sprint(chatID), fromID, "member", message.From.IsBot)
+		}
+		return
+	}
+	event := update.ChatMember
+	if event == nil {
+		event = update.MyChatMember
+	}
+	if event == nil {
+		return
+	}
+	chatID := event.Chat.ID
+	user := event.NewChatMember.User
+	status := strings.ToLower(event.NewChatMember.Status)
+	if chatID == 0 || user.ID <= 0 {
+		return
+	}
+	a.refreshTelegramUsername(user.ID, user.Username)
+	if !a.telegramRosterChatConfigured(event.Chat) {
+		return
+	}
+	if status == "left" || status == "kicked" {
+		_ = a.store().MarkTelegramRosterLeft(fmt.Sprint(chatID), user.ID, status)
+		return
+	}
+	_ = a.store().UpsertTelegramRoster(fmt.Sprint(chatID), user.ID, firstNonEmpty(status, "member"), user.IsBot)
+}
+
+// telegramRosterChatConfigured 修复：花名册只记录配置里的群组/频道。
+// 原先 Bot 所在的任何群（包括别人把 Bot 拉进去的群）都会写进
+// twilight_telegram_roster，可被灌号让表无上限增长。配置项可以是数字 ID
+// 或 @用户名，两种都认。
+func (a *App) telegramRosterChatConfigured(chat telegramChat) bool {
+	if chat.ID == 0 {
+		return false
+	}
+	id := strconv.FormatInt(chat.ID, 10)
+	username := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(chat.Username), "@"))
+	cfg := a.cfg()
+	for _, list := range [][]string{cfg.TelegramGroupIDs, cfg.TelegramChannelIDs} {
+		for _, raw := range list {
+			value := strings.TrimSpace(raw)
+			if value == "" {
+				continue
+			}
+			if value == id {
+				return true
+			}
+			if username != "" && strings.HasPrefix(value, "@") && strings.EqualFold(strings.TrimPrefix(value, "@"), username) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// refreshTelegramUsername 在收到任意来自已绑定用户的更新时被动刷新其存储的
+// Telegram 用户名。只有解析到绑定账号、且新用户名非空并与现存不同才写库，避免
+// 无谓写盘；用户名为空（对方删了 @username）时保留旧值不清空，以免破坏指名码匹配。
+func (a *App) refreshTelegramUsername(telegramID int64, rawUsername string) {
+	_, _, _ = a.store().UpdateTelegramUsernameIfBound(telegramID, rawUsername)
+}
+
+func (a *App) telegramHandleMe(ctx context.Context, chatID, telegramID int64) {
+	if u, okUser := a.store().FindUserByTelegramID(telegramID); okUser {
+		_ = a.telegramSendMessage(ctx, chatID, "当前绑定信息\n\n"+telegramUserSummary(u))
+		return
+	}
+	_ = a.telegramSendMessage(ctx, chatID, "当前 Telegram 尚未绑定 Twilight 账号。")
+}
+
+func (a *App) telegramHandleEmby(ctx context.Context, chatID, telegramID int64) {
+	u, okUser := a.store().FindUserByTelegramID(telegramID)
+	if !okUser {
+		_ = a.telegramSendMessage(ctx, chatID, "当前 Telegram 尚未绑定 Twilight 账号。")
+		return
+	}
+	checked, online := a.telegramCachedEmbyHealth(ctx)
+	status := "未检测"
+	if checked && online {
+		status = "正常"
+	} else if checked {
+		status = "不可用"
+	}
+	lines := []string{
+		"Emby 状态",
+		"",
+		"账号: " + u.Username,
+		"本地状态: " + telegramActiveLabel(u.Active),
+		"到期: " + expireStatus(u.ExpiredAt),
+		"Emby 绑定: " + telegramEmbyLabel(u),
+		"服务器配置: " + telegramConfiguredLabel(a.cfg().EmbyURL != ""),
+		"连通性: " + status,
+	}
+	_ = a.telegramSendMessage(ctx, chatID, strings.Join(lines, "\n"))
+}
+
+func (a *App) telegramCachedEmbyHealth(ctx context.Context) (checked, online bool) {
+	cfg := a.cfg()
+	baseURL := strings.TrimSpace(cfg.EmbyURL)
+	if baseURL == "" {
+		return false, false
+	}
+	token := strings.TrimSpace(cfg.EmbyToken)
+	key := sha256.Sum256([]byte(baseURL + "\x00" + token))
+	now := time.Now()
+	a.telegramEmbyHealthMu.Lock()
+	cache := a.telegramEmbyHealth
+	if cache.key == key && now.Before(cache.until) {
+		a.telegramEmbyHealthMu.Unlock()
+		return true, cache.ok
+	}
+	a.telegramEmbyHealthMu.Unlock()
+
+	checkCtx, cancel := context.WithTimeout(ctx, telegramEmbyHealthTimeout)
+	_, online = a.embyHealth(checkCtx)
+	cancel()
+	ttl := telegramEmbyHealthFailureTTL
+	if online {
+		ttl = telegramEmbyHealthSuccessTTL
+	}
+	a.telegramEmbyHealthMu.Lock()
+	a.telegramEmbyHealth = telegramEmbyHealthCache{key: key, ok: online, until: now.Add(ttl)}
+	a.telegramEmbyHealthMu.Unlock()
+	return true, online
+}
+
+func (a *App) telegramHandleResetPassword(ctx context.Context, chatID, telegramID int64) {
+	if _, okUser := a.store().FindUserByTelegramID(telegramID); !okUser {
+		_ = a.telegramSendMessage(ctx, chatID, "当前 Telegram 尚未绑定 Twilight 账号。")
+		return
+	}
+	_ = a.telegramSendMessage(ctx, chatID, "请在 Web 端的账号安全页面修改密码。Bot 不接收、不生成也不发送密码。")
+}
+
+// telegramConsumeDelAccountPending 消费 delAccount 两步验证中的非命令文本。
+// 用户发送 Web 密码后，Bot 在此验证并进入 Emby 密码等待状态。
+func (a *App) telegramConsumeDelAccountPending(ctx context.Context, chatID, fromID int64, text string) bool {
+	state := a.peekDelAccountPending(chatID, fromID)
+	if state == nil || state.Stage == delAccountStageEmail {
+		return false
+	}
+	if !state.WebVerified {
+		u, ok := a.store().User(state.UserUID)
+		if !ok {
+			a.clearDelAccountPending(chatID, fromID)
+			_ = a.telegramSendMessage(ctx, chatID, "用户状态异常，请重新发送 /delAccount 开始。")
+			return true
+		}
+		if !verifyPasswordThrottled(text, u.PasswordHash) {
+			a.auditSelfDeleteVerifyFailed(u.UID, u.Username, "web_password", fromID)
+			_ = a.telegramSendMessage(ctx, chatID, "Web 密码错误，请重试。发送 /cancel 取消操作。")
+			return true
+		}
+		if state.SkipEmby {
+			a.clearDelAccountPending(chatID, fromID)
+			a.telegramExecuteDelAccount(ctx, chatID, u, state.Reason)
+			return true
+		}
+		state.WebVerified = true
+		state.ExpiresAt = time.Now().Add(60 * time.Second).Unix()
+		a.saveDelAccountPending(state)
+		_ = a.telegramSendMessage(ctx, chatID, "Web 密码验证通过。请在 60 秒内发送你的 Emby 密码继续。\n\n发送 /cancel 取消操作。")
+		return true
+	}
+	a.clearDelAccountPending(chatID, fromID)
+	u, ok := a.store().User(state.UserUID)
+	if !ok {
+		_ = a.telegramSendMessage(ctx, chatID, "用户状态异常，请重新发送 /delAccount 开始。")
+		return true
+	}
+	if _, authOK, err := a.embyAuthenticateByName(ctx, u.EmbyUsername, text); err != nil {
+		_ = a.telegramSendMessage(ctx, chatID, "Emby 验证服务异常，请稍后重试。")
+	} else if !authOK {
+		a.auditSelfDeleteVerifyFailed(u.UID, u.Username, "emby_password", fromID)
+		_ = a.telegramSendMessage(ctx, chatID, "Emby 密码验证失败。请重新发送 /delAccount emby 开始。")
+	} else {
+		a.telegramExecuteDelAccount(ctx, chatID, u, state.Reason)
+	}
+	return true
+}
+
+// telegramHandleDelAccount 用户通过 Telegram 删除自己的账号，支持多因素验证。
+// 禁止群聊使用（已在 dispatch 层通过 private=true 强制私聊）。
+// 验证优先级：
+//  1. 已绑定已验证邮箱 → 必须使用邮箱验证码
+//  2. 已绑定 Emby → 需要 Web 密码 + Emby 密码两步验证
+//  3. 无绑定 → /delAccount confirm 后发送 Web 密码二次确认
+//
+// 安全约束：
+//   - 管理员/白名单账号拒绝删除
+//   - Web 被禁用时拒绝删除，防止通过删号绕过封禁
+//   - Emby 被禁用时默认拒绝；邀请关系中的已到期账号可用 Web 密码完成退出清理
+//
+// 用法：
+//
+//	/delAccount                     查看可用的验证方式
+//	/delAccount email [原因]        向绑定邮箱发送验证码（原因暂存到验证后提交）
+//	/delAccount email <code>        验证邮箱验证码
+//	/delAccount emby [原因]         开始 Web + Emby 密码两步验证
+//	/delAccount cancel              取消操作
+//	/delAccount confirm [原因]      无邮箱/Emby 时，发送 Web 密码二次确认后删除
+//	其余参数只回说明，不会触发任何删除动作；子命令不分大小写。
+func (a *App) telegramHandleDelAccount(ctx context.Context, chatID, telegramID int64, args []string) {
+	u, okUser := a.store().FindUserByTelegramID(telegramID)
+	if !okUser {
+		_ = a.telegramSendMessage(ctx, chatID, "当前 Telegram 尚未绑定 Twilight 账号。")
+		return
+	}
+	if a.userIsProtected(u) {
+		_ = a.telegramSendMessage(ctx, chatID, "管理员/白名单账号不支持通过 Telegram 删除，请联系其他管理员。")
+		return
+	}
+	if !u.Active {
+		_ = a.telegramSendMessage(ctx, chatID, "你的 Web 账号已被禁用，不允许通过 Telegram 删除。请联系管理员。")
+		return
+	}
+	expiredInviteCleanup := a.inviteExpiredSelfCleanupAllowed(u, time.Now().Unix())
+	if u.EmbyDisabled && !expiredInviteCleanup {
+		_ = a.telegramSendMessage(ctx, chatID, "你的 Emby 账号已被禁用，不允许通过 Telegram 删除。请联系管理员。")
+		return
+	}
+
+	hasEmail := u.Email != "" && u.EmailVerified
+	hasEmby := u.EmbyID != ""
+	emailConfigured := emailConfigured(a.cfg())
+
+	if len(args) == 0 {
+		msg := "⚠️ 账号删除确认\n\n此操作将永久删除你的账号，不可恢复！\n你的所有数据（播放记录、设备、邀请关系等）将被删除，注册码使用记录将被匿名化。\n\n"
+		if hasEmail && emailConfigured {
+			msg += "📧 你已绑定已验证邮箱，必须使用邮箱验证码删除。\n发送 /delAccount email 将验证码发送到你的绑定邮箱。\n\n可选：附带删除原因 /delAccount email 原因说明"
+		} else if expiredInviteCleanup {
+			msg += "🎬 你的邀请关系 Emby 权益已到期，可通过 Web 密码验证后删除本地账号并完全删除 Emby 账号。\n发送 /delAccount emby 开始验证。\n\n可选：附带删除原因 /delAccount emby 原因说明"
+		} else if hasEmby {
+			msg += "🎬 你已绑定 Emby 账号，必须通过 Web 密码 + Emby 密码两步验证删除。\n发送 /delAccount emby 开始验证。\n\n可选：附带删除原因 /delAccount emby 原因说明"
+		} else {
+			msg += "\n由于未绑定邮箱或 Emby，发送 /delAccount confirm 后按提示发送 Web 登录密码即可删除。\n\n可选：附带删除原因 /delAccount confirm 原因说明"
+		}
+		_ = a.telegramSendMessage(ctx, chatID, msg)
+		return
+	}
+
+	// 修复：动词比对不分大小写（/delAccount Cancel 以前会被当成原因）；
+	// 不认得的参数一律只回说明，不再自动补上 confirm/emby/email 动作——
+	// 以前 /delAccount help 这类输入会让无邮箱、无 Emby 的账号被立即删除。
+	verb := strings.ToLower(args[0])
+	if !isKnownDelAccountVerb(verb) {
+		_ = a.telegramSendMessage(ctx, chatID, "未知参数："+truncateString(args[0], 32)+"\n请发送 /delAccount 查看可用的验证方式；删除原因请写在子命令之后，例如 /delAccount emby 原因说明。")
+		return
+	}
+	reason := ""
+	if len(args) > 1 {
+		reason = strings.Join(args[1:], " ")
+	}
+
+	switch verb {
+	case "email":
+		if !hasEmail || !emailConfigured {
+			_ = a.telegramSendMessage(ctx, chatID, "你未绑定已验证的邮箱，或邮件服务未配置。")
+			return
+		}
+		// 修复：只有「恰好一个参数且形如验证码」才当验证码处理；其余都视为删除原因，
+		// 原因存进 pending state，验证码通过后再带出来写入审计。
+		if len(args) == 2 && a.delAccountLooksLikeEmailCode(args[1]) {
+			pendingReason := ""
+			if pending := a.peekDelAccountPending(chatID, telegramID); pending != nil && pending.Stage == delAccountStageEmail && pending.UserUID == u.UID {
+				pendingReason = pending.Reason
+			}
+			code := args[1]
+			rec, found := a.store().FindActiveEmailVerification(emailPurposeDelAccount, u.Email, time.Now().Unix())
+			if !found {
+				_ = a.telegramSendMessage(ctx, chatID, "未找到有效的验证码，请重新发送 /delAccount email 获取新验证码。")
+				return
+			}
+			candidateHash := a.hashEmailCode(rec.ID, code)
+			_, result, err := a.store().ConsumeEmailVerificationAtomic(rec.ID, candidateHash, time.Now().Unix())
+			if err != nil {
+				_ = a.telegramSendMessage(ctx, chatID, "验证失败："+err.Error())
+				return
+			}
+			if result == store.EmailVerificationOK {
+				a.clearDelAccountPending(chatID, telegramID)
+				a.telegramExecuteDelAccount(ctx, chatID, u, pendingReason)
+				return
+			}
+			a.auditSelfDeleteVerifyFailed(u.UID, u.Username, "email_code", telegramID)
+			_ = a.telegramSendMessage(ctx, chatID, "验证码无效或已过期，请重新发送 /delAccount email 获取新验证码。")
+			return
+		}
+		a.clearDelAccountPending(chatID, telegramID)
+		_, _, errCode, errMsg := a.issueEmailCode(ctx, "telegram", emailPurposeDelAccount, u.Email, u.UID)
+		if errCode != "" {
+			_ = a.telegramSendMessage(ctx, chatID, "发送验证码失败："+errMsg)
+			return
+		}
+		ttl := a.cfg().EmailCodeTTLMinutes
+		if ttl <= 0 {
+			ttl = 10
+		}
+		a.saveDelAccountPending(&delAccountPendingState{
+			TelegramID: telegramID,
+			ChatID:     chatID,
+			UserUID:    u.UID,
+			Stage:      delAccountStageEmail,
+			ExpiresAt:  time.Now().Add(time.Duration(ttl) * time.Minute).Unix(),
+			Reason:     reason,
+		})
+		msg := "验证码已发送到你的绑定邮箱，请查收后发送 /delAccount email <验证码>"
+		if reason != "" {
+			msg += "\n\n删除原因将在验证后提交：" + truncateString(reason, 200)
+		}
+		_ = a.telegramSendMessage(ctx, chatID, msg)
+
+	case "emby":
+		if !hasEmby {
+			_ = a.telegramSendMessage(ctx, chatID, "你未绑定 Emby 账号。")
+			return
+		}
+		if hasEmail && emailConfigured {
+			_ = a.telegramSendMessage(ctx, chatID, "你已绑定已验证邮箱，必须使用邮箱验证码删除。发送 /delAccount email 开始。")
+			return
+		}
+		a.clearDelAccountPending(chatID, telegramID)
+		state := &delAccountPendingState{
+			TelegramID:  telegramID,
+			ChatID:      chatID,
+			UserUID:     u.UID,
+			WebVerified: false,
+			SkipEmby:    expiredInviteCleanup,
+			ExpiresAt:   time.Now().Add(180 * time.Second).Unix(),
+			Reason:      reason,
+		}
+		a.saveDelAccountPending(state)
+		msg := "两步验证已启动。请在 3 分钟内发送你的 Web 登录密码以进行第一步验证。\n\n密码不会记录或分享，仅用于验证身份。\n发送 /cancel 取消操作。"
+		if expiredInviteCleanup {
+			msg = "邀请到期清理已启动。请在 3 分钟内发送你的 Web 登录密码；验证通过后将删除本地账号并完全删除对应 Emby 账号。\n\n密码不会记录或分享，仅用于验证身份。\n发送 /cancel 取消操作。"
+		}
+		if reason != "" {
+			msg += "\n\n删除原因：" + truncateString(reason, 200)
+		}
+		_ = a.telegramSendMessage(ctx, chatID, msg)
+
+	case "confirm", "force":
+		if hasEmail && emailConfigured {
+			_ = a.telegramSendMessage(ctx, chatID, "你绑定了已验证邮箱，必须使用邮箱验证码删除。发送 /delAccount email 开始。")
+			return
+		}
+		if expiredInviteCleanup {
+			_ = a.telegramSendMessage(ctx, chatID, "你的邀请关系 Emby 权益已到期，需要先验证 Web 密码。发送 /delAccount emby 开始。")
+			return
+		}
+		if hasEmby {
+			_ = a.telegramSendMessage(ctx, chatID, "你绑定了 Emby 账号，必须通过 Web 密码 + Emby 密码两步验证删除。发送 /delAccount emby 开始。")
+			return
+		}
+		// 修复：confirm 不再当场删除，而是进入 pending，要求在下一条消息里发送
+		// Web 登录密码作为二次确认（复用两步验证的 Web 密码阶段，跳过 Emby 阶段）。
+		a.clearDelAccountPending(chatID, telegramID)
+		a.saveDelAccountPending(&delAccountPendingState{
+			TelegramID: telegramID,
+			ChatID:     chatID,
+			UserUID:    u.UID,
+			SkipEmby:   true,
+			ExpiresAt:  time.Now().Add(180 * time.Second).Unix(),
+			Reason:     reason,
+		})
+		msg := "即将永久删除你的账号。请在 3 分钟内发送你的 Web 登录密码作为最终确认。\n\n密码不会记录或分享，仅用于验证身份。\n发送 /cancel 取消操作。"
+		if reason != "" {
+			msg += "\n\n删除原因：" + truncateString(reason, 200)
+		}
+		_ = a.telegramSendMessage(ctx, chatID, msg)
+
+	case "cancel":
+		a.clearDelAccountPending(chatID, telegramID)
+		_ = a.telegramSendMessage(ctx, chatID, "已取消删除操作。")
+	}
+}
+
+// isKnownDelAccountVerb 检查是否是 delAccount 的已知子命令（调用方需先转小写）。
+func isKnownDelAccountVerb(s string) bool {
+	switch strings.ToLower(s) {
+	case "email", "emby", "confirm", "force", "cancel":
+		return true
+	}
+	return false
+}
+
+// delAccountLooksLikeEmailCode 判断参数是否形如本站当前配置生成的邮箱验证码
+// （长度与字符集都要对上），用来区分 /delAccount email <验证码> 和 <原因>。
+func (a *App) delAccountLooksLikeEmailCode(s string) bool {
+	length := a.cfg().EmailCodeLength
+	if length < 4 {
+		length = 6
+	}
+	if length > 12 {
+		length = 12
+	}
+	if len(s) != length {
+		return false
+	}
+	alphabet := emailCodeDigits
+	if strings.ToLower(strings.TrimSpace(a.cfg().EmailCodeType)) == "alphanumeric" {
+		alphabet = emailCodeAlnum
+	}
+	for _, r := range s {
+		if !strings.ContainsRune(alphabet, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// telegramExecuteDelAccount 执行账号删除操作（从本地删除 + 远端 Emby 解绑 + 清除会话）。
+// reason 为可选的删除原因，会记入审计日志。
+func (a *App) telegramExecuteDelAccount(ctx context.Context, chatID int64, u store.User, reason string) {
+	if a.userIsProtected(u) {
+		_ = a.telegramSendMessage(ctx, chatID, "受保护账号不允许通过 Telegram 删除。")
+		return
+	}
+	if u.EmbyID != "" && a.embyConfigured() {
+		if err := a.embyDelete(ctx, "/Users/"+urlPathEscape(u.EmbyID)); err != nil && !strings.Contains(err.Error(), "remote status 404") {
+			zap.L().Warn("telegram delAccount: emby delete failed", zap.Int64("uid", u.UID), zap.Error(err))
+			a.auditEntryIP("telegram", u.UID, u.Username, "self_delete_via_telegram_failed", "user", u.UID, map[string]any{"source": "telegram", "stage": "emby_delete", "error": telegramAuditError(err)})
+			_ = a.telegramSendMessage(ctx, chatID, "删除 Emby 账号失败，请稍后重试或联系管理员。你的本地账号尚未删除。")
+			return
+		}
+	}
+	if err := a.deleteLocalUser(ctx, u); err != nil {
+		a.auditEntryIP("telegram", u.UID, u.Username, "self_delete_via_telegram_failed", "user", u.UID, map[string]any{"source": "telegram", "stage": "local_delete", "error": telegramAuditError(err)})
+		_ = a.telegramSendMessage(ctx, chatID, "删除账号失败："+err.Error())
+		return
+	}
+	detail := map[string]any{"source": "telegram"}
+	if reason != "" {
+		detail["reason"] = truncateString(reason, 200)
+	}
+	a.auditEntryIP("telegram", u.UID, u.Username, "self_delete_via_telegram", "user", u.UID, detail)
+	msg := "你的账号已永久删除。感谢你的使用，再见。"
+	if reason != "" {
+		msg += "\n\n已记录的删除原因：" + truncateString(reason, 200)
+	}
+	_ = a.telegramSendMessage(ctx, chatID, msg)
+}
+
+func (a *App) telegramHandleStats(ctx context.Context, chatID int64) {
+	counts := a.store().UserSummaryCounts()
+	text := fmt.Sprintf("服务统计\n\n用户总数: %d\n活跃用户: %d\nTelegram 已绑定: %d\nEmby 已绑定: %d\n待开通 Emby: %d\n注册码: %d\n邀请码: %d", counts.Total, counts.Active, counts.TelegramBound, counts.EmbyBound, counts.PendingEmby, a.store().CountRegCodes(), a.store().CountInviteCodes())
+	_ = a.telegramSendMessage(ctx, chatID, text)
+}
+
+func (a *App) telegramHandleAdmin(ctx context.Context, chatID int64) {
+	_ = a.telegramSendMessage(ctx, chatID, "管理员查询入口\n\n/stats 服务统计\n/userinfo <关键词> 查看单个用户\n/twfind <关键词> 搜索用户\n/twishelp 查看管理员帮助\n\n涉及写入、删除、密码和服务重启的操作请在 Web 后台完成。")
+}
+
+func (a *App) telegramHandleUserInfo(ctx context.Context, chatID int64, query string) {
+	if strings.TrimSpace(query) == "" {
+		_ = a.telegramSendMessage(ctx, chatID, "请发送 /userinfo <用户名/UID/关键词>")
+		return
+	}
+	users := a.telegramFindUsers(query, 6)
+	if len(users) == 0 {
+		_ = a.telegramSendMessage(ctx, chatID, "未找到匹配用户。")
+		return
+	}
+	if len(users) > 1 {
+		_ = a.telegramSendMessage(ctx, chatID, "找到多个匹配项，请缩小关键词。\n\n"+telegramUserList(users))
+		return
+	}
+	_ = a.telegramSendMessage(ctx, chatID, "用户详情\n\n"+telegramUserSummary(users[0]))
+}
+
+func (a *App) telegramHandleFind(ctx context.Context, chatID int64, query string) {
+	if strings.TrimSpace(query) == "" {
+		_ = a.telegramSendMessage(ctx, chatID, "请发送 /twfind <用户名/UID/关键词>")
+		return
+	}
+	users := a.telegramFindUsers(query, 10)
+	if len(users) == 0 {
+		_ = a.telegramSendMessage(ctx, chatID, "未找到匹配用户。")
+		return
+	}
+	_ = a.telegramSendMessage(ctx, chatID, "用户搜索结果\n\n"+telegramUserList(users))
+}
+
+// telegramHandleBanWeb 禁用指定用户的 Web 账号（可选理由）。
+// 用法：/banweb <用户名/UID/关键词> [理由]
+func (a *App) telegramHandleBanWeb(ctx context.Context, chatID, telegramID int64, args []string) {
+	if len(args) == 0 {
+		_ = a.telegramSendMessage(ctx, chatID, "请发送 /banweb <UID/完整用户名/Telegram ID/@用户名> [理由]")
+		return
+	}
+	query := args[0]
+	reason := ""
+	if len(args) > 1 {
+		reason = strings.TrimSpace(strings.Join(args[1:], " "))
+		if len(reason) > 200 {
+			reason = reason[:200]
+		}
+	}
+	target, ok := a.telegramResolveExactBanTarget(ctx, chatID, query)
+	if !ok {
+		return
+	}
+	if a.telegramProtectedTarget(target) {
+		_ = a.telegramSendMessage(ctx, chatID, "受保护账号禁止通过 Telegram 禁用。")
+		return
+	}
+	updated, err := a.store().SetUserActiveAtomic(target.UID, false)
+	if err != nil {
+		a.auditTelegramFailure(telegramID, "banweb_via_telegram", target.UID, err, map[string]any{"reason": reason})
+		_ = a.telegramSendMessage(ctx, chatID, "禁用 Web 账号失败: "+err.Error())
+		return
+	}
+	a.sessions().DeleteUser(ctx, updated.UID)
+	embySynced, syncErr := a.disableRemoteEmbyForWebState(ctx, updated)
+	if syncErr != nil {
+		_ = a.telegramSendMessage(ctx, chatID, "Web 账号已禁用，但 Emby 远端关停失败: "+syncErr.Error())
+	} else {
+		_ = a.telegramSendMessage(ctx, chatID, "已禁用 Web 账号（Emby 已同步关停）。")
+	}
+	// 审计日志（修复：带上 Emby 同步结果，失败时记录错误）
+	opUID, opName := a.telegramAdminIdentity(telegramID)
+	detail := map[string]any{"source": "telegram", "emby_synced": embySynced}
+	if syncErr != nil {
+		detail["emby_error"] = telegramAuditError(syncErr)
+	}
+	if reason != "" {
+		detail["reason"] = reason
+	}
+	a.auditEntryIP("telegram", opUID, opName, "banweb_via_telegram", "admin", target.UID, detail)
+}
+
+// telegramHandleBanEmby 单独禁用指定用户的 Emby 账号，不影响 Web 账号（可选理由）。
+// 用法：/banemby <用户名/UID/关键词> [理由]
+func (a *App) telegramHandleBanEmby(ctx context.Context, chatID, telegramID int64, args []string) {
+	if len(args) == 0 {
+		_ = a.telegramSendMessage(ctx, chatID, "请发送 /banemby <UID/完整用户名/Telegram ID/@用户名> [理由]")
+		return
+	}
+	query := args[0]
+	reason := ""
+	if len(args) > 1 {
+		reason = strings.TrimSpace(strings.Join(args[1:], " "))
+		if len(reason) > 200 {
+			reason = reason[:200]
+		}
+	}
+	target, ok := a.telegramResolveExactBanTarget(ctx, chatID, query)
+	if !ok {
+		return
+	}
+	if a.telegramProtectedTarget(target) {
+		_ = a.telegramSendMessage(ctx, chatID, "受保护账号禁止通过 Telegram 禁用 Emby。")
+		return
+	}
+	if target.EmbyID == "" {
+		_ = a.telegramSendMessage(ctx, chatID, "目标用户未绑定 Emby 账号。")
+		return
+	}
+	if !a.embyConfigured() {
+		_ = a.telegramSendMessage(ctx, chatID, "Emby URL 或 API Token 未配置，无法操作远端账号。")
+		return
+	}
+	if err := a.embyApplyEnabledState(ctx, target.UID, target.EmbyID, false); err != nil {
+		a.auditTelegramFailure(telegramID, "banemby_via_telegram", target.UID, err, map[string]any{"reason": reason})
+		_ = a.telegramSendMessage(ctx, chatID, "禁用 Emby 账号失败: "+telegramPanelSafeError(err))
+		return
+	}
+	_ = a.telegramSendMessage(ctx, chatID, "已禁用 Emby 账号（Web 账号保持不变）。")
+	// 审计日志
+	opUID, opName := a.telegramAdminIdentity(telegramID)
+	detail := map[string]any{"source": "telegram"}
+	if reason != "" {
+		detail["reason"] = reason
+	}
+	a.auditEntryIP("telegram", opUID, opName, "banemby_via_telegram", "admin", target.UID, detail)
+}
+
+// telegramResolveExactBanTarget 为 /banweb、/banemby 解析唯一目标。
+// 修复：原先用含邮箱、Emby 字段的模糊子串搜索，只命中一笔就直接停用——想封 bob
+// 却封到 bobby 或邮箱含 bob 的人。现在先用限缩字段的 SearchUsersByIdentity 取候选，
+// 再要求精确相等（UID、完整 Web 用户名、Telegram ID 或 @Telegram 用户名），
+// 恰好一个精确命中才执行；否则只列出候选，不做任何写入。
+func (a *App) telegramResolveExactBanTarget(ctx context.Context, chatID int64, query string) (store.User, bool) {
+	query = strings.TrimSpace(query)
+	candidates := a.store().SearchUsersByIdentity(query, store.UserIdentitySearchAny, 20)
+	lower := strings.ToLower(query)
+	tgName := strings.TrimPrefix(lower, "@")
+	exact := make([]store.User, 0, 2)
+	for _, u := range candidates {
+		if strconv.FormatInt(u.UID, 10) == query ||
+			strings.ToLower(u.Username) == lower ||
+			(u.TelegramID != 0 && strconv.FormatInt(u.TelegramID, 10) == query) ||
+			(tgName != "" && strings.ToLower(strings.TrimPrefix(strings.TrimSpace(u.TelegramUsername), "@")) == tgName) {
+			exact = append(exact, u)
+		}
+	}
+	switch {
+	case len(exact) == 1:
+		return exact[0], true
+	case len(exact) > 1:
+		_ = a.telegramSendMessage(ctx, chatID, "找到多个精确匹配项，请使用 UID 指定。\n\n"+telegramUserList(exact))
+	case len(candidates) > 0:
+		if len(candidates) > 6 {
+			candidates = candidates[:6]
+		}
+		_ = a.telegramSendMessage(ctx, chatID, "没有精确匹配的用户（需填写 UID、完整用户名、Telegram ID 或 @用户名）。相近结果：\n\n"+telegramUserList(candidates))
+	default:
+		_ = a.telegramSendMessage(ctx, chatID, "未找到匹配用户。")
+	}
+	return store.User{}, false
+}
+
+// telegramAdminIdentity 返回 Telegram 管理员在系统中的 UID 和 Username
+// （UID=0/Username="" 表示配置管理员未绑定面板账号）。
+func (a *App) telegramAdminIdentity(telegramID int64) (int64, string) {
+	if u, ok := a.store().FindUserByTelegramID(telegramID); ok {
+		return u.UID, u.Username
+	}
+	return 0, ""
+}
+
+func (a *App) telegramHandleGroupUser(ctx context.Context, chatID, telegramID int64, args []string, message *telegramMessage) {
+	if message == nil {
+		return
+	}
+	messageID := message.MessageID
+	query := strings.Join(args, " ")
+	anonymousCommand := telegramIsAnonymousGroupMessage(message)
+	if anonymousCommand {
+		a.telegramSendGroupAdminAuth(ctx, chatID, messageID, query, message)
+		return
+	}
+	if !a.telegramAdminID(telegramID) {
+		// 修复：同一 (chat, user) 30 秒内只提示一次，其余越权指令静默忽略。
+		if a.telegramPanelThrottle.allow(telegramCooldownKey("deny", chatID, telegramID), telegramUnauthorizedCooldown) {
+			a.telegramSendUnauthorizedAndCleanup(ctx, chatID, messageID)
+		}
+		return
+	}
+	resolution := a.telegramResolveGroupUserTargets(query, message)
+	if resolution.Reason != "" {
+		_ = a.telegramSendMessage(ctx, chatID, resolution.Reason)
+		return
+	}
+	if len(resolution.Users) > 1 {
+		if a.telegramSendGroupUserSelection(ctx, chatID, messageID, query, telegramReplyTelegramID(message), resolution) {
+			a.telegramDeleteGroupUserCommandMessage(ctx, chatID, messageID)
+		}
+		return
+	}
+	if a.telegramSendGroupUserPanel(ctx, chatID, messageID, resolution.Users[0], false) {
+		a.telegramDeleteGroupUserCommandMessage(ctx, chatID, messageID)
+	}
+}
+
+func (a *App) telegramAdminID(telegramID int64) bool {
+	if _, ok := a.telegramCommandConfigIndex().admins[telegramID]; ok {
+		return true
+	}
+	if u, okUser := a.store().FindUserByTelegramID(telegramID); okUser && u.Role == store.RoleAdmin {
+		return true
+	}
+	return false
+}
+
+func (a *App) telegramRequirePrivate(ctx context.Context, chatID int64, private bool) bool {
+	if private {
+		return true
+	}
+	_ = a.telegramSendMessage(ctx, chatID, "请私聊 Bot 使用该命令，避免泄露账号信息。")
+	return false
+}
+
+func telegramCommand(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if idx := strings.IndexByte(raw, '@'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	return strings.ToLower(raw)
+}
+
+func telegramParseCommandText(text string) (string, []string) {
+	text = strings.TrimSpace(text)
+	if text == "" || text[0] != '/' {
+		return "", nil
+	}
+	separator := strings.IndexFunc(text, unicode.IsSpace)
+	if separator < 0 {
+		return telegramCommand(text), nil
+	}
+	return telegramCommand(text[:separator]), strings.Fields(text[separator:])
+}
+
+func (a *App) telegramCustomCommandReply(command string) (string, bool) {
+	command = telegramCommand(command)
+	return a.telegramCustomCommandReplyNormalized(command)
+}
+
+func (a *App) telegramCustomCommandReplyNormalized(command string) (string, bool) {
+	if command == "" || !strings.HasPrefix(command, "/") {
+		return "", false
+	}
+	// 检查是否与内置指令冲突，冲突时拒绝自定义覆盖
+	if _, isBuiltIn := telegramCommandRegistry[command]; isBuiltIn {
+		return "", false
+	}
+	reply, ok := a.telegramCommandConfigIndex().custom[command]
+	return reply, ok
+}
+
+func (a *App) telegramStartText() string {
+	if text := strings.TrimSpace(a.cfg().TelegramBotStartText); text != "" {
+		return a.telegramRenderText(text)
+	}
+	title := firstNonEmpty(strings.TrimSpace(a.cfg().TelegramBotStartTitle), "Twilight Bot")
+	intro := firstNonEmpty(strings.TrimSpace(a.cfg().TelegramBotStartIntro), "用于绑定 Telegram、查看账号状态和接收服务通知。")
+	return strings.Join([]string{
+		title,
+		"",
+		intro,
+		"",
+		"常用命令:",
+		"/bind <绑定码> 绑定 Telegram",
+		"/me 查看当前绑定",
+		"/emby 查看 Emby 状态",
+		"/help 查看完整帮助",
+	}, "\n")
+}
+
+func (a *App) telegramGroupPrompt() string {
+	if text := strings.TrimSpace(a.cfg().TelegramBotGroupStartText); text != "" {
+		return a.telegramRenderText(text)
+	}
+	return "为避免泄露账号信息，请私聊 Bot 使用 /bind、/me、/emby 等账号命令。管理员可在群内使用 /twguser 打开用户管理面板。"
+}
+
+func (a *App) telegramBindPrompt() string {
+	if text := strings.TrimSpace(a.cfg().TelegramBotBindPromptText); text != "" {
+		return a.telegramRenderText(text)
+	}
+	return "请在网页点击「在 Telegram 中绑定」打开链接；或发送 /bind <绑定令牌>。链接需要先在 Web 端生成，有效期较短。"
+}
+
+func (a *App) telegramHelpText(admin bool) string {
+	if text := strings.TrimSpace(a.cfg().TelegramBotHelpText); text != "" {
+		return a.telegramRenderText(text)
+	}
+	lines := []string{}
+	if header := strings.TrimSpace(a.cfg().TelegramBotHelpHeader); header != "" {
+		lines = append(lines, a.telegramRenderText(header), "")
+	}
+	lines = append(lines,
+		"Twilight Bot 帮助",
+		"",
+		"用户命令:",
+	)
+	catalog := a.telegramCommandCatalog()
+	for _, item := range catalog {
+		if item.Admin || item.Category != "user" || item.Disabled {
+			continue
+		}
+		lines = append(lines, telegramCommandHelpLine(item))
+	}
+	if admin {
+		lines = append(lines, "", "管理员命令:")
+		for _, item := range catalog {
+			if !item.Admin || item.Category != "admin" || item.Disabled {
+				continue
+			}
+			lines = append(lines, telegramCommandHelpLine(item))
+		}
+	}
+	if footer := strings.TrimSpace(a.cfg().TelegramBotHelpFooter); footer != "" {
+		lines = append(lines, "", a.telegramRenderText(footer))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (a *App) telegramAdminHelpText() string {
+	if text := strings.TrimSpace(a.cfg().TelegramBotAdminHelpText); text != "" {
+		return a.telegramRenderText(text)
+	}
+	lines := []string{"管理员帮助", ""}
+	for _, item := range a.telegramCommandCatalog() {
+		if (!item.Admin && item.Category != "group") || item.Disabled {
+			continue
+		}
+		lines = append(lines, telegramCommandHelpLine(item))
+	}
+	lines = append(lines,
+		"",
+		"/twguser 回复群成员消息时按 Telegram 绑定关系查询",
+		"/twguser <关键词> 可模糊匹配 UID、Web 用户名、Telegram ID 和 Telegram 用户名",
+		"/twguser <值> uid|username|tgid|tgname 可限定查询字段；多结果时点击按钮选择",
+		"",
+		"/twguser 面板支持启用/禁用 Web 账号、启用/禁用 Emby、删除 Emby、本地删除用户、移出/封禁群组和授予 7/30/365 天或永久 Emby 注册资格。删除类操作需要二次确认；每次按钮操作都会重新鉴权。群组匿名管理员使用 /twguser 时需要先通过 inline 按钮验证身份。",
+	)
+	return strings.Join(lines, "\n")
+}
+
+func telegramCommandHelpLine(item telegramCommandCatalogItem) string {
+	usage := strings.TrimSpace(item.Usage)
+	if usage == "" {
+		usage = item.Label
+	}
+	desc := strings.TrimSpace(item.Description)
+	if desc == "" {
+		return usage
+	}
+	return usage + " " + desc
+}
+
+func (a *App) telegramAboutText() string {
+	if text := strings.TrimSpace(a.cfg().TelegramBotAbout); text != "" {
+		return a.telegramRenderText(text)
+	}
+	return a.cfg().AppName + "\n\nTelegram Bot 仅用于绑定、查询、统计和通知。不会通过 Telegram 展示密码、Token、Emby ID 或服务器线路。"
+}
+
+func (a *App) telegramRenderText(text string) string {
+	text = strings.ReplaceAll(text, "{server_name}", a.cfg().AppName)
+	text = strings.ReplaceAll(text, "{bot_username}", "")
+	text = strings.ReplaceAll(text, "{user_name}", "")
+	return text
+}
+
+func (a *App) telegramFindUsers(query string, limit int) []store.User {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	if limit <= 0 || limit > 20 {
+		limit = 20
+	}
+	return a.store().SearchUsers(query, limit)
+}
+
+func telegramUserSummary(u store.User) string {
+	return strings.Join([]string{
+		"账号: " + u.Username,
+		"UID: " + strconv.FormatInt(u.UID, 10),
+		"角色: " + roleName(u.Role),
+		"状态: " + telegramActiveLabel(u.Active),
+		"到期: " + expireStatus(u.ExpiredAt),
+		"Telegram: " + telegramBoundLabel(u.TelegramID != 0),
+		"Emby: " + telegramEmbyLabel(u),
+		"待开通 Emby: " + telegramYesNoLabel(u.PendingEmby),
+	}, "\n")
+}
+
+func telegramUserList(users []store.User) string {
+	lines := make([]string, 0, len(users))
+	for _, u := range users {
+		lines = append(lines, fmt.Sprintf("- UID %d / %s / %s / TG %s / Emby %s", u.UID, u.Username, roleName(u.Role), telegramBoundLabel(u.TelegramID != 0), telegramEmbyLabel(u)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func telegramActiveLabel(active bool) string {
+	if active {
+		return "启用"
+	}
+	return "禁用"
+}
+
+func telegramConfiguredLabel(ok bool) string {
+	if ok {
+		return "已配置"
+	}
+	return "未配置"
+}
+
+func telegramBoundLabel(ok bool) string {
+	if ok {
+		return "已绑定"
+	}
+	return "未绑定"
+}
+
+func telegramYesNoLabel(ok bool) string {
+	if ok {
+		return "是"
+	}
+	return "否"
+}
+
+func telegramEmbyLabel(u store.User) string {
+	if u.EmbyID != "" {
+		return "已绑定"
+	}
+	if u.PendingEmby {
+		return "待开通"
+	}
+	return "未绑定"
+}

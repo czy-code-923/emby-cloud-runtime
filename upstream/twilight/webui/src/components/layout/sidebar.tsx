@@ -1,0 +1,371 @@
+"use client";
+
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentType } from "react";
+import Image from "next/image";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { cn } from "@/lib/utils";
+import { useAuthStore } from "@/store/auth";
+import {
+  LayoutDashboard,
+  Film,
+  Settings,
+  Users,
+  FileText,
+  MessageSquare,
+  LogOut,
+  TestTube,
+  FileCode,
+  Database,
+  Server,
+  Megaphone,
+  TimerReset,
+  GitBranch,
+  Network,
+  Coins,
+  ScrollText,
+  ShieldAlert,
+  Mail,
+  ClipboardList,
+  BookOpen,
+  MessageSquareMore,
+  Shield,
+  Code2,
+  BarChart3,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { GithubProjectLink } from "@/components/github-project-link";
+import { LocaleSwitcher } from "@/components/locale-switcher";
+import { ThemeSwitcher } from "@/components/theme-switcher";
+import { api } from "@/lib/api";
+import { useI18n, type MessageKey } from "@/lib/i18n";
+import { SITE_NAME } from "@/lib/site-config";
+import { useRegionRefresh } from "@/hooks/use-region-refresh";
+import { RegionRefreshKeys } from "@/lib/region-refresh";
+import { useSystemStore } from "@/store/system";
+import { sanitizeImageUrl } from "@/lib/safe-url";
+
+export interface SidebarNavItem {
+  href: string;
+  labelKey?: MessageKey;
+  label?: string;
+  icon: ComponentType<{ className?: string }>;
+  category?: string;
+}
+
+export interface SidebarNavGroup {
+  category: string;
+  items: SidebarNavItem[];
+}
+
+export const userNavItems: SidebarNavItem[] = [
+  { href: "/dashboard", labelKey: "navigation.dashboard", icon: LayoutDashboard },
+  { href: "/announcements", labelKey: "navigation.announcements", icon: Megaphone },
+  { href: "/tickets", labelKey: "navigation.tickets", icon: MessageSquareMore },
+  { href: "/media", labelKey: "navigation.mediaRequest", icon: Film },
+  { href: "/bangumi", labelKey: "navigation.bangumi", icon: BookOpen },
+  { href: "/playrank", labelKey: "navigation.playRank", icon: BarChart3 },
+  { href: "/score", labelKey: "navigation.signin", icon: Coins },
+  { href: "/invite", labelKey: "navigation.inviteCenter", icon: GitBranch },
+  { href: "/settings", labelKey: "navigation.settings", icon: Settings },
+];
+
+export const adminNavItems: SidebarNavItem[] = [
+  { href: "/admin", labelKey: "navigation.adminHome", icon: LayoutDashboard },
+  { href: "/admin/users", labelKey: "navigation.users", icon: Users },
+  { href: "/admin/regcodes", labelKey: "navigation.regcodes", icon: FileText },
+  { href: "/admin/invite", labelKey: "navigation.inviteForest", icon: Network },
+
+  { href: "/admin/emby", labelKey: "navigation.embyAdmin", icon: Server, category: "service" },
+  { href: "/admin/playrank", labelKey: "navigation.playRankAdmin", icon: BarChart3, category: "service" },
+  { href: "/admin/bangumi", labelKey: "navigation.bangumiAdmin", icon: BookOpen, category: "service" },
+  { href: "/admin/email", labelKey: "navigation.emailAdmin", icon: Mail, category: "service" },
+  { href: "/admin/telegram", labelKey: "navigation.telegramAdmin", icon: MessageSquare, category: "service" },
+
+  { href: "/admin/announcements", labelKey: "navigation.adminAnnouncements", icon: Megaphone, category: "content" },
+  { href: "/admin/tickets", labelKey: "navigation.adminTickets", icon: MessageSquareMore, category: "content" },
+  { href: "/admin/requests", labelKey: "navigation.requestReview", icon: Film, category: "content" },
+
+  { href: "/admin/security", labelKey: "navigation.securityCenter", icon: Shield, category: "security" },
+  { href: "/admin/audit-logs", labelKey: "navigation.auditLogs", icon: ClipboardList, category: "security" },
+  { href: "/admin/violations", labelKey: "navigation.violations", icon: ShieldAlert, category: "security" },
+
+  { href: "/admin/config", labelKey: "navigation.configAdmin", icon: FileCode, category: "system" },
+  { href: "/admin/database", labelKey: "navigation.databaseBackup", icon: Database, category: "system" },
+  { href: "/admin/scheduler", labelKey: "navigation.scheduler", icon: TimerReset, category: "system" },
+  { href: "/admin/logs", labelKey: "navigation.runtimeLogs", icon: ScrollText, category: "system" },
+  { href: "/admin/test", labelKey: "navigation.serverInfo", icon: TestTube, category: "system" },
+  { href: "/admin/developer", labelKey: "navigation.developerMode", icon: Code2, category: "system" },
+];
+
+export const adminCategoryLabelKeys: Record<string, MessageKey> = {
+  service: "navigation.catService",
+  content: "navigation.catContent",
+  security: "navigation.catSecurity",
+  system: "navigation.catSystem",
+};
+
+export function groupNavItems(items: SidebarNavItem[]): SidebarNavGroup[] {
+  const groups: SidebarNavGroup[] = [];
+  for (const navItem of items) {
+    const category = navItem.category || "";
+    const current = groups[groups.length - 1];
+    if (!current || current.category !== category) {
+      groups.push({ category, items: [navItem] });
+      continue;
+    }
+    current.items.push(navItem);
+  }
+  return groups;
+}
+
+// isAdmin 影响排行榜入口：普通用户开关关闭时管理员仍要能看到用户侧榜单，
+// 便于确认普通用户看到的是什么（管理后台另有含 UID 的完整榜单）。
+export function filterNavItems(
+  items: SidebarNavItem[],
+  features?: Record<string, boolean> | null,
+  isAdmin = false,
+) {
+  return items.filter((item) => {
+    if (features?.media_request === false && item.href === "/media") {
+      return false;
+    }
+    if (item.href === "/playrank" && (features?.play_rank === false || (features?.play_rank_user === false && !isAdmin))) {
+      return false;
+    }
+    if (features?.signin === false && item.href === "/score") {
+      return false;
+    }
+    // 邀请中心只在邀请系统开启时才有内容；管理员的“邀请森林”走 /admin/invite，
+    // 不受这条限制——后台仍要能看到配置页。
+    if (features?.invite === false && item.href === "/invite") {
+      return false;
+    }
+    if (item.href === "/bangumi" && features?.bangumi_sync === false && features?.bangumi_manage === false) {
+      return false;
+    }
+    if (features?.ticket_system === false && (item.href === "/tickets" || item.href === "/admin/tickets")) {
+      return false;
+    }
+    if (features?.developer_mode === false && item.href === "/admin/developer") {
+      return false;
+    }
+    return true;
+  });
+}
+
+export function isActivePath(pathname: string, href: string) {
+  if (href === "/admin") return pathname === "/admin";
+  if (href === "/admin/telegram") {
+    return pathname === href || pathname.startsWith(`${href}/`) || pathname.startsWith("/admin/telegram-rebind-requests");
+  }
+  if (href === "/admin/security") {
+    return pathname === href || pathname.startsWith(`${href}/`);
+  }
+  if (href === "/admin/emby") {
+    return pathname === href || pathname.startsWith(`${href}/`) || pathname.startsWith("/admin/device-audit");
+  }
+  return pathname === href || pathname.startsWith(`${href}/`);
+}
+
+export function Sidebar() {
+  const pathname = usePathname();
+  const { t } = useI18n();
+  const user = useAuthStore((s) => s.user);
+  const logout = useAuthStore((s) => s.logout);
+  const isAdmin = user?.role === 0;
+  const [profileAvatar, setProfileAvatar] = useState<string | null>(user?.avatar || null);
+  const systemInfo = useSystemStore((s) => s.info);
+  const activeLinkRef = useRef<HTMLAnchorElement | null>(null);
+
+  const loadProfileAvatar = useCallback(async () => {
+    if (!user?.uid) {
+      setProfileAvatar(null);
+      return;
+    }
+
+    try {
+      if (user.avatar) {
+        setProfileAvatar(user.avatar);
+        return;
+      }
+      const res = await api.getUserAvatar(user.uid);
+      if (res.success) {
+        setProfileAvatar(res.data?.avatar || user.avatar || null);
+      } else {
+        setProfileAvatar(user.avatar || null);
+      }
+    } catch {
+      setProfileAvatar(user.avatar || null);
+    }
+  }, [user?.uid, user?.avatar]);
+
+  useEffect(() => {
+    setProfileAvatar(user?.avatar || null);
+    void loadProfileAvatar();
+  }, [user?.avatar, loadProfileAvatar]);
+
+  useRegionRefresh(
+    RegionRefreshKeys.UserProfile,
+    useCallback(() => {
+      void loadProfileAvatar();
+    }, [loadProfileAvatar])
+  );
+
+  const displaySiteName = systemInfo?.name || SITE_NAME;
+  const envIcon = process.env.NEXT_PUBLIC_AUTH_ICON_URL?.trim();
+  const safeSystemIcon = useMemo(() => sanitizeImageUrl(envIcon || systemInfo?.icon), [envIcon, systemInfo?.icon]);
+  const safeProfileAvatar = useMemo(() => sanitizeImageUrl(profileAvatar), [profileAvatar]);
+  const visibleUserNavItems = useMemo(
+    () => filterNavItems(userNavItems, systemInfo?.features, isAdmin),
+    [isAdmin, systemInfo?.features],
+  );
+  const visibleAdminNavItems = useMemo(
+    () => filterNavItems(adminNavItems, systemInfo?.features),
+    [systemInfo?.features],
+  );
+  const visibleAdminNavGroups = useMemo(
+    () => groupNavItems(visibleAdminNavItems),
+    [visibleAdminNavItems],
+  );
+
+  useEffect(() => {
+    const activeLink = activeLinkRef.current;
+    if (!activeLink) return;
+    const frame = window.requestAnimationFrame(() => {
+      activeLink.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [pathname]);
+
+  return (
+    <aside className="fixed inset-y-0 left-0 z-40 hidden w-72 p-4 lg:block">
+      <div className="sidebar-surface h-full">
+        <div className="sidebar-brand">
+          {safeSystemIcon ? (
+            <Image
+              src={safeSystemIcon}
+              alt={displaySiteName}
+              width={40}
+              height={40}
+              className="h-10 w-10 rounded-xl object-cover"
+              unoptimized
+              referrerPolicy="no-referrer"
+            />
+          ) : (
+            <div className="brand-logo">{displaySiteName.slice(0, 2).toUpperCase()}</div>
+          )}
+          <div>
+            <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{t("navigation.mediaOps")}</p>
+            <h2 className="text-lg font-semibold">{displaySiteName}</h2>
+          </div>
+        </div>
+
+        <nav className="sidebar-nav">
+          <p className="sidebar-label">{t("navigation.userMenu")}</p>
+          <Fragment>
+            {visibleUserNavItems.map((item) => {
+              const active = isActivePath(pathname, item.href);
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  prefetch={false}
+                  ref={active ? activeLinkRef : undefined}
+                  aria-current={active ? "page" : undefined}
+                  className={cn("sidebar-link", active && "sidebar-link-active")}
+                >
+                  {active && (
+                    <span className="sidebar-active-bg animate-in fade-in duration-150" />
+                  )}
+                  <item.icon className="relative z-10 h-4 w-4 shrink-0" />
+                  <span className="relative z-10">{item.label || (item.labelKey ? t(item.labelKey) : "")}</span>
+                  {active && (
+                    <span className="sidebar-dot animate-in fade-in duration-150" />
+                  )}
+                </Link>
+              );
+            })}
+          </Fragment>
+          {isAdmin && (
+            <>
+              <p className="sidebar-label mt-5">{t("navigation.adminMenu")}</p>
+              <Fragment>
+                {visibleAdminNavGroups.map((group) => (
+                  <Fragment key={group.category || "account"}>
+                    {group.category && (
+                      <p className="px-3 pb-1 pt-3 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/50">
+                        {adminCategoryLabelKeys[group.category]
+                          ? t(adminCategoryLabelKeys[group.category])
+                          : group.category}
+                      </p>
+                    )}
+                    {group.items.map((item) => {
+                      const active = isActivePath(pathname, item.href);
+                      return (
+                        <Link
+                          key={item.href}
+                          href={item.href}
+                          prefetch={false}
+                          ref={active ? activeLinkRef : undefined}
+                          aria-current={active ? "page" : undefined}
+                          className={cn("sidebar-link", active && "sidebar-link-active")}
+                        >
+                          {active && <span className="sidebar-active-bg animate-in fade-in duration-150" />}
+                          <item.icon className="relative z-10 h-4 w-4 shrink-0" />
+                          <span className="relative z-10">{item.label || (item.labelKey ? t(item.labelKey) : "")}</span>
+                          {active && <span className="sidebar-dot animate-in fade-in duration-150" />}
+                        </Link>
+                      );
+                    })}
+                  </Fragment>
+                ))}
+              </Fragment>
+            </>
+          )}
+        </nav>
+
+        <div className="sidebar-footer">
+          <GithubProjectLink className="w-full" />
+
+          <div className="profile-card">
+            <Avatar className="h-10 w-10 border border-border/60">
+              {safeProfileAvatar && <AvatarImage src={safeProfileAvatar} alt={user?.username} referrerPolicy="no-referrer" />}
+              <AvatarFallback className="bg-primary/15 text-primary text-xs font-semibold">
+                {user?.username?.slice(0, 2).toUpperCase() || "U"}
+              </AvatarFallback>
+            </Avatar>
+            <div className="min-w-0">
+              <p className="truncate text-sm font-medium">{user?.username}</p>
+              <p className="truncate text-xs text-muted-foreground">{user?.role_name}</p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.5rem] gap-2">
+            <ThemeSwitcher
+              align="start"
+              className="h-10 justify-start overflow-hidden rounded-full border-border/70 bg-background/60 px-3 transition-all hover:bg-primary/10 hover:text-primary"
+            />
+            <LocaleSwitcher
+              align="start"
+              className="h-10 justify-start overflow-hidden rounded-full border-border/70 bg-background/60 px-3 transition-all hover:bg-primary/10 hover:text-primary"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="h-10 rounded-full border-border/70 bg-background/60 transition-all hover:bg-destructive/10 hover:text-destructive"
+              onClick={() => void logout()}
+              title={t("common.logout")}
+              aria-label={t("common.logout")}
+            >
+              <LogOut className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      </div>
+    </aside>
+  );
+}

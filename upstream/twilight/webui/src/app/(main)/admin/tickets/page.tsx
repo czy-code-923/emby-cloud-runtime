@@ -1,0 +1,578 @@
+"use client";
+
+import { useState, useCallback, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import {
+  MessageSquareMore, Loader2, Trash2, Edit2, AlertCircle, Clock, User,
+  CheckCircle2, Archive, RotateCcw, PlayCircle, Plus, Pencil, Settings2, RefreshCw,
+  ArrowRight, MoreHorizontal, ShieldAlert, Image as ImageIcon,
+} from "lucide-react";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { useToast } from "@/hooks/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
+import { useAsyncResource } from "@/hooks/use-async-resource";
+import { api, type Ticket } from "@/lib/api";
+import { useI18n } from "@/lib/i18n";
+const ADMIN_TICKET_PAGE_SIZE = 20;
+
+const STATUS_MAP: Record<string, { labelKey: string; className: string; icon: typeof AlertCircle }> = {
+  open: { labelKey: "tickets.statusOpen", className: "bg-warning/10 text-warning border-warning/30", icon: AlertCircle },
+  in_progress: { labelKey: "tickets.statusInProgress", className: "bg-info/10 text-info border-info/30", icon: PlayCircle },
+  resolved: { labelKey: "tickets.statusResolved", className: "bg-success/10 text-success border-success/30", icon: CheckCircle2 },
+  closed: { labelKey: "tickets.statusClosed", className: "bg-muted text-muted-foreground border-muted", icon: Archive },
+};
+
+const PRIORITY_MAP: Record<string, { labelKey: string; className: string }> = {
+  low: { labelKey: "tickets.priorityLow", className: "bg-muted text-muted-foreground" },
+  medium: { labelKey: "tickets.priorityMedium", className: "bg-info/10 text-info" },
+  high: { labelKey: "tickets.priorityHigh", className: "bg-warning/10 text-warning" },
+  urgent: { labelKey: "tickets.priorityUrgent", className: "bg-destructive/10 text-destructive" },
+};
+
+const DEFAULT_TYPES = [
+  { value: "all", labelKey: "tickets.typeAll" },
+];
+
+export default function AdminTicketsPage() {
+  const { toast } = useToast();
+  const { confirm } = useConfirm();
+  const { t } = useI18n();
+  const router = useRouter();
+
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [typeFilter, setTypeFilter] = useState("all");
+  const [priorityFilter, setPriorityFilter] = useState("all");
+  const [page, setPage] = useState(1);
+  const [jumpId, setJumpId] = useState("");
+
+  const [editOpen, setEditOpen] = useState(false);
+  const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
+  const [editStatus, setEditStatus] = useState("");
+  const [editPriority, setEditPriority] = useState("");
+  const [editType, setEditType] = useState("");
+  const [editNote, setEditNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [busyTicketId, setBusyTicketId] = useState<number | null>(null);
+
+  // 工单类型管理
+  const [typeMgmtOpen, setTypeMgmtOpen] = useState(false);
+  const [typeMgmtTypes, setTypeMgmtTypes] = useState<string[]>([]);
+  const [newTypeName, setNewTypeName] = useState("");
+  const [editingTypeName, setEditingTypeName] = useState<string | null>(null);
+  const [editTypeValue, setEditTypeValue] = useState("");
+  const [typeMgmtSaving, setTypeMgmtSaving] = useState(false);
+
+  const refreshTypeMgmtTypes = async () => {
+    try {
+      const res = await api.adminGetTicketTypes();
+      if (res.success && res.data) setTypeMgmtTypes(res.data.types);
+    } catch { /* ignore */ }
+  };
+
+  const handleAddType = async () => {
+    const name = newTypeName.trim();
+    if (!name) return;
+    setTypeMgmtSaving(true);
+    try {
+      const res = await api.adminAddTicketType(name);
+      if (res.success) { toast({ title: t("adminTickets.typeAdded") }); setNewTypeName(""); await reload(); await refreshTypeMgmtTypes(); }
+      else toast({ title: res.message, variant: "destructive" });
+    } catch (err: any) { toast({ title: err?.message || t("common.networkError"), variant: "destructive" }); }
+    finally { setTypeMgmtSaving(false); }
+  };
+
+  const handleDeleteType = async (name: string) => {
+    const ok = await confirm({ title: t("adminTickets.deleteTypeTitle"), description: t("adminTickets.deleteTypeDesc", { name }), tone: "danger", confirmLabel: t("common.delete") });
+    if (!ok) return;
+    try {
+      const res = await api.adminDeleteTicketType(name);
+      if (res.success) { toast({ title: t("adminTickets.typeDeleted") }); await reload(); await refreshTypeMgmtTypes(); }
+      else toast({ title: res.message, variant: "destructive" });
+    } catch (err: any) { toast({ title: err?.message || t("common.networkError"), variant: "destructive" }); }
+  };
+
+  const handleRenameType = async () => {
+    if (!editingTypeName || !editTypeValue.trim()) return;
+    setTypeMgmtSaving(true);
+    try {
+      const res = await api.adminRenameTicketType(editingTypeName, editTypeValue.trim());
+      if (res.success) { toast({ title: t("adminTickets.typeRenamed") }); setEditingTypeName(null); setEditTypeValue(""); await reload(); await refreshTypeMgmtTypes(); }
+      else toast({ title: res.message, variant: "destructive" });
+    } catch (err: any) { toast({ title: err?.message || t("common.networkError"), variant: "destructive" }); }
+    finally { setTypeMgmtSaving(false); }
+  };
+
+  const loadTickets = useCallback(async (signal?: AbortSignal) => {
+    const res = await api.adminListTickets({
+      all: statusFilter === "all",
+      status: statusFilter !== "all" ? statusFilter : undefined,
+      type: typeFilter !== "all" ? typeFilter : undefined,
+      priority: priorityFilter !== "all" ? priorityFilter : undefined,
+      page,
+      per_page: ADMIN_TICKET_PAGE_SIZE,
+    }, signal);
+    if (res.success && res.data) {
+      return {
+        tickets: res.data.tickets,
+        total: res.data.total || 0,
+        page: res.data.page || page,
+        perPage: res.data.per_page || ADMIN_TICKET_PAGE_SIZE,
+        types: res.data.ticket_types || [],
+      };
+    }
+    throw new Error(res.message || t("common.networkError"));
+  }, [page, statusFilter, typeFilter, priorityFilter, t]);
+
+  const { data, isLoading, error, execute: reload } = useAsyncResource(loadTickets, { immediate: true });
+
+  const openEdit = (ticket: Ticket) => { setEditingTicket(ticket); setEditStatus(ticket.status); setEditPriority(ticket.priority); setEditType(ticket.type); setEditNote(ticket.admin_note || ""); setEditOpen(true); };
+  const openConversation = (id: number) => router.push(`/admin/tickets/${id}`);
+
+  const handleJump = () => {
+    const id = Number(jumpId.trim());
+    if (!Number.isInteger(id) || id <= 0) {
+      toast({ title: t("adminTickets.invalidTicketId"), variant: "destructive" });
+      return;
+    }
+    openConversation(id);
+  };
+
+  const handleSave = async () => {
+    if (!editingTicket) return;
+    // 只提交相对原值真正改动的字段：后端按 patch 语义处理，未提交的字段保持最新落库值不变，
+    // 两个管理员并发各改一字段时不会用陈旧快照回退对方的改动。
+    const payload: { status?: string; priority?: string; type?: string; admin_note?: string } = {};
+    if (editStatus !== editingTicket.status) payload.status = editStatus;
+    if (editPriority !== editingTicket.priority) payload.priority = editPriority;
+    if (editType !== editingTicket.type) payload.type = editType;
+    if (editNote.trim() !== (editingTicket.admin_note || "")) payload.admin_note = editNote.trim();
+    if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
+    setSaving(true);
+    try {
+      const res = await api.adminUpdateTicket(editingTicket.id, payload);
+      if (res.success) { toast({ title: t("adminTickets.updated") }); setEditOpen(false); await reload(); }
+      else toast({ title: res.message, variant: "destructive" });
+    } catch (err: any) { toast({ title: err?.message || t("common.networkError"), variant: "destructive" }); }
+    finally { setSaving(false); }
+  };
+
+  const quickStatus = async (ticket: Ticket, status: string) => {
+    // 只发 status：不再顺手回传 admin_note（patch 语义下未提供即「不动此字段」），
+    // 避免用列表行里的陈旧备注覆盖他人刚在详情页保存的内部备注。
+    if (status === ticket.status) return;
+    setBusyTicketId(ticket.id);
+    try {
+      const res = await api.adminUpdateTicket(ticket.id, { status });
+      if (res.success) { toast({ title: t("adminTickets.updated") }); await reload(); }
+      else toast({ title: res.message, variant: "destructive" });
+    } catch (err: any) { toast({ title: err?.message || t("common.networkError"), variant: "destructive" }); }
+    finally { setBusyTicketId(null); }
+  };
+
+  const handleDelete = async (id: number) => {
+    const ok = await confirm({ title: t("adminTickets.deleteConfirmTitle"), description: t("adminTickets.deleteConfirmDescription"), tone: "danger", confirmLabel: t("common.delete") });
+    if (!ok) return;
+    setBusyTicketId(id);
+    try { const res = await api.adminDeleteTicket(id); if (res.success) { toast({ title: t("adminTickets.deleted") }); await reload(); } else toast({ title: res.message, variant: "destructive" }); }
+    catch (err: any) { toast({ title: err?.message || t("common.networkError"), variant: "destructive" }); }
+    finally { setBusyTicketId(null); }
+  };
+
+  const types = Array.isArray(data?.types) && data.types.length ? data.types : DEFAULT_TYPES.map((d) => d.value);
+  const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
+  const totalTickets = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(totalTickets / ADMIN_TICKET_PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+  const updateStatusFilter = (value: string) => {
+    setPage(1);
+    setStatusFilter(value);
+  };
+  const updateTypeFilter = (value: string) => {
+    setPage(1);
+    setTypeFilter(value);
+  };
+  const updatePriorityFilter = (value: string) => {
+    setPage(1);
+    setPriorityFilter(value);
+  };
+  const hasFilters = statusFilter !== "all" || typeFilter !== "all" || priorityFilter !== "all";
+  const resetFilters = () => {
+    setPage(1);
+    setStatusFilter("all");
+    setTypeFilter("all");
+    setPriorityFilter("all");
+  };
+  const typeLabelFor = (value: string) => {
+    const known = DEFAULT_TYPES.find((d) => d.value === value);
+    return known ? t(known.labelKey as any) : value;
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold flex items-center gap-2"><MessageSquareMore className="h-5 w-5" />{t("adminTickets.title")}</h1>
+        <p className="text-sm text-muted-foreground mt-1">{t("adminTickets.description")}</p>
+      </div>
+
+      {/* 筛选与操作分成两行：原先是一串 7 列的 xl 网格，前四列的最小宽度加起来
+          就超过多数屏幕的可用宽度，按钮会被挤出容器产生横向滚动。 */}
+      <div className="space-y-3">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <Select value={statusFilter} onValueChange={updateStatusFilter}>
+            <SelectTrigger className="w-full"><SelectValue placeholder={t("adminTickets.filterAll")} /></SelectTrigger>
+            <SelectContent>{Object.entries(STATUS_MAP).map(([v, s]) => <SelectItem key={v} value={v}>{t(s.labelKey as any)}</SelectItem>)}<SelectItem value="all">{t("adminTickets.filterAll")}</SelectItem></SelectContent>
+          </Select>
+          <Select value={typeFilter} onValueChange={updateTypeFilter}>
+            <SelectTrigger className="w-full"><SelectValue placeholder={t("adminTickets.filterAllTypes")} /></SelectTrigger>
+            <SelectContent><SelectItem value="all">{t("adminTickets.filterAllTypes")}</SelectItem>
+              {types.map((tp: string) => <SelectItem key={tp} value={tp}>{typeLabelFor(tp)}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Select value={priorityFilter} onValueChange={updatePriorityFilter}>
+            <SelectTrigger className="w-full"><SelectValue placeholder={t("adminTickets.filterAllPriorities")} /></SelectTrigger>
+            <SelectContent><SelectItem value="all">{t("adminTickets.filterAllPriorities")}</SelectItem>
+              {Object.entries(PRIORITY_MAP).map(([v, p]) => <SelectItem key={v} value={v}>{t(p.labelKey as any)}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <form
+            className="flex min-w-0 flex-1 gap-2 sm:max-w-[18rem]"
+            onSubmit={(event) => {
+              event.preventDefault();
+              handleJump();
+            }}
+          >
+            <Input
+              value={jumpId}
+              onChange={(event) => setJumpId(event.target.value)}
+              inputMode="numeric"
+              placeholder={t("adminTickets.jumpPlaceholder")}
+              className="min-w-0"
+            />
+            <Button type="submit" variant="outline" size="icon" className="h-10 w-10 shrink-0" title={t("adminTickets.jump")} aria-label={t("adminTickets.jump")}>
+              <ArrowRight className="h-4 w-4" />
+            </Button>
+          </form>
+          <span className="text-xs text-muted-foreground">{t("adminTickets.total", { count: totalTickets })}</span>
+          {hasFilters ? (
+            <Button variant="ghost" size="sm" onClick={resetFilters}>
+              <RotateCcw className="mr-1 h-3.5 w-3.5" />{t("adminTickets.resetFilters")}
+            </Button>
+          ) : null}
+          <div className="ml-auto flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={async () => {
+              try {
+                const res = await api.adminGetTicketTypes();
+                setTypeMgmtTypes(res.success && res.data ? res.data.types : []);
+              } catch { setTypeMgmtTypes([]); }
+              setTypeMgmtOpen(true);
+            }}><Settings2 className="mr-1 h-3.5 w-3.5" />{t("adminTickets.manageTypes")}</Button>
+            <Button variant="outline" size="sm" onClick={() => void reload().catch(() => undefined)} disabled={isLoading}>
+              <RefreshCw className={`mr-1 h-3.5 w-3.5 ${isLoading ? "animate-spin" : ""}`} />{t("common.refresh")}
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {error ? (
+      <Card className="border-destructive/40"><CardContent className="p-6 text-center space-y-3"><AlertCircle className="h-8 w-8 mx-auto text-destructive" /><p className="text-sm">{error}</p><Button variant="outline" size="sm" onClick={() => void reload().catch(() => undefined)}>{t("common.retry")}</Button></CardContent></Card>
+      ) : isLoading && !data ? (
+        <Card className="border-dashed"><CardContent className="p-8 text-center"><Loader2 className="h-6 w-6 mx-auto animate-spin text-muted-foreground" /></CardContent></Card>
+      ) : tickets.length === 0 ? (
+        <Card className="border-dashed"><CardContent className="p-8 text-center"><MessageSquareMore className="h-10 w-10 mx-auto text-muted-foreground mb-2 opacity-40" /><p className="font-medium">{t("adminTickets.noTickets")}</p><p className="text-xs text-muted-foreground mt-1">{t("adminTickets.noTicketsHint")}</p></CardContent></Card>
+      ) : (
+        <div className="space-y-4">
+          {tickets.map((ticket: Ticket) => {
+            const s = STATUS_MAP[ticket.status] || STATUS_MAP.open;
+            const p = PRIORITY_MAP[ticket.priority] || PRIORITY_MAP.medium;
+            const typeLabel = ticket.type ? typeLabelFor(ticket.type) : "";
+            const SI = s.icon;
+            const isClosed = ticket.status === "closed";
+            return (
+              <Card key={ticket.id} className={isClosed ? "opacity-70" : ""}>
+                <CardContent className="space-y-3 p-4 sm:p-5">
+                  <div className="flex items-start justify-between gap-3 flex-wrap">
+                    <div className="flex-1 min-w-0 space-y-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <Badge variant="outline" className={`text-[10px] gap-1 ${s.className}`}><SI className="h-3 w-3" />{t(s.labelKey as any)}</Badge>
+                        <Badge variant="outline" className={`text-[10px] ${p.className}`}>{t(p.labelKey as any)}</Badge>
+                        {typeLabel && <Badge variant="secondary" className="text-[10px]">{typeLabel}</Badge>}
+                        <Badge variant="secondary" className="text-[10px] font-mono">#{ticket.id}</Badge>
+                      </div>
+                      <p className="text-xs text-muted-foreground flex items-center gap-1"><User className="h-3 w-3" />{ticket.username} (UID: {ticket.uid})</p>
+                      <button className="block min-w-0 text-left" onClick={() => openConversation(ticket.id)}>
+                        <h3 className="font-bold text-base hover:underline">{ticket.title}</h3>
+                      </button>
+                    </div>
+                    <div className="flex w-full shrink-0 flex-wrap gap-2 sm:w-auto">
+                      <Button variant="default" size="sm" className="min-h-9 flex-1 text-xs sm:flex-none" onClick={() => openConversation(ticket.id)}>
+                        <MessageSquareMore className="h-3.5 w-3.5 mr-1" />{t("adminTickets.openConversation")}
+                      </Button>
+                      <Button variant="outline" size="sm" className="min-h-9 flex-1 text-xs sm:flex-none" onClick={() => openEdit(ticket)}>
+                        <Edit2 className="mr-1 h-3.5 w-3.5" />{t("adminTickets.editTitle")}
+                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="outline"
+                            size="icon"
+                            className="h-9 w-9 shrink-0"
+                            disabled={busyTicketId === ticket.id}
+                            aria-label={t("adminTickets.moreActions")}
+                            title={t("adminTickets.moreActions")}
+                          >
+                            {busyTicketId === ticket.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-52">
+                          {ticket.status === "open" && (
+                            <DropdownMenuItem onClick={() => void quickStatus(ticket, "in_progress")}>
+                              <PlayCircle className="h-4 w-4" />{t("adminTickets.markInProgress")}
+                            </DropdownMenuItem>
+                          )}
+                          {(ticket.status === "open" || ticket.status === "in_progress") && (
+                            <DropdownMenuItem onClick={() => void quickStatus(ticket, "resolved")}>
+                              <CheckCircle2 className="h-4 w-4" />{t("adminTickets.markResolved")}
+                            </DropdownMenuItem>
+                          )}
+                          {ticket.status !== "closed" ? (
+                            <DropdownMenuItem onClick={() => void quickStatus(ticket, "closed")}>
+                              <Archive className="h-4 w-4" />{t("adminTickets.closeTicket")}
+                            </DropdownMenuItem>
+                          ) : (
+                            <DropdownMenuItem onClick={() => void quickStatus(ticket, "open")}>
+                              <RotateCcw className="h-4 w-4" />{t("adminTickets.reopenTicket")}
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => void handleDelete(ticket.id)}>
+                            <Trash2 className="h-4 w-4" />{t("common.delete")}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  </div>
+
+                  <div className="line-clamp-3 rounded-lg border border-border/50 bg-muted/30 p-3 text-sm whitespace-pre-wrap break-words">
+                    {ticket.content}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                    <span className="flex items-center gap-1">
+                      <MessageSquareMore className="h-3.5 w-3.5" />
+                      {t("adminTickets.replyCount", { count: ticket.reply_count ?? ticket.replies?.length ?? 0 })}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <ImageIcon className="h-3.5 w-3.5" />
+                      {t("adminTickets.imageCount", { count: ticket.attachment_count ?? ticket.attachments?.length ?? 0 })}
+                    </span>
+                  </div>
+
+                  {/* 内部备注独占一行：挤在计数旁边会被 flex-1 压成半截，还容易和
+                      工单正文混在一起。 */}
+                  {ticket.admin_note && (
+                    <p className="line-clamp-2 rounded-md border border-dashed border-border/70 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                      {t("adminTickets.adminNoteSummary", { note: ticket.admin_note })}
+                    </p>
+                  )}
+
+                  {/* 每个时间戳都带标签：原来只有一个裸的时间串跟在 "·" 后面，
+                      看不出那是创建时间还是更新时间。 */}
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                    <span className="flex items-center gap-1">
+                      <Clock className="h-3 w-3" />
+                      {t("tickets.createdAt", { time: new Date(ticket.created_at * 1000).toLocaleString() })}
+                    </span>
+                    {ticket.updated_at !== ticket.created_at && (
+                      <span>{t("tickets.updatedAt", { time: new Date(ticket.updated_at * 1000).toLocaleString() })}</span>
+                    )}
+                    {ticket.resolved_at && ticket.resolved_at > 0 && (
+                      <span className="text-success">{t("tickets.resolvedAt", { time: new Date(ticket.resolved_at * 1000).toLocaleString() })}</span>
+                    )}
+                    {isClosed && ticket.closed_at && ticket.closed_at > 0 && (
+                      <span>{t("tickets.closedAt", { time: new Date(ticket.closed_at * 1000).toLocaleString() })}</span>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
+      {totalPages > 1 && (
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setPage((value) => Math.max(1, value - 1))}
+            disabled={isLoading || currentPage <= 1}
+          >
+            {t("common.previousPage")}
+          </Button>
+          <span className="min-w-[6rem] text-center text-xs text-muted-foreground">
+            {t("common.pageStatus", { page: currentPage, pages: totalPages })}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setPage((value) => Math.min(totalPages, value + 1))}
+            disabled={isLoading || currentPage >= totalPages}
+          >
+            {t("common.nextPage")}
+          </Button>
+        </div>
+      )}
+
+      {/* Edit Dialog */}
+      <Dialog open={editOpen} onOpenChange={setEditOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("adminTickets.editTitle")}</DialogTitle>
+            <DialogDescription>
+              <span className="block font-medium text-sm text-foreground">{editingTicket?.title}</span>
+              <span className="text-xs text-muted-foreground">{editingTicket?.username} · #{editingTicket?.id}</span>
+            </DialogDescription>
+          </DialogHeader>
+          {editingTicket && (
+            <div className="space-y-4">
+              <div className="custom-scrollbar max-h-32 overflow-y-auto overscroll-contain rounded-lg border bg-muted/30 p-3 text-sm whitespace-pre-wrap break-words">
+                {editingTicket.content}
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                <div className="space-y-2"><Label>{t("adminTickets.changeStatus")}</Label>
+                  <Select value={editStatus} onValueChange={setEditStatus}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>{Object.entries(STATUS_MAP).map(([v, st]) => <SelectItem key={v} value={v}>{t(st.labelKey as any)}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2"><Label>{t("tickets.priority")}</Label>
+                  <Select value={editPriority} onValueChange={setEditPriority}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>{Object.entries(PRIORITY_MAP).map(([v, pr]) => <SelectItem key={v} value={v}>{t(pr.labelKey as any)}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2"><Label>{t("tickets.type")}</Label>
+                  <Select value={editType} onValueChange={setEditType}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>{types.map((tp: string) => <SelectItem key={tp} value={tp}>{typeLabelFor(tp)}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+              </div>
+              {/* 这块是内部备注，不是回复框。此前挂的是「管理员回复」标签配一个会话图标，
+                  管理员很容易把要发给用户的话写进这个用户永远看不到的字段里。 */}
+              <div className="space-y-2">
+                <Label className="flex items-center gap-1"><ShieldAlert className="h-3.5 w-3.5" />{t("adminTickets.adminNote")}</Label>
+                <Textarea value={editNote} onChange={(e) => setEditNote(e.target.value)} placeholder={t("adminTickets.adminNotePlaceholder")} rows={4} maxLength={5000} className="resize-y bg-muted/30" />
+                <p className="flex items-start gap-1 text-[11px] text-muted-foreground">
+                  <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  {t("adminTickets.adminNoteNotVisible")}
+                </p>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditOpen(false)}>{t("common.cancel")}</Button>
+            <Button onClick={handleSave} disabled={saving}>{saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{t("adminTickets.save")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 工单类型管理 */}
+      <Dialog open={typeMgmtOpen} onOpenChange={setTypeMgmtOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("adminTickets.manageTypes")}</DialogTitle>
+            <DialogDescription>{t("adminTickets.manageTypesDesc")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {/* 添加新类型 */}
+            <div className="flex gap-2">
+              <Input
+                value={newTypeName}
+                onChange={(e) => setNewTypeName(e.target.value)}
+                placeholder={t("adminTickets.newTypePlaceholder")}
+                maxLength={50}
+                className="flex-1"
+                onKeyDown={(e) => { if (e.key === "Enter") void handleAddType(); }}
+              />
+              <Button size="sm" onClick={() => void handleAddType()} disabled={typeMgmtSaving || !newTypeName.trim()}>
+                <Plus className="mr-1 h-3.5 w-3.5" />{t("adminTickets.addType")}
+              </Button>
+            </div>
+            {/* 已有类型列表 */}
+            <div className="custom-scrollbar max-h-60 space-y-1 overflow-y-auto overscroll-contain">
+              {typeMgmtTypes.map((tp: string) => (
+                <div key={tp} className="flex items-center gap-2 rounded-md border px-3 py-2">
+                  {editingTypeName === tp ? (
+                    <>
+                      <Input
+                        value={editTypeValue}
+                        onChange={(e) => setEditTypeValue(e.target.value)}
+                        maxLength={50}
+                        className="flex-1 h-8 text-sm"
+                        onKeyDown={(e) => { if (e.key === "Enter") void handleRenameType(); if (e.key === "Escape") setEditingTypeName(null); }}
+                        autoFocus
+                      />
+                      <Button size="sm" variant="ghost" className="h-8 px-2" onClick={() => void handleRenameType()} disabled={typeMgmtSaving}>
+                        {t("common.save")}
+                      </Button>
+                      <Button size="sm" variant="ghost" className="h-8 px-2" onClick={() => setEditingTypeName(null)}>
+                        {t("common.cancel")}
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="flex-1 text-sm">{DEFAULT_TYPES.find((d) => d.value === tp) ? t(DEFAULT_TYPES.find((d) => d.value === tp)!.labelKey as any) : tp}</span>
+                      <Button
+                        size="icon" variant="ghost" className="h-7 w-7"
+                        onClick={() => { setEditingTypeName(tp); setEditTypeValue(tp); }}
+                        title={t("adminTickets.renameType")}
+                        aria-label={t("adminTickets.renameType")}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        size="icon" variant="ghost" className="h-7 w-7 text-destructive hover:text-destructive"
+                        onClick={() => void handleDeleteType(tp)}
+                        disabled={typeMgmtTypes.length <= 1}
+                        title={typeMgmtTypes.length <= 1 ? t("adminTickets.cannotDeleteLastType") : t("common.delete")}
+                        aria-label={typeMgmtTypes.length <= 1 ? t("adminTickets.cannotDeleteLastType") : t("common.delete")}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setTypeMgmtOpen(false)}>{t("common.close")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

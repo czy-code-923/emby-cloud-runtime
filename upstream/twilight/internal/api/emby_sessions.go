@@ -1,0 +1,197 @@
+package api
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"time"
+)
+
+const embySessionsCacheTTL = 5 * time.Second
+
+func cloneEmbySessions(sessions []map[string]any) []map[string]any {
+	out := make([]map[string]any, len(sessions))
+	for i, session := range sessions {
+		copySession := make(map[string]any, len(session))
+		for key, value := range session {
+			copySession[key] = value
+		}
+		out[i] = copySession
+	}
+	return out
+}
+
+// embySessionsSnapshot coalesces the many dashboard/admin polling paths that
+// need /Sessions. Holding the mutex across the upstream request intentionally
+// provides single-flight behavior for concurrent callers.
+func (a *App) embySessionsSnapshot(ctx context.Context, force bool) ([]map[string]any, error) {
+	a.embySessionsMu.Lock()
+	defer a.embySessionsMu.Unlock()
+
+	if !force && a.embySessionsCache != nil && time.Now().Before(a.embySessionsUntil) {
+		return cloneEmbySessions(a.embySessionsCache), nil
+	}
+
+	var sessions []map[string]any
+	if err := a.embyGet(ctx, "/Sessions", &sessions); err != nil {
+		return nil, err
+	}
+	a.embySessionsCache = cloneEmbySessions(sessions)
+	a.embySessionsUntil = time.Now().Add(embySessionsCacheTTL)
+	return cloneEmbySessions(sessions), nil
+}
+
+func (a *App) invalidateEmbySessionsSnapshot() {
+	a.embySessionsMu.Lock()
+	a.embySessionsUntil = time.Time{}
+	a.embySessionsCache = nil
+	a.embySessionsMu.Unlock()
+}
+
+// invalidateEmbyConfigurationCaches drops every cache whose identity belongs
+// to one Emby server. A hot-reloaded URL or token must never reuse sessions,
+// device audit data, or administrator decisions from the previous server.
+func (a *App) invalidateEmbyConfigurationCaches() {
+	a.invalidateEmbySessionsSnapshot()
+
+	a.embyDeviceAuditMu.Lock()
+	a.embyDeviceAuditUntil = time.Time{}
+	a.embyDeviceAuditCache = nil
+	a.embyDeviceAuditMu.Unlock()
+
+	a.embyAdminMu.Lock()
+	clear(a.embyAdminCache)
+	a.embyAdminMu.Unlock()
+}
+
+func embySessionNowPlaying(session map[string]any) (map[string]any, bool) {
+	item, ok := session["NowPlayingItem"].(map[string]any)
+	return item, ok && item != nil
+}
+
+func countEmbyPlayingSessions(sessions []map[string]any) int {
+	count := 0
+	for _, session := range sessions {
+		if _, playing := embySessionNowPlaying(session); playing {
+			count++
+		}
+	}
+	return count
+}
+
+func (a *App) handleEmbyNowPlaying(w http.ResponseWriter, r *http.Request, _ Params) {
+	if !a.embyConfigured() {
+		ok(w, "OK", map[string]any{"viewers": 0, "items": []any{}})
+		return
+	}
+	sessions, err := a.embySessionsSnapshot(r.Context(), false)
+	if err != nil {
+		ok(w, "OK", map[string]any{"viewers": 0, "items": []any{}})
+		return
+	}
+	type nowPlayingItem struct {
+		ItemID       string `json:"item_id"`
+		ItemName     string `json:"item_name"`
+		SeriesName   string `json:"series_name,omitempty"`
+		MediaType    string `json:"media_type"`
+		ImageURL     string `json:"image_url,omitempty"`
+		UserName     string `json:"user_name"`
+		PlayDuration int64  `json:"play_duration"`
+		TotalRuntime int64  `json:"total_runtime"`
+	}
+	items := make([]nowPlayingItem, 0)
+	itemIDs := make([]string, 0)
+	for _, session := range sessions {
+		item, playing := embySessionNowPlaying(session)
+		if !playing {
+			continue
+		}
+		itemID := firstNonEmpty(asString(item["Id"]), asString(item["ID"]), asString(item["id"]))
+		itemName := firstNonEmpty(asString(item["Name"]), asString(item["name"]))
+		seriesName := firstNonEmpty(asString(item["SeriesName"]), asString(item["SeriesId"]), asString(item["Album"]))
+		mediaType := strings.ToLower(strings.TrimSpace(firstNonEmpty(asString(item["Type"]), asString(item["type"]), asString(item["MediaType"]), "other")))
+		userName := firstNonEmpty(asString(session["UserName"]), asString(session["userName"]), asString(session["Client"]), "未知")
+		imgID := itemID
+		if mediaType == "episode" {
+			parentID := firstNonEmpty(asString(item["SeriesId"]), asString(item["ParentId"]))
+			if parentID != "" {
+				imgID = parentID
+			}
+		}
+		posTicks := int64(numeric(item["PlaybackPositionTicks"]))
+		runTicks := int64(numeric(item["RunTimeTicks"]))
+		items = append(items, nowPlayingItem{
+			ItemID:       itemID,
+			ItemName:     itemName,
+			SeriesName:   seriesName,
+			MediaType:    mediaType,
+			ImageURL:     embyItemImageURL(imgID),
+			UserName:     userName,
+			PlayDuration: posTicks / 10000000,
+			TotalRuntime: runTicks / 10000000,
+		})
+		if itemID != "" {
+			itemIDs = append(itemIDs, itemID)
+		}
+	}
+	resp := map[string]any{
+		"viewers": len(items),
+		"items":   items,
+	}
+	if len(itemIDs) > 0 {
+		maxItems := min(len(itemIDs), 50)
+		metadata := a.embyItemMetadata(r.Context(), itemIDs[:maxItems])
+		enriched := make([]map[string]any, 0, len(items))
+		for _, entry := range items {
+			meta, ok := metadata[entry.ItemID]
+			mapped := map[string]any{
+				"item_id":       entry.ItemID,
+				"item_name":     entry.ItemName,
+				"series_name":   entry.SeriesName,
+				"media_type":    entry.MediaType,
+				"image_url":     entry.ImageURL,
+				"user_name":     entry.UserName,
+				"play_duration": entry.PlayDuration,
+				"total_runtime": entry.TotalRuntime,
+			}
+			if ok && meta.SeriesName != "" && mapped["series_name"] == nil {
+				mapped["series_name"] = meta.SeriesName
+			}
+			if ok && meta.Name != "" {
+				mapped["item_name"] = meta.Name
+			}
+			if ok && meta.SeriesID != "" && entry.ImageURL == "" {
+				mapped["image_url"] = embyItemImageURL(meta.SeriesID)
+			}
+			enriched = append(enriched, mapped)
+		}
+		resp["items"] = enriched
+	}
+	ok(w, "OK", resp)
+}
+
+func (a *App) handleEmbyOnline(w http.ResponseWriter, r *http.Request, _ Params) {
+	if !a.embyConfigured() {
+		ok(w, "OK", map[string]any{"online": false, "current_online": 0, "users": []any{}})
+		return
+	}
+	sessions, err := a.embySessionsSnapshot(r.Context(), false)
+	if err != nil {
+		ok(w, "OK", map[string]any{"online": false, "current_online": 0, "users": []any{}})
+		return
+	}
+	// 仅统计在线观看人数，绝不回吐「谁在看 / 在看什么」明细：面板与任何调用方都
+	// 不得据此展示观看者身份或媒体信息（见 AGENTS.md Dashboard Online Viewer Rules）。
+	currentOnline := 0
+	for _, session := range sessions {
+		if nowPlaying, _ := session["NowPlayingItem"].(map[string]any); nowPlaying == nil {
+			continue
+		}
+		currentOnline++
+	}
+	ok(w, "OK", map[string]any{
+		"online":         true,
+		"current_online": currentOnline,
+		"users":          []any{},
+	})
+}

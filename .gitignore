@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+runtime/
+backups/
+secrets/
+*.pem
+*.key
+*.db
+*.sqlite*
+__pycache__/
+node_modules/
+.next/
+.validation/

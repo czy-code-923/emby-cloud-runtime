@@ -1,0 +1,304 @@
+# 安全加固
+
+本文用于 Twilight 生产部署前后的安全检查与日常运维基线，并记录已经在 Go 后端落地的安全、逻辑与性能加固点。所有结论均对照实际代码（`internal/api`、`internal/config`、`internal/security`）核对，与代码不符的历史描述已在文中改正。
+
+相关文档：部署见 [安装部署](./install.md)，配置项全表见 [Go 后端架构与配置](../reference/backend.md)，鉴权与错误码见 [后端 API 详参](../reference/backend-api.md)，外部接入见 [API Key 外部接入](../reference/api-key.md)。
+
+## 1. 敏感配置与密钥管理
+
+- 不要把真实密钥写入仓库版本历史。
+- Web 配置查看/编辑接口会脱敏 API Key、Token、密码、Secret 等敏感字段；schema 保存使用服务端哨兵保留未修改密钥，原始 TOML 保存会在文本层还原未修改密钥，禁止通过配置管理明文回显。
+- 推荐做法：
+  - 把通用配置放在 `config.toml`。
+  - 把真实密钥放在 `config.local.toml`（同名 `.local` 文件会被自动合并覆盖，且应被 `.gitignore` 忽略；也可通过环境变量 `TWILIGHT_CONFIG_LOCAL_FILE` 指定其他路径）。
+  - 或者使用环境变量（`TWILIGHT_*`，见 `internal/config/config.go` 的 `applyEnv`），环境变量优先级最高。
+- 如果密钥曾经泄露（提交进 Git 历史、日志、截图），请立即轮换：
+  - Telegram Bot Token（`Telegram.bot_token`）
+  - Emby API Token / 管理员凭据（`Emby.emby_token` / `emby_username` / `emby_password`）
+  - TMDB / Bangumi Token（`Global.tmdb_api_key` / `Global.bangumi_token`）
+  - 内部回调密钥 `Security.bot_internal_secret`
+  - PostgreSQL 连接凭据（`Database.postgres_password` 等）
+
+## 2. 出站远端 URL 的 SSRF 防护
+
+所有从配置读出后送进 `net/http` 的远端 base URL（Emby / Bangumi / Telegram / TMDB）都必须经过 `internal/api/outbound_url.go` 的 `validateOutboundBaseURL` 校验：
+
+- scheme 仅允许 `http` / `https`，其它（`file:`、`javascript:` 等误粘贴）一律拒绝；
+- host 不能为空；
+- base URL 不允许携带 query / fragment，避免后续路径拼接被污染；
+- 若 host 是字面 IP，交由 `refuseUnsafeOutboundIP` 否决典型 SSRF 目标：链路本地（`169.254.0.0/16`、IPv6 `fe80::/10`）、未指定地址（`0.0.0.0` / `::`）、云元数据 magic IP（如 `100.100.100.200`）。
+- 显式放行 loopback（`127.0.0.1` / `::1`）：自托管同机 docker-compose、反代回环部署普遍依赖该路径；不强制 HTTPS（HTTPS 由部署侧反向代理承担）。
+- **拨号阶段再校验一次**（`guardOutboundDialAddress`，挂在 `sharedHTTPTransport` 的 `net.Dialer.Control` 上）：上面几步都作用在**配置字符串**上，管不到 host 是域名的情况——一个解析到 `169.254.169.254` 的主机名就能绕过。而 `Control` 回调拿到的是 **DNS 解析之后**的 `IP:port`，在这一刻拦截既覆盖了域名，也顺带堵住了 DNS rebinding（校验时返回公网 IP、拨号时返回内网 IP）。开发者 JS 沙箱的 `fetch()` 早先就是这么做的，现在系统侧出站与之对齐。
+
+配置面被入侵或管理员误填时，这一层避免可信的 `X-Emby-Token` / Bot Token / TMDB Key 被发往攻击者控制的内部地址。
+
+> **已知边界（M1，刻意保留、仅文档标注）**：`validateOutboundBaseURL` / `refuseUnsafeOutboundIP` 的过滤有意收窄，属于自托管取舍而非疏漏，运维需知悉其边界：
+> - **不拦 RFC1918 / CGNAT / ULA**：`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、CGNAT `100.64.0.0/10`、IPv6 ULA `fc00::/7` 均**不在**否决列表内；只拦 link-local（`169.254.0.0/16`、`fe80::/10`，AWS/GCP 元数据 `169.254.169.254` 借此被拦）、unspecified（`0.0.0.0`/`::`）与阿里云元数据 `100.100.100.200`。loopback（`127.0.0.1`/`::1`）显式放行。
+> - 早期版本**只拦字面 IP**（host 本身是 IP 才校验，填域名则完全绕过，含 DNS rebinding）。该缺口已由上述拨号阶段校验补齐；域名与 rebinding 不再是盲区。
+> - **触发面是管理员配置面，非用户输入**：这些 base URL（`Emby.emby_url` / `Bangumi.api_url` / `Telegram.api_url` / `Global.tmdb_api_url`）只有管理员能改，普通用户无法注入。实际风险是「配置面被入侵 / 管理员误填 / 从旧库迁入被污染值」时，可信凭据被发往内网服务，属于纵深防御的最后一环而非首要边界。
+> - 之所以不进一步收紧：自托管、docker-compose 同栈、内网反代普遍要求把 Emby / Bangumi 指向 RFC1918 或主机名地址，一刀切拦截会打死绝大多数现网部署。**如果你的部署不需要出站到内网**，可在反向代理 / 出口防火墙层面对后端做 egress 限制，作为这层之外的补充。
+
+## 3. CORS 与会话安全
+
+### 3.1 CORS
+
+CORS 由 `internal/api/app.go` 的 `applyCORS` 处理，启动 / 热重载时由 `validateCORSOriginsStartup` 体检。
+
+- `cors_origins` 留空时，后端会反射任意合法的 `http`/`https` Origin，便于自托管和反代排障；填写显式列表后，跨 origin 请求只允许列表内 Origin；`*` 等价于兼容模式。
+- `cors_origins` 只填 Origin（`scheme://host[:port]`），不带路径、查询串或片段。尾斜杠会被 `normalizeCORSOrigin` 规范化；带 `path`/`query`/`fragment` 或非 `http`/`https` 的条目会被判为无效并忽略。
+- 请求的 Origin 与当前请求 Host 按 `scheme://host[:port]` 完全一致时，`corsOriginMatchesHost` 会保留同源回退，不要求把 API 自身 Origin 重复写进 `cors_origins`。旧的隐藏 `cors_allow_any_origin` 开关已移除。
+- 只允许你的前端域名：
+
+```toml
+[API]
+cors_origins = ["https://app.example.com"]
+allow_credential = true
+```
+
+- `allow_credential = true` 同时放行 `localhost` / `127.0.0.1` / `[::1]` 时，启动期会打 `Warn` 提示。请只在开发、可信内网或你明确接受的自托管场景使用。
+- 允许的请求头列表为 `Content-Type, Authorization, X-API-Key, If-Match, X-Twilight-Client, X-Twilight-Intent`。`If-Match` 用于求片等管理写操作的 revision 并发保护；遗漏它会让跨 Origin 浏览器请求在 `PUT` / `DELETE` 发出前被预检拦截。`X-Twilight-Client` 不参与鉴权；`X-Twilight-Intent` 仅用于少数有副作用 GET 的显式意图校验。
+
+> **已知边界（M2，刻意保留、仅文档标注）**：`cors_origins` 留空 / 填 `*` 时的「反射任意 Origin」是自托管便利取舍，但与默认 `allow_credential = true` 组合时需明确其风险：
+> - **触发条件**：`cors_origins` 为空数组，或首项为 `*`（`corsOriginRelaxed()` 返回 `true`）。此时 `applyCORS` 会对**任意合法 `http`/`https` Origin** 回填 `Access-Control-Allow-Origin: <该 Origin>`（反射，而非 `*`）。
+> - **叠加凭据的后果**：默认 `allow_credential = true`，反射 Origin 时会同时下发 `Access-Control-Allow-Credentials: true`。浏览器规范只禁止 `*` + 凭据，但**反射出的是具体 Origin**，因此该禁令被绕过——任意第三方站点可在受害者浏览器里对本服务发起**带 Cookie 的跨站请求并读取已登录用户的鉴权响应**（跨站信息泄露；写请求因无 CSRF 令牌校验，见 §3.3，同样可被跨站触发）。
+> - **告警可见性弱**：`cors_origins` 留空时启动期仅打 **`Info`**（不是 `Warn`/`Error`），运维极易忽略。`*` + `allow_credential` 会打 `Error`，但空列表 + 凭据这一等价危险组合不会升级日志级别。
+> - **默认配置的定位**：出厂默认 `cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]` 且 `allow_credential = true`——**默认是白名单模式**（只放行本地前端），并不触发反射。风险出现在管理员**主动清空 `cors_origins` 或改成 `*`**、却保留 `allow_credential = true` 时。
+> - **规避方式（无需改代码）**：生产环境**始终显式填写可信前端 Origin 列表**（见上方 `[API]` 示例），不要留空也不要用 `*`；若确实需要多来源且不需要跨站携带 Cookie，则把 `allow_credential` 显式设为 `false`，让反射退化为无凭据的安全模式。
+
+### 3.2 会话与 Cookie
+
+- 若通过 HTTPS 对外提供服务（生产基线），保持：
+  - `session_cookie_secure = true`（默认即 `true`；纯 HTTP 调试才显式关闭，否则会话明文走线）；
+  - 合理的 `session_cookie_samesite`（默认 `lax`，可选 `strict` / `none`）。
+- session cookie（默认名 `twilight_session`）为 `HttpOnly`。`session_cookie_domain` 单 origin 部署留空；双子域部署（webui 与 API 不同子域）需设为 `.example.com` 让两子域共享 cookie。
+- WebUI 登录态以后端 `/users/me` 响应为准；`/users/me` 与 `/auth/me` 属于会话身份数据，后端 JSON 响应默认 `Cache-Control: no-store, private`，前端也不会对这两个端点做短缓存或 in-flight 合流。登录、登出、刷新这类会话边界会清理前端请求缓存并废弃旧的用户信息请求，避免多账号快速切换时旧响应覆盖新会话。
+- 前端短响应缓存和在途 GET 合并只接受显式 `credentials: "omit"` 的公开 GET/HEAD。所有 Cookie 认证请求即使不是身份端点也不参与这两种共享机制，避免 HttpOnly 会话无法进入缓存键而造成账号切换后的私有数据复用。
+- WebUI API 响应在客户端按字节流读取并限制为 8 MiB；超过限制的响应会在 JSON 解析前被取消，避免异常或被劫持的响应造成浏览器内存膨胀。请求超时保护覆盖响应正文读取阶段，避免慢速响应占用连接并绕过客户端超时。该限制不替代后端各接口自己的分页和上传限制。
+- 会话 TTL 由 `session_cookie_ttl`（默认 7 天）控制；登出会清除 session cookie。
+- 服务端创建 session 时会把 token 当作不可重映射的 bearer 凭据：Redis 使用 NX 写入，PostgreSQL `twilight_sessions.token` 冲突时只重试新 token，不会把既有 token 覆盖到另一个 UID。
+
+### 3.3 Cookie 写请求
+
+后端不做 CSRF 令牌校验，也不做额外来源校验；Cookie 鉴权写请求只要求有效的 `HttpOnly` session cookie。Bearer Token / API Key 仍按各自鉴权路径处理。
+
+## 4. 鉴权级别与统一响应
+
+后端按路由声明鉴权级别（`internal/api/routes.go`、`internal/api/app.go`）：
+
+| 级别 | 含义 |
+| --- | --- |
+| `AuthPublic` | 免登录 |
+| `AuthUser` | 登录会话（cookie）或 `Authorization: Bearer <session token>` |
+| `AuthAdmin` | 登录且 `Role == RoleAdmin` |
+| `AuthAPIKey` | `X-API-Key` 头、`Authorization: ApiKey/Bearer <key>`，或 `?apikey=`（仅当该 Key 允许 query 传参） |
+
+所有响应使用统一 envelope：`{ success, code, error_code, message, data, timestamp }`（`error_code` 为协议层错误码，便于前端按码而非文案分支；`data` 为空时省略）。
+
+JSON 请求体由统一解码器限制为 256 KiB、最多 32 层嵌套且只能包含一个 JSON 值；尾随第二个对象、数组或标量会被拒绝，避免不同代理、校验层与 handler 对同一请求产生歧义解析。
+
+被禁用 / 到期账号即便持有有效 session 也会被拒：`authenticate` 在 `!Active` 时区分「到期」（`ACCOUNT_EXPIRED`）与「被禁用」（`ACCOUNT_DISABLED`），让前端把「续费」与「申诉」两条引导分开。
+
+公开 `GET /api/v1/system/health` 只返回 API 存活摘要，不执行 PostgreSQL Ping、Emby 请求或返回私有依赖详情；数据库、Emby 与 API 真实检测分别位于三个 `AuthAdmin` 健康接口。`GET /api/v1/system/emby-viewers` 会触发 Emby 会话读取，因此是 `AuthUser`，匿名调用不能借此探测在线活动。
+
+### 4.1 运行时 API 文档边界
+
+- `GET /api/v2/openapi.json` 是公开接口，只输出 `AuthPublic` 路由，不能枚举后台管理或用户态路由。旧 `/api/v1/openapi.json` 继续兼容。
+- 公开 API 控制台由 Go 直接提供：`GET /api/v2/docs`（旧 `/api/v1/docs` 兼容）。未登录时只读取公开 OpenAPI，当前会话是管理员时才读取受保护的 `/api/v2/admin/docs/routes`。WebUI 不再内置独立的 `/api-docs` 页面。
+- 完整路由清单只来自受 `AuthAdmin` 保护的 `GET /api/v1/system/admin/apis`，不得把该清单内联到公开 HTML 或公开 OpenAPI。
+- API 控制台只提供本地测试便利。输入 API Key 后使用 `X-API-Key` 请求头发送，不会把密钥写入服务端文档、日志或页面静态内容；共享屏幕和截图时仍应手动清空敏感字段。
+
+## 5. 密码哈希
+
+`internal/security/password.go`：
+
+- 当前算法为 PBKDF2-HMAC-SHA256，默认迭代数 `600000`（对齐 OWASP 2024 下限）；哈希格式 `salt$iterations$hex(dk)`。
+- 兼容旧哈希：旧 Python 时代的 `salt$sha256(salt+password)` 两段格式仍可校验；`VerifyPassword` 接受迭代数在 `10000 ~ 1000000` 范围内的存量哈希。
+- 透明迁移：登录校验通过后调用 `NeedsRehash`，对 legacy 格式或迭代数低于门槛的哈希在登录路径无感重哈希，无需强制用户重置密码。
+- 所有比对走 `subtle.ConstantTimeCompare`，避免时序侧信道。
+
+## 6. API 速率限制
+
+限流由 `internal/api/ratelimit.go` 实现（滑动窗口计数），总开关 `RateLimit.enabled`（默认开）。命中后返回 `HTTP 429` + 对应错误码（如 `AUTH_LOGIN_RATE_LIMITED`、`REGISTER_RATE_LIMITED`、`RATE_LIMITED`），并写 `logger.warning`。
+
+> 纠正：旧文档称 429 响应体携带 `retry_after` 字段。当前 Go 实现的限流器仅返回是否放行，429 响应走标准 envelope，**不附带 `retry_after`**。
+
+主要限流维度（配置项见 `[RateLimit]`，默认值见 `internal/config/config.go`）：
+
+| 维度 | 配置项 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| 全局（每 IP） | `global_per_minute` | 1200 | 所有请求进入路由前先过这道闸 |
+| 登录（每 IP） | `login_per_minute` | 60 | 登录 / API Key 登录 |
+| 登录（每账号 5 分钟） | `login_user_per_5m` | 10 | 密码校验前消耗；已有账号按 UID 共享用户名/邮箱配额，未知账号按规范化登录标识计数；成功和失败尝试均计数 |
+| 注册（每 IP 10 分钟） | `register_per_10m` | 30 | |
+| 找回密码（每 IP 10 分钟） | `forgot_password_ip_per_10m` | 20 | 含邮箱找回两步 |
+| 找回密码（每账号 30 分钟） | `forgot_password_user_per_30m` | 10 | |
+| 邮箱发码（每 IP 10 分钟） | `email_code_ip_per_10m` | 20 | 绑定 / 改密 / 找回发码 |
+| 邮箱发码（每收件地址 10 分钟） | `email_code_addr_per_10m` | 5 | 防对单一邮箱轰炸 |
+| 邮箱发码（每登录账号 10 分钟） | `email_code_uid_per_10m` | 10 | 防同一账号轮换收件邮箱滥刷 |
+| 上传（每用户每分钟） | `upload_per_minute` | 60 | 头像 / 背景上传 |
+| 管理员服务器图标（每用户每分钟） | `admin_icon_per_minute` | 20 | |
+| API Key 默认配额（每分钟） | `api_key_default_per_minute` | 300 | 单 Key 可在管理端覆盖 |
+
+注册队列状态查询另保留 request 与 IP 双维度限流。
+
+邮箱验证子系统的安全模型（验证码只存 HMAC 哈希 + 常量时间比较、尝试上限、有效期、防枚举找回、SMTP 未配好时强制门自动失效防锁死）详见 [邮箱验证与找回密码](../features/email.md)。
+
+Emby 改密的当前 Web 密码证明与个人邮箱验证码证明只启用一种：开启当前 Web 密码证明会由后端同步关闭个人邮箱证明，历史上两个开关同时开启时也以 Web 密码为准。管理员关闭自己的个人邮箱改密保护时无需邮箱验证码，普通用户仍必须完成对应邮箱证明。普通用户发信失败只返回通用错误，SMTP 主机、源 IP、认证信息和底层错误不会进入客户端响应。
+
+## 7. 多进程与限流一致性
+
+- 配置 `Global.redis_url` 后，会话状态与限流计数共享到 Redis；未配置 Redis 时降级为单进程内存计数与内存会话。
+- 多副本 / 多进程部署务必配置 Redis，否则每副本各自维护一份内存桶，限流上限实际被放大 N 倍，会话也只在当前进程生效。
+- Redis 命令失败时限流器会自动回退到内存桶并累加 `fallbackCount`（可经 `/system/stats` 观察）；该值持续增长意味着 Redis 失联、限流已退化。
+- 单进程内存限流桶最多保留 10,000 个键。达到上限时会先回收过期桶；若仍满载，已有键继续计数，未见过的新键按超限拒绝，避免攻击者在 Redis 未配置或故障时通过大量来源键无限抬高进程内存。Redis 与内存路径都会把小于 1 秒的窗口归一为 1 秒。
+- Emby 注册队列在多进程部署下仍是单进程内队列；强一致的名额控制应依赖数据库与业务锁兜底，不要依赖该队列。
+
+## 8. 反向代理与暴露面
+
+- 用 Nginx / Caddy 暴露单一入口，仅开放 80/443；后端服务端口尽量仅监听内网或本机；限制管理接口访问来源（网段 / IP / WAF）。
+- 后端对所有响应附带安全响应头（`applySecurityHeaders`）：`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: strict-origin-when-cross-origin`、`Permissions-Policy`、`X-Permitted-Cross-Domain-Policies: none`、`Cross-Origin-Opener-Policy`、`Cross-Origin-Resource-Policy`，以及一条收紧的 `Content-Security-Policy`（`default-src 'none'`，后端只吐 JSON / 静态上传资源）。WebUI 由 Next.js 提供：`webui/src/proxy.ts`（Next.js middleware）按请求注入 CSP（`connect-src` 从 `NEXT_PUBLIC_API_URL` 推导，附加白名单逐条过 origin 校验），`next.config.mjs` 的 `headers()` 输出与请求上下文无关的静态安全头。Nginx 负责同源反代和缓存边界：只有 `/_next/static/` 下带 hash 的产物长期缓存，HTML 外壳保持 `no-store`。
+- 反向代理若覆盖这些头，应保持同等或更严格策略。
+- 信任代理头需谨慎：仅当 `API.trust_proxy_headers = true` **且** 直接上游落在 `API.trusted_proxy_cidrs` 列表内时，`clientIP` 才消费 `CF-Connecting-IP` / `X-Real-IP` / `X-Forwarded-For`；否则一律用 TCP 对端地址（fail-closed）。`trusted_proxy_cidrs` 为空时即便 `trust_proxy_headers = true` 也不会消费任何代理头，启动期会打 `Error` 提示。`X-Forwarded-For` 按从右向左逐跳验证，避免客户端伪造最左端 IP 绕过 IP 限流 / 黑名单。注意 `CF-Connecting-IP` 优先级最高：受信代理必须覆盖或清空客户端自带的这个头（仓库的 `deploy/nginx-twilight.conf` 已 `proxy_set_header CF-Connecting-IP ""`），否则任何人都能伪造 IP；部署在 Cloudflare 后面时应在 nginx 用 `real_ip_header CF-Connecting-IP` 还原真实 IP。
+
+## 9. 前端资源、背景图与头像
+
+上传与背景的安全约束集中在 `internal/api/upload_handlers.go`：
+
+- `uploads` 目录不再作为静态目录直接暴露；用户头像和背景统一通过 `/api/v1/users/assets/{avatar|background}/{filename}` 读取，该接口要求登录，并校验 `kind` 白名单、文件名模式（随机 16 hex + 已知图片扩展名）与路径不越界（`ResolveWithinRoot`）。历史 `/uploads/...` 引用在读取时会被改写为受控 API URL。
+- 上传链路：限流 → multipart 解析 → 用 `http.DetectContentType` 嗅探真实 MIME（仅放行 jpg/png/gif/webp/bmp）→ 随机文件名 → `ResolveWithinRoot` 防穿越 + `O_NOFOLLOW` 拒绝符号链接 TOCTOU → `WriteFileAtomicSync`（tmp + fsync + rename）写盘，权限 `0o600`，目录 `0o700`。
+- 背景配置（`sanitizedBackgroundConfig`）：
+  - CSS 背景只允许渐变函数（`linear-gradient` / `radial-gradient` / `conic-gradient` 及其 `repeating-` 变体），并拒绝含 `url(`、`@`、`;`、`{}`、`<>`、换行的值，避免 `paint()`、`element()`、`image-set()`、`url()`、`@import` 扩大攻击面或做 XSS。
+  - 背景图片只接受本系统上传的 `/api/v1/users/assets/background/{filename}` 资源，且文件名必须匹配白名单；不保存任意外部 URL。
+- 前端侧也会丢弃不安全的 URL scheme（`javascript:`、非图片 `data:`、跨域绝对地址）。如允许外部图片，请优先 HTTPS，避免混合内容与第三方 Referer 泄漏。
+- 新增定时任务 `cleanup_unused_uploads`：清理未被任何用户头像 / 背景 / 服务器图标引用的上传文件，对新文件保留 24 小时宽限期。
+- Next.js 的图片优化器已被显式关闭（`images.unoptimized = true`），避免由它代拉任意远程 URL；图片 URL 仍必须经过后端白名单和受保护资源规则。若通过 CDN / 反代暴露前端，请同步隐藏上游技术栈指纹。
+- 服务器图标不再以本地路径形式作为公开配置面暴露：管理员通过上传接口写入受控资源，公开信息端点固定返回内置图标。
+
+## 10. 日志与审计
+
+- 后端日志统一经 `redactSensitiveText`（`internal/api/runtime_logs.go`）脱敏：`Bearer` 令牌、`key-` 前缀 API Key、以及 `password` / `token` / `secret` 等敏感 key=value（含带引号变体）会被替换为 `[REDACTED]`。
+- 该脱敏在 5xx envelope、panic 日志、配置热重载日志、Git 自动更新输出（含 stderr 里可能出现的 `https://user:PAT@host`）等路径上兜底。
+- 不要在自建日志里打印 Token、密码、密钥原文或完整 `Authorization` 头。
+- 建议保留并审计：管理员关键操作日志、登录失败与封禁日志、API Key 调用轨迹。
+- 设备 / IP 审查有两套来源，勿混淆：**Emby 登录用户**的设备与真实登录 IP 来自 Emby API——`GET /api/v1/admin/emby/device-audit`（`emby_device_audit.go`）按用户聚合：以 `/Devices` 设备清单为基底、用实时 `/Sessions` 的 `RemoteEndPoint`（经 `parseRemoteIP` 剥离端口，覆盖 IPv4/IPv6）补当前 IP 与在线状态，并从 `/System/ActivityLog` 抽取历史登录 IP（离线设备也能审查来源 IP），映射回完整本地账号（网页/Emby/Telegram）。接口会过滤 Twilight 自身连接 Emby 时产生的 `Twilight` / `Twilight Bind` / `twilight-client` 设备与会话，避免把管理面板计入用户、IP 和设备统计；同时会规范化设备名、客户端名和版本等展示字段，解码 `&quot;` 等 HTML 实体并清理异常尾随引号/反斜杠。离线保留设备会按同一 Emby 用户下的设备名、客户端名、客户端版本聚合，保留 `count` 与最新活动时间；在线设备保留实时独立行。`/Devices`、`/Sessions`、活动日志任一来源失败时审查接口降级返回其余来源，并在 `summary` 内标记可用性，避免单个 Emby 子接口异常导致整页不可用。全量 Emby 设备记录清理仅通过定时任务 `cleanup_emby_devices` 执行，默认 `dry_run=true`，实际删除使用官方管理员接口 `DELETE /Devices?Id={DeviceId}`，并自动跳过 Twilight 自身设备和受保护用户设备；设备审查页不提供“清理全部/踢出全部”按钮。前端主入口在「Emby 管理 → 设备 / IP 审查」页签，旧 `/admin/device-audit` 页面仅保留兼容跳转/直达能力；**Web 面板自身**的登录设备记录在本地 `store.Device`（含 UA / `LastIP` / 首末时间 / 信任 / 封禁），登录写入走 `UpdateDevice` 读改写以保留信任/封禁标记，`GET /api/v1/security/login-history` 另有按 IP 的登录历史。
+
+### 10.1 安全中心与迁移入口
+
+- 后台「安全中心」集中展示操作审计、运行日志、违规风控入口；设备/IP 审查入口指向「Emby 管理 → 设备 / IP 审查」页签。安全中心内嵌 `[Security]`、`[RateLimit]`、`[AuditLog]`、`[DeviceLimit]` 的结构化配置编辑。
+- 配置管理中的安全相关配置段保留兼容入口，但默认折叠并提示跳转安全中心；所有保存仍写入同一个 `config.toml`，不创建第二套配置源。
+- 所有新增管理端接口均使用 `AuthAdmin`，状态变更与沙箱执行写入审计日志。Telegram Bot 与群组 inline 管理面板产生的写操作使用 `source=telegram` 记录操作者、目标 UID 与动作详情；审计日志自身的删除、清空、裁剪接口不会在清理后向同一张审计日志表追加新记录，避免管理员无法真正清空日志。V2 审计页面使用 `/api/v2/admin/audit-logs`，V1 路径仅保留兼容入口。
+- 注册、卡码、邀请、续期、签到与注册资格 / 队列的写操作都有显式审计：`register`、`create_regcode` / `update_regcode` / `delete_regcode` / `batch_delete_regcode` / `clear_regcode_usage`、`use_code`、`renew_account`、`create_invite_code` / `create_renew_code` / `delete_invite_code` / `use_invite_code`、`admin_renew_user` / `admin_set_expiry`、`grant_registration_entitlement` / `bulk_grant_registration_entitlement` / `clear_registration_queue`、`signin` / `renew_with_signin_points`。卡码与邀请码只记录 `code_hint` / `code_hints` / `deleted_hints`（保留首尾各 4 个字符），不写完整可兑换码值；以 `code` 结尾的键会被遮罩为 `[REDACTED]`，因此不要改回 `code` 键。续期与改到期记录 `expired_at_before` / `expired_at_after` 或 `before` / `after`。
+- 操作审计保存在独立的 `twilight_audit_logs` 表，写入、检索和保留策略不再重写整份 `twilight_state`。筛选值全部使用 SQL 参数，排序字段只能从后端白名单选择，搜索中的 `%`、`_` 与反斜杠按字面量转义。历史快照里的 `audit_logs` 会在启动时幂等迁移；数据库备份仍包含完整审计历史。
+
+## 11. 最小权限原则
+
+- API Key 不得兑换完整网页会话，V1/V2 `/auth/login/apikey` 对有效且账号启用的 Key 返回 `API_KEY_PERMISSION_DENIED`，不签发 Token 或 Cookie；管理员和 legacy Key 同样受限。网页登录使用密码，外部集成继续使用带 scope 检查的 `/apikey/*`。升级前已兑换的会话应按需通过现有流程全部撤销。
+- Key 的正数 `expired_at` 在 Store 查询层强制校验，等于或早于当前 Unix 秒即无效；索引和扫描回退路径必须一致。此规则检查的是 Key 自身有效期，独立于账号到期状态。
+- API Key 仅授予必要 scope；`?apikey=` query 传参仅对显式允许 query 的 Key 生效（默认不允许）。
+- `/apikey/*` 在路由 handler 前强制执行 scope：账号读写分别要求 `account:read` / `account:write`，Emby 状态与会话操作分别要求 `emby:read` / `emby:write`。缺少 scope 返回 `API_KEY_PERMISSION_DENIED`，不能把 `permissions` 退化成仅展示字段。
+- API Key 不能自行修改权限；权限变更必须通过已登录 Web 端完成，避免只读 Key 自提权。
+- 管理员账号数量最小化，长期不用的高权限账号及时停用。
+- Telegram 管理员 ID 仅配置必要人员。
+- Telegram 管理员私聊仅保留只读查询与统计能力；添加用户、生成注册码、广播、强制绑定、踢出会话等写操作统一走 Web 后台。
+
+## 12. Telegram 相关安全
+
+- 绑定链接由三段独立随机值组成：`link_id`（32 位十六进制观察句柄）、`start_token`（128 位随机熵，随 `https://t.me/<bot>?start=<token>` 交给 Telegram）、`link_secret`（256 位随机熵，仅注册场景）。数据库只保存 token 与 secret 的 SHA-256 用途隔离摘要。观察句柄不能向 Bot 确认；token 不能查询状态；注册场景的状态查询与提交都必须带 secret（`X-Telegram-Link-Secret` 头 / `telegram_link_secret` 字段），缺失或不匹配一律 `not_found`。secret 不走 Cookie，因此与 `session_cookie_samesite` 及前后端是否跨站无关。已登录场景的链接归属当前 UID。
+- 链接表总数限制为 10,000；签发前回收过期记录，同一所有者重新签发会取消旧 pending/confirmed 记录。注册消费和账号/权益/身份历史同事务，失败不消耗有效已确认链接。临时外部校验失败只写 pending 行，不能污染已确认状态。Bot 直接读写共享 PostgreSQL，没有浏览器可调用的确认端点。
+- Twilight 逻辑备份/迁移排除链接，恢复时事务内使当前链接失效。物理数据库备份仍可能含短期认证记录，按凭据备份处理。
+- 普通绑定链接只允许绑定尚未绑定的账号；已绑定身份的变更必须先完成审批及解绑，不能只在前端隐藏入口。解绑时在同一数据库事务校验并消费审批、清除身份、设置换绑标志及追加历史；并发身份变化或审批撤销会使旧请求失败。token、secret 和 Bot Token 不得写入日志。链接服务故障仅记录操作名、失败类别和 SQLSTATE，原始驱动/上游错误不进入日志。
+- Telegram JSON 请求统一复用经过 SSRF 校验的端点、共享连接池和同源重定向策略。成功响应最多解码 4 MiB，错误响应只读取有界正文；网络错误、Telegram 错误正文和被拒绝重定向的 `Location` 在离开 App 协议层前都会清除 Bot Token。不得在命令实现中自行拼接 Bot URL 或绕过该脱敏出口。
+- 入站 update、Bot 身份、聊天和群成员响应只解码业务需要的强类型字段，未知 Telegram 字段不会进入通用动态对象。配置管理员 ID 使用不可变快照索引，但本地账号角色仍从 Store 的 Telegram ID 索引实时读取，避免缓存角色变更。群组面板 callback 仅接受 `gadm:auth:<token>` / `gadm:act:<action>:<token>`，开发者 JS callback 仅接受 `djs:<token>:<index>`；空段、多余段和非法序号必须拒绝，不能用宽松 `Split` 后忽略中间内容。
+- 开启群组 / 频道强制校验时，确保 Bot 在目标群有足够权限，避免误判。
+- 开发者模式下的 Telegram JS 自定义命令只在 `bot_custom_commands` 的回复内容以 `js:` 开头时启用；沙箱暴露 `ctx`、`args`、`user`、`constants`、`reply(text)`、`log(text)`、`auth(role)`、`config(key)`、`env(key)` 以及受限的同步 `fetch()`、`interactions.*`、`users.*` / `db.*` 等白名单能力。其中配置与环境变量读取为只读白名单，Token、Secret、密码、API Key、数据库 URL、服务器线路等敏感信息不会返回；`fetch()` 仅放行公网 `http/https` 的 `GET`/`POST`/`HEAD`，禁用凭据与跳转、限制响应体长度，并在发起前按域名解析校验、在 TCP 拨号阶段对实际连接 IP 再次校验以阻断 localhost / 内网 / 链路本地（含云元数据）/ 广播组播目标和 DNS rebinding；沙箱不提供文件或进程能力，并有执行超时与危险 token 静态拦截。每次执行会写入 `telegram_js_command_execute` 审计日志。
+- **退群完全封禁模式（`Telegram.ban_on_leave`）**：
+  - 默认 `false`；开启后定时巡检发现退群用户会被 Bot 永久封禁（不会自动解封），无法重新加入。
+  - 依赖 Bot 在每个 `group_id` 群里是管理员且具备「封禁成员」权限。
+  - 开启时巡检的「重新入群识别」分支会被跳过；如需放行某个被永封 ID，需手动在 TG 群里解封。
+  - 误判不可逆，上线前请先以 `require_group_membership = true` + `ban_on_leave = false` 观察 1～2 周巡检日志。
+
+## 13. Emby 管理员账号安全隔离
+
+集中在 `internal/api/emby.go` 的 `blockRestrictedEmbyAdmin`（在请求分发层统一拦截，无需逐 handler 校验）：
+
+- **核心规则**：若某用户绑定的 Emby 账号在 Emby 端具有管理员权限（`IsAdministrator`），但该用户在 Twilight 中不是管理员（`Role != RoleAdmin`），则其请求被**默认拒绝**，仅放行一小撮只读 / 登出端点：`GET /api/v1/auth/me`、`GET /api/v1/users/me`、`POST /api/v1/auth/logout`、`POST /api/v1/auth/logout/all`。
+- 被拒的操作返回 `HTTP 403` + `EMBY_ADMIN_RESTRICTED`，并记一条 `Warn` 日志。
+- 其余被禁止的能力包括但不限于：修改系统 / Emby 密码、改个人资料、解绑 Emby 等。
+- 绑定时非系统管理员不允许绑定 Emby 管理员账号；已存在此类绑定的用户需联系系统管理员处理。
+- 系统管理员（`Role == RoleAdmin`）不受此限制。
+- 该机制防止用户通过绑定 Emby 管理员账号、借密码修改等功能间接控制 Emby 服务器。
+
+## 14. 管理员保护
+
+- 系统禁止移除最后一个管理员的权限：降级管理员前会检查剩余活跃管理员数量，至少保留一个，否则返回 `HTTP 409` + `ADMIN_LAST_ADMIN_PROTECTED`（`store.ErrLastAdmin` 在 `statusFromError` 集中映射）。
+- 管理员不能撤销自己的管理员权限。
+- 管理员不能通过旧接口修改其他管理员的 Telegram 绑定。
+
+## 15. Emby 用户上限口径
+
+`Register.emby_user_limit`（默认 `-1` 不限制）使用统一容量口径：
+
+- 占用名额的来源：已绑定 Emby 的系统用户、`PendingEmby` 待开通资格、自由注册 / 卡码队列中正在创建的请求。
+- 管理员签发的有效注册码 / 白名单码（type 1/3）按剩余次数预占名额；未使用的邀请码不预占 Emby 名额，也不计入系统用户上限（邀请码只能由已注册用户使用），被使用后受邀者进入 `PendingEmby` 才占用。
+- 注册码注册、邀请码开通、用户自助补建、手动绑定、管理员授予开通资格、独立 Emby 账号创建等路径都应在创建或新增绑定前检查容量。
+- 删除 Emby 账号或清理待开通资格后释放对应名额；独立 Emby 账号不写入本地用户表，因此还会额外读取 Emby 端总用户数做兜底。
+
+> 注意：邀请关系、注册码、公告等业务状态以**字段形式存在于单一状态文档**（`internal/store`，即 PostgreSQL `twilight_state` 表的整份 jsonb 行；唯一运行后端），不存在独立的 `invites.db` / `invite_relations` 单表 / `ALTER TABLE` 这类旧描述。
+
+## 16. 配置文件自动备份
+
+由 `internal/api/config_admin.go` 实现：
+
+- 在任何「保存配置 / 恢复配置」写回 `config.toml` 之前，后端会先把当前配置内容备份到数据库备份目录（`Database.backup_dir`，默认 `db/backups`），文件名形如 `<base>_<YYYYMMDD_HHMMSS>_<nanos>.toml`，权限 `0o600`，目录 `0o700`。
+- 备份列表 / 查看 / 删除走管理员接口，并通过 `ResolveLeafFile` 限制只能落在备份目录直下、拒绝符号链接与路径穿越。
+- 备份目录应加入 `.gitignore`，不要提交。
+
+> 纠正：旧文档描述的 Python 时代 `sweep_config_toml` 自动整理、`config_backups/<file>.<timestamp>.<reason>.bak` 命名、单文件 `config.toml.backup`、环境变量 `TWILIGHT_CONFIG_BACKUP_RETENTION` 保留份数裁剪等机制，在当前 Go 后端代码中不存在，已据实改写为上述行为。
+
+## 17. 数据库与自动更新安全
+
+数据库管理（`internal/api/database_admin.go`）：
+
+- 备份、恢复、迁移接口均要求管理员登录；备份 / 恢复目标通过 `store.ResolveBackupPath` 限制在配置的备份目录内，拒绝 `../` 路径穿越。
+- 恢复与迁移前会自动创建保护性备份（如「数据库恢复前保护性备份」「数据库迁移前保护性备份」）。
+- 迁移到 PostgreSQL 前先用管理端预检，确认目标连接成功、快照与实体计数符合预期。
+- 运行后端只有 PostgreSQL 一种：`Database.driver` 设为非 postgres 值时后端启动即报错。热重载会在 DSN 变化时重开 store，但监听地址变化仍需重启。
+- 主状态文档（`twilight_state`）之外另有独立表 `twilight_audit_logs`、`twilight_sessions`、`twilight_runtime_logs`、`twilight_playback_records`、`twilight_telegram_roster`、`twilight_telegram_runtime`，同库不同表；其中审计、运行日志、Telegram 花名册和确认游标用于隔离高频小写入，避免放大主状态 JSONB 的 CPU、内存与 I/O 开销。花名册查询和写入均使用参数化 SQL，普通消息缓存严格限制为 4096 项；Telegram 游标只允许单调推进，只有 `getMe` 证明 Bot 身份变化时才能清零，且必须等整个更新批次副作用完成后再确认。
+
+Git 自动更新（`internal/api/system_update.go`）：
+
+- 仅允许完整的 HTTPS 仓库 URL；拒绝非 https scheme、空路径、URL 内携带凭据（userinfo）、以及带 query / fragment 的 URL。分支名经白名单正则校验。
+- 使用 `git pull --ff-only`，不做 rebase / merge / reset。
+- 先执行 dry-run 预检（报告 worktree 是否 dirty）。正式更新时若 worktree 有本地改动，会先 `git stash push --include-untracked` 暂存，拉取后再 `git stash pop` 恢复；恢复出现冲突时会在响应里报告 `stash_conflicts`。
+- 更新响应只返回必要的仓库状态和脱敏诊断，不返回服务器本机项目绝对路径，避免管理员浏览器和前端日志暴露部署目录。
+- 自动更新命令输出与 stderr 经脱敏后才记日志，避免泄漏 `https://user:PAT@host` 形式的凭据。
+
+> 纠正：旧文档称「自动更新默认拒绝 dirty worktree」。当前实现并不拒绝，而是**先 stash 本地改动、拉取、再尝试恢复**。需要长期保留本地补丁时仍建议先提交或合并，避免依赖自动 stash/restore。
+
+## 18. 签到积分自动续期边界
+
+- 管理员许可、签到总开关、积分续期开关和用户个人偏好是四个独立条件，后端在每次到期任务中全部复核，不能只依赖前端隐藏开关。
+- 自动续期只处理启用中、已经到期、具有固定有效期的普通用户；管理员、白名单、配置管理员、手动禁用账号、永久账号和无有效 Emby 绑定的账号不会自动扣分。
+- 余额检查、积分扣除、Emby 资格复核与到期时间更新统一通过 `SpendSigninPointsAndUpdateUser` 在 Store 锁内完成。余额不足或资格失效时状态整体回滚，不允许出现扣分后未续期。
+- 自动续期失败后继续普通到期处理，避免利用个人偏好让无余额账号绕过到期禁用；同一用户续期成功后有效期已进入未来，后续轮次不会重复消费。
+
+## 19. 上线前检查清单
+
+- [ ] 所有默认 / 示例密钥已替换
+- [ ] `config.local.toml` 与 `.env` 未入库
+- [ ] CORS 策略符合部署预期：兼容模式留空/`*`，限制模式填写可信 Origin 列表
+- [ ] HTTPS 与安全 Cookie（`session_cookie_secure` / 合理 `samesite`）已启用
+- [ ] 双子域部署已正确设置 `session_cookie_domain`，前端和 API 能共享 session cookie
+- [ ] API/Bot 已协调升级，签名使用的有效配置一致；如配置 `bot_internal_secret`，双方均已同步并验证
+- [ ] 多副本部署已配置 Redis（会话 + 限流共享）
+- [ ] `trust_proxy_headers` 与 `trusted_proxy_cidrs` 配置一致（启用代理头时 CIDR 不为空）
+- [ ] 公开端点的速率限制阈值已按预期流量评估
+- [ ] 若启用邮箱验证：SMTP 已用后台「发送测试邮件」验证连通，再开 `[Email].enabled`；强制绑定 `force_bind` 在确认普通账号能正常收码后再开启
+- [ ] `Telegram.ban_on_leave` 已评估：开启前确认 Bot 在每个群有封禁权限，并备好「误封解除」运维流程
+- [ ] 数据库备份 / 恢复 / 迁移预检已在测试环境跑过
+- [ ] Git 自动更新预检显示行为可接受（worktree 状态、stash 策略），且仓库 URL 不含凭据
+- [ ] 关键日志可追溯但不泄密（依赖统一脱敏，自建日志不要打印明文凭据）
+
+## 双重验证
+
+验证器 App、一次性备用码、后台开关、密钥部署、API 契约与恢复操作见 [双重验证（2FA）](../features/two-factor.md)。密码与 Telegram 扫码登录均接入第二步；旧客户端收到 `two_factor_required` 时不能把它当成登录成功。
