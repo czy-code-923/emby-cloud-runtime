@@ -22,7 +22,7 @@ Telegram 由 Twilight 单独收件；不要把同一个 Bot Token 同时交给 O
 
 备份接收公钥在 `runtime/backup-recipient.txt`，本次dmit-pro私钥保存在管理员本机；全新一键安装若尚未指定接收方，会在服务器 `/root/.config/emby-cloud/backup-identity.agekey` 生成独立私钥，应由管理员另存到安全的离线位置。解密用 `age -d -i backup-identity.agekey -o snapshot.tar.gz full-....tar.gz.age`。先在隔离目录核对内容；数据库通过 `pg_restore` 恢复到新库，配置与 Emby/OpenStrm 状态在目标服务停止时恢复。不得把快照直接覆盖到仍在产生新数据的生产目录。当前验证包括临时SQL库恢复、本机解密和SQLite检查，未声称完成整机灾难恢复演练。
 
-管理员可在“系统 → 版本与升级”检查正式Release，点击“一键拉取并升级”并验证当前密码；执行器自动备份和检查。未确认时不会自动升级。镜像摘要保存在不入库的 `images.lock.yaml`，重启使用 `docker compose -f compose.yaml -f images.lock.yaml ...`。固定源码、依赖版本和已发布构建可追踪；不同日期重新构建的系统包不保证得到相同二进制摘要。
+管理员可在“系统运维 → 版本与升级”检查正式Release，点击“一键拉取并升级”并验证当前密码；执行器自动备份和检查。未确认时不会自动升级。镜像摘要保存在不入库的 `images.lock.yaml`，重启使用 `docker compose -f compose.yaml -f images.lock.yaml ...`。固定源码、依赖版本和已发布构建可追踪；不同日期重新构建的系统包不保证得到相同二进制摘要。
 
 
 # 发布升级执行器
@@ -32,3 +32,11 @@ Telegram 由 Twilight 单独收件；不要把同一个 Bot Token 同时交给 O
 升级只取本仓库的正式Release，验证GitHub资产摘要、来源、源码版本和数据库兼容标记。预下载和备份通过后才替换程序；失败回退程序与镜像，保留当前业务数据库。需要数据库不兼容迁移的发布不能直接点击应用。升级进程重启会标记中断，不会自动再次执行未知进度的操作。
 
 从早期alpha部署迁移时，未改动的Git元数据保存在升级历史中；今后使用Release更新，无需在生产目录Git拉取。本地跟踪文件有改动时会拒绝覆盖，需管理员先处理。生产VPS不执行卸载演示；卸载、重装和彻底清理在独立CI环境验证。
+
+v0.2.2新增的tmpfiles配置用于在开机时先创建socket目录，并在执行器重启时保留目录，使后台容器的只读挂载持续有效。首次从v0.2.1使用旧执行器升级后，应补装这份新增宿主机配置；本次dmit-pro已完成并验证执行器重启后面板状态接口正常。全新v0.2.2安装与以后升级会自动安装它：
+
+```bash
+cd /srv/emby-cloud
+cp deploy/emby-cloud-tmpfiles.conf /etc/tmpfiles.d/emby-cloud.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/emby-cloud.conf
+```

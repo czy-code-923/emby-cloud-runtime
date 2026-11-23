@@ -4,6 +4,9 @@
 
 ## 已通过
 
+- v0.2.2正式版本的 [CI运行](https://github.com/czy-code-923/emby-cloud-runtime/actions/runs/45198020748) 全部通过：Go静态检查与鉴权/配置/升级测试、前端构建、固定操作代理、包校验、临时环境安装、保留数据升级、健康故障回退、保留数据卸载/重装、显式清理及无关容器保留。全量源码包、Linux amd64分发包、前后端镜像和校验清单已公开发布。
+- dmit-pro先通过公开一键安装入口从alpha.3迁移到v0.2.1，再通过管理后台使用的原生鉴权升级接口实际应用v0.2.2；管理员密码复核通过，任务最终为`succeeded`，当前/最新正式版本均为0.2.2，检查结果`available=false`。浏览器观察到确认表单、下载阶段、自动重连及升级完成状态。
+- v0.2.2实机再次执行`python3 scripts/check.py`结果`passed=true`：六项服务运行，三个HTTP入口200，未出现OOM与异常重启；原Owner可登录、配置与数据库保留。补装新增tmpfiles配置并重启升级执行器后，后台版本状态/检查接口仍为200；升级服务和备份定时器均为active，原python3:80和sing-box:8080监听保留。
 - 创建 public 仓库与预发布构建；alpha.3 的 [CI 运行](https://github.com/czy-code-923/emby-cloud-runtime/actions/runs/45187427291) 完成镜像构建、Go依赖验证/静态检查及数据库、配置、登录、会话、MFA、初始化等相关测试。
 - 六个服务已在 `/srv/emby-cloud` 启动：PostgreSQL、Twilight后端、WebUI、Caddy、Emby 4.10.2.0、OpenStrm v2.28.0。检查时均在运行，未发现OOM及异常重启；配置了各自内存/PID/日志上限。
 - 三个本机HTTP入口返回200，后台Owner登录成功、首次初始化入口关闭、数据库健康；后台通过专用API Key读取到Emby在线状态与版本。
