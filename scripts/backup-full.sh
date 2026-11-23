@@ -2,7 +2,8 @@
 # Consistent application snapshot. Does not copy PostgreSQL's live data directory.
 set -Eeuo pipefail
 umask 077
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+backup_root=${EMBY_CLOUD_ROOT:-"$(dirname -- "${BASH_SOURCE[0]}")/.."}
+cd -- "$backup_root"
 [[ $EUID == 0 ]] || { echo 'Run as root'; exit 1; }
 command -v age >/dev/null
 mkdir -p backups

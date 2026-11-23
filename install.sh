@@ -9,8 +9,12 @@ action=${1:-install}
 if [[ $action != uninstall ]]; then
     [[ -f /etc/debian_version ]] || { echo '目前支持 Debian / Ubuntu'; exit 1; }
     apt-get update
-    apt-get install -y ca-certificates curl python3 git age docker.io
-    if apt-cache show docker-cli >/dev/null 2>&1; then apt-get install -y docker-cli; fi
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ca-certificates curl python3 git age
+    if ! command -v docker >/dev/null 2>&1; then
+        apt-get install -y docker.io
+        if apt-cache show docker-cli >/dev/null 2>&1; then apt-get install -y docker-cli; fi
+    fi
     if ! docker compose version >/dev/null 2>&1; then
         if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
             apt-get install -y docker-compose-v2

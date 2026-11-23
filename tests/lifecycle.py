@@ -19,6 +19,9 @@ m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 assert os.environ.get('GITHUB_ACTIONS')=='true' and os.geteuid()==0, 'Disposable GitHub runner only'
 assert not m.ROOT.exists(), 'Refusing to touch an existing deployment'
 base=(repo/'VERSION').read_text().strip()
+major,minor,patch_number=map(int,base.split('.'))
+next_version=f'{major}.{minor}.{patch_number+1}'
+failed_version=f'{major}.{minor}.{patch_number+2}'
 temp=Path(tempfile.mkdtemp(prefix='emby-cloud-ci-'))
 fixture=temp/'assets';fixture.mkdir()
 source=temp/'source'
@@ -56,23 +59,35 @@ with patch.object(m,'release_info',side_effect=lambda *_args:dict(release)),patc
     assert api('/api/v2/admin/deployment/status')['data']['installed_version']==base
     env_before=(m.ROOT/'.env').read_bytes()
     sentinel=m.ROOT/'runtime/media/movies/ci-preserve.txt';sentinel.write_text('keep media and configuration')
-    prepare('0.2.1')
-    manager.install('v0.2.1')
+    # Exercise adoption of an early alpha deployment, including its older lock behavior.
+    (m.ROOT/'.emby-cloud.json').unlink()
+    (m.ROOT/'VERSION').write_text('0.1.0-alpha.3\n')
+    legacy_backup=subprocess.check_output(['git','show','3f82262:scripts/backup-full.sh'],cwd=repo)
+    (m.ROOT/'scripts/backup-full.sh').write_bytes(legacy_backup)
+    subprocess.run(['git','init',str(m.ROOT)],check=True)
+    subprocess.run(['git','-C',str(m.ROOT),'config','user.name','Disposable CI'],check=True)
+    subprocess.run(['git','-C',str(m.ROOT),'config','user.email','ci@example.invalid'],check=True)
+    subprocess.run(['git','-C',str(m.ROOT),'add','VERSION','compose.yaml','scripts/backup-full.sh'],check=True)
+    subprocess.run(['git','-C',str(m.ROOT),'commit','-m','Disposable alpha adoption fixture'],check=True)
+    prepare(next_version)
+    manager.install('v'+next_version)
     assert (m.ROOT/'.env').read_bytes().split(b'POSTGRES_PASSWORD=',1)[1].splitlines()[0]==env_before.split(b'POSTGRES_PASSWORD=',1)[1].splitlines()[0]
     assert sentinel.read_text()=='keep media and configuration'
     api('/api/v2/auth/login',{'username':'ci-owner','password':'CI-Disposable-Password123!'})
     assert api('/api/v2/admin/health/database')['data']['user_count']==1
-    assert manager.status()['installed_version']=='0.2.1'
-    prepare('0.2.2')
+    assert manager.status()['installed_version']==next_version
+    assert not (m.ROOT/'.git').exists()
+    assert any((m.STATE/'history').glob('*/legacy-git'))
+    prepare(failed_version)
     original=manager.command
     def injected(args,**kwargs):
         if any(str(arg).endswith('/scripts/check.py') for arg in args):raise RuntimeError('Injected post-start health failure')
         return original(args,**kwargs)
     with patch.object(manager,'command',side_effect=injected):
-        try:manager.install('v0.2.2')
+        try:manager.install('v'+failed_version)
         except RuntimeError:pass
         else:raise AssertionError('Health failure must abort the upgrade')
-    assert manager.status()['installed_version']=='0.2.1'
+    assert manager.status()['installed_version']==next_version
     assert manager.status()['job']['phase']=='rolled_back'
     assert sentinel.exists()
     api('/api/v2/auth/login',{'username':'ci-owner','password':'CI-Disposable-Password123!'})
@@ -81,7 +96,8 @@ with patch.object(m,'release_info',side_effect=lambda *_args:dict(release)),patc
     manager.uninstall()
     assert sentinel.exists() and (m.ROOT/'.env').exists()
     assert json.loads(subprocess.check_output(['docker','inspect','unrelated-canary']))[0]['State']['Running']
-    manager.install('v0.2.1')
+    prepare(next_version)
+    manager.install('v'+next_version)
     api('/api/v2/auth/login',{'username':'ci-owner','password':'CI-Disposable-Password123!'})
     assert api('/api/v2/admin/health/database')['data']['user_count']==1
     assert sentinel.exists()

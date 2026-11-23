@@ -23,6 +23,8 @@ jobs:
       TWILIGHT_DATABASE_URL: postgres://twilight_test:ci_disposable_only@127.0.0.1:5432/twilight_test?sslmode=disable
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
         with:
           go-version-file: upstream/twilight/go.mod
@@ -60,6 +62,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          fetch-depth: 0
       - name: Build application images
         run: |
           version=$(cat VERSION)

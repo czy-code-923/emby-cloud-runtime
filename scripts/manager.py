@@ -179,7 +179,7 @@ class Manager:
     def _background(self, tag):
         try:
             self.install(tag)
-            self.command(['systemd-run','--collect','--unit=emby-cloud-updater-refresh','--on-active=8s',
+            self.command(['systemd-run','--collect','--unit=emby-cloud-updater-refresh-'+secrets.token_hex(4),'--on-active=8s',
                           '/bin/systemctl','try-restart','emby-cloud-updater.service'],timeout=30)
         except Exception as exc:
             phase=read_json(self.status_file,{}).get('phase')
@@ -240,7 +240,8 @@ class Manager:
                 self.progress('backup')
                 env = os.environ.copy()
                 env['EMBY_CLOUD_LOCK_HELD'] = '1'
-                self.command(['bash',str(self.root/'scripts/backup-full.sh')], env=env)
+                env['EMBY_CLOUD_ROOT'] = str(self.root)
+                self.command(['bash',str(source/'scripts/backup-full.sh')], env=env)
             files = sorted(p.relative_to(source).as_posix() for p in source.rglob('*') if p.is_file())
             old_files = old_marker.get('files', files)
             saved = self.state/'history'/stamp
