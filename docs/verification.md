@@ -14,6 +14,7 @@
 - 原有python3:80、sing-box:8080及其它原有监听仍存在，未修改其配置。
 - 首份一致备份：停写后SQL导出并恢复到独立临时数据库成功，4个Emby SQLite检查成功；本机下载、age解密、归档必需文件与4个SQLite再次检查成功。
 - 每日北京时间04:20后0～5分钟的systemd加密备份定时器已启用；包括OpenStrm在内再次手动执行，systemd回执 `Result=success`、`ExecMainStatus=0`，原服务恢复运行。
+- alpha.3实机安装后再次检查通过，原Owner账户/关闭的初始化状态保留。快照 `full-20261123T135516Z.tar.gz.age` 已下载到本机，解密通过，91个归档条目包含PostgreSQL导出、Emby/OpenStrm状态、配置和镜像锁；快照内版本为alpha.3。
 
 ## 尚未验收或完成
 
