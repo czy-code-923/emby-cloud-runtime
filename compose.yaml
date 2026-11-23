@@ -42,7 +42,9 @@ services:
       TWILIGHT_POSTGRES_SSLMODE: disable
       TWILIGHT_TWO_FACTOR_KEY: ${TWILIGHT_TWO_FACTOR_KEY:?Generate local secrets first}
       TWILIGHT_BOT_INTERNAL_SECRET: ${BOT_INTERNAL_SECRET:?Generate local secrets first}
-    volumes: ["./runtime/twilight:/var/lib/twilight"]
+    volumes:
+      - ./runtime/twilight:/var/lib/twilight
+      - /run/emby-cloud-updater:/run/emby-cloud-updater:ro
     depends_on:
       postgres: {condition: service_healthy}
     healthcheck:

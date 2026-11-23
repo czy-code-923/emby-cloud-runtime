@@ -1,0 +1,109 @@
+import assert from "node:assert/strict";
+import { test as t } from "node:test";
+import { parseJsonBigIntSafe, reachedCursor, type LifeEvent } from "../cloud-115/life.js";
+import { matchTask, toStrmPath, type LifeContext } from "./handlers.js";
+import { joinPanPath } from "../cloud-115/path-resolver.js";
+import type { TaskDefinition } from "@openstrm/shared";
+// ---- parseJsonBigIntSafe ----
+t("19 位 id 不丢精度", () => {
+  const raw = '{"data":{"count":3,"list":[{"id":2618855323975851714,"file_id":3040163688862324736,"parent_id":0,"type":2}]}}';
+  const o = parseJsonBigIntSafe<any>(raw);
+  assert.equal(o.data.list[0].id, "2618855323975851714");
+  assert.equal(o.data.list[0].file_id, "3040163688862324736");
+  assert.equal(o.data.list[0].parent_id, 0, "短整数保持数字");
+  assert.equal(o.data.count, 3);
+});
+t("已是字符串的 id 原样保留", () => {
+  const o = parseJsonBigIntSafe<any>('{"file_id":"3040163688862324736"}');
+  assert.equal(o.file_id, "3040163688862324736");
+});
+t("数组结尾的长整数也被引号包住", () => {
+  const o = parseJsonBigIntSafe<any>('{"ids":[3040163688862324736]}');
+  assert.equal(o.ids[0], "3040163688862324736");
+});
+
+t("字符串内部的长数字不被改动", () => {
+  const raw = '{"file_name":"S01E01 [1234567890123456789] 4K.mkv","file_id":3040163688862324736}';
+  const o = parseJsonBigIntSafe<any>(raw);
+  assert.equal(o.file_name, "S01E01 [1234567890123456789] 4K.mkv");
+  assert.equal(o.file_id, "3040163688862324736");
+});
+t("字符串里的转义引号不破坏扫描", () => {
+  const o = parseJsonBigIntSafe<any>('{"n":"a\\"b","file_id":3040163688862324736}');
+  assert.equal(o.n, 'a"b');
+  assert.equal(o.file_id, "3040163688862324736");
+});
+t("小数的小数部分很长时不被误当成大整数（会产生非法 JSON）", () => {
+  // 真实事故：只吃连续数字的扫描器会把小数部分单独加引号，
+  // 得到 0."9007199254740993000"，JSON.parse 报 Unterminated fractional number
+  const o = parseJsonBigIntSafe<any>('{"a":0.9007199254740993000,"file_id":3040163688862324736}');
+  assert.equal(o.a, 0.9007199254740993);
+  assert.equal(o.file_id, "3040163688862324736");
+});
+t("负的长整数整体加引号，而不是留下 -\"123\"", () => {
+  const o = parseJsonBigIntSafe<any>('{"a":-3040163688862324736}');
+  assert.equal(o.a, "-3040163688862324736");
+});
+t("科学计数法原样保留", () => {
+  const o = parseJsonBigIntSafe<any>('{"a":1.5e+20,"b":-2E-8}');
+  assert.equal(o.a, 1.5e20);
+  assert.equal(o.b, -2e-8);
+});
+t("长整数后紧跟小数不受影响", () => {
+  const o = parseJsonBigIntSafe<any>('{"a":3040163688862324736,"b":1.25,"c":-7}');
+  assert.equal(o.a, "3040163688862324736");
+  assert.equal(o.b, 1.25);
+  assert.equal(o.c, -7);
+});
+t("浮点与短整数原样保留为数字", () => {
+  const o = parseJsonBigIntSafe<any>('{"a":1.5,"b":123,"c":1e3,"d":0}');
+  assert.equal(o.a, 1.5); assert.equal(o.b, 123); assert.equal(o.c, 1000); assert.equal(o.d, 0);
+});
+// ---- reachedCursor（列表倒序，命中即停） ----
+const ev = (id: string, ut: number) => ({ id, update_time: ut } as LifeEvent);
+t("id 相等 → 停", () => assert.equal(reachedCursor(ev("100", 5), { fromId: "100", fromTime: 0 }), true));
+t("id 更小 → 停", () => assert.equal(reachedCursor(ev("99", 5), { fromId: "100", fromTime: 0 }), true));
+t("id 更大 → 继续", () => assert.equal(reachedCursor(ev("101", 5), { fromId: "100", fromTime: 0 }), false));
+t("19 位 id 按长度先比，不走字典序", () => {
+  assert.equal(reachedCursor(ev("2618855323975851715", 0), { fromId: "2618855323975851714", fromTime: 0 }), false);
+  assert.equal(reachedCursor(ev("999999999999999999", 0), { fromId: "1000000000000000000", fromTime: 0 }), true, "18 位 < 19 位");
+  assert.equal(reachedCursor(ev("1000000000000000000", 0), { fromId: "999999999999999999", fromTime: 0 }), false, "19 位 > 18 位");
+});
+t("update_time 早于游标 → 停", () => assert.equal(reachedCursor(ev("0", 100), { fromId: "0", fromTime: 200 }), true));
+t("update_time 等于游标 → 继续（含）", () => assert.equal(reachedCursor(ev("0", 200), { fromId: "0", fromTime: 200 }), false));
+// ---- joinPanPath ----
+t("根目录下拼接不出现双斜杠", () => assert.equal(joinPanPath("/", "tv"), "/tv"));
+t("普通拼接", () => assert.equal(joinPanPath("/tv", "ShowA"), "/tv/ShowA"));
+t("文件名里的 / 被转义", () => assert.equal(joinPanPath("/tv", "a/b"), "/tv/a\\/b"));
+// ---- toStrmPath ----
+t(".mkv → .strm", () => assert.equal(toStrmPath("/d/a.mkv"), "/d/a.strm"));
+t("目录名含点也不误伤", () => assert.equal(toStrmPath("/d.v2/a.mkv"), "/d.v2/a.strm"));
+// ---- matchTask + strm 内容与全量任务一致 ----
+const tasks: TaskDefinition[] = [
+  { id: "t-tv", account: "acct", accountType: "115", originPath: "tv", targetPath: "tv", strmPrefix: "/prefix" },
+  { id: "t-movie", account: "acct", accountType: "115", originPath: "movie", targetPath: "movie", strmPrefix: "/prefix" },
+  { id: "t-sub", account: "acct", accountType: "115", originPath: "tv/anime", targetPath: "anime", strmPrefix: "/p" },
+];
+const ctx = { tasks } as unknown as LifeContext;
+t("originPath 无前导斜杠时也能命中", () => {
+  const m = matchTask(ctx, "/tv/ShowA/ep1.mkv");
+  assert.equal(m?.task.id, "t-tv");
+  assert.equal(m?.relPath, "ShowA/ep1.mkv");
+});
+t("命中最长（最具体）的 originPath", () => {
+  const m = matchTask(ctx, "/tv/anime/SubShow/ep1.mkv");
+  assert.equal(m?.task.id, "t-sub");
+  assert.equal(m?.relPath, "SubShow/ep1.mkv");
+});
+t("不在任何 originPath 下 → null", () => assert.equal(matchTask(ctx, "/other/x.mkv"), null));
+t("前缀相同但不是子路径 → 不命中", () => assert.equal(matchTask(ctx, "/tvshows/x.mkv"), null));
+t("originPath 自身 → relPath 为空", () => assert.equal(matchTask(ctx, "/tv")?.relPath, ""));
+
+t("originPath 写得不规范（重复斜杠、段首尾空格）也按归一化后的路径命中，和变更源算出来的事件路径一致", () => {
+  const tasks: TaskDefinition[] = [{ id: "odd", account: "a", accountType: "quark", originPath: "tv// show /", targetPath: "tv-odd", strmPrefix: "/mnt" }];
+  const ctx = { tasks } as unknown as LifeContext;
+  const m = matchTask(ctx, "/tv/show/S1/e1.mkv");
+  assert.equal(m?.task.id, "odd");
+  assert.equal(m?.relPath, "S1/e1.mkv");
+  assert.equal(matchTask(ctx, "/tv/showx/e1.mkv"), null);
+});

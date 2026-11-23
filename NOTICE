@@ -1,6 +1,12 @@
 Twilight Licensing and Attribution Notice
 ==========================================
 
+Distribution modifications (2026-11-23, czy-code-923): added a fixed-repository
+release updater API and administrator interface, deployment configuration,
+installation/uninstallation tools, encrypted snapshots and release packaging.
+Complete corresponding source: https://github.com/czy-code-923/emby-cloud-runtime
+OpenStrm source is separately preserved under upstream/openstrm with its license.
+
 Copyright (C) 2025-2026 Prejudice Studio
 Original project: Twilight
 Upstream source: https://github.com/Prejudice-Studio/Twilight

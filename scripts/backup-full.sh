@@ -7,7 +7,9 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 command -v age >/dev/null
 mkdir -p backups
 exec 9>runtime/.maintenance.lock
-flock -n 9 || { echo 'Another maintenance operation is active'; exit 1; }
+if [[ ${EMBY_CLOUD_LOCK_HELD:-0} != 1 ]]; then
+  flock -n 9 || { echo 'Another maintenance operation is active'; exit 1; }
+fi
 recipient=${AGE_RECIPIENT:-$(cat runtime/backup-recipient.txt 2>/dev/null || true)}
 [[ $recipient == age1* && $recipient != *[[:space:]]* ]] || { echo 'Set AGE_RECIPIENT or runtime/backup-recipient.txt'; exit 1; }
 dc=(docker compose --profile cloud --profile source -f compose.yaml -f images.lock.yaml)

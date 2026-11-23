@@ -1,0 +1,607 @@
+"use client";
+
+import * as React from "react";
+import { useEffect, useMemo, useReducer, useState } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  CheckCircle2,
+  History,
+  Loader2,
+  ScrollText,
+  Square,
+  XCircle,
+} from "lucide-react";
+import { toast } from "sonner";
+import type { TaskExecutionHistory } from "@openstrm/shared";
+import { Badge } from "@/components/ui/badge";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { PageHeader } from "@/components/page-header";
+import { StatusBadge } from "@/components/status-badge";
+import { ProgressBar } from "@/components/progress-bar";
+import { EmptyState } from "@/components/empty-state";
+import { Spinner } from "@/components/loading";
+import { api } from "@/lib/api";
+import { apiErrorMessage, apiErrorStatus } from "@/lib/axios";
+import { streamSse } from "@/lib/sse";
+import { RUN_STATUS } from "@/lib/status";
+import { useCountUp } from "@/hooks/use-count-up";
+import { FILE_FAILURE_LABEL, failureActionLink } from "@/lib/task-failures";
+import {
+  applyEvents,
+  countFiles,
+  createLogState,
+  normalizeEvent,
+  type FileRow,
+  type LogEvent,
+  type LogState,
+  groupFailures,
+  type FailureGroup,
+} from "./events";
+
+/** 列表最多渲染最近这么多行：任务动辄几千个文件，全部渲染会把页面拖死 */
+const MAX_ROWS = 500;
+/** 事件攒一批再渲染：几万个文件时每条事件都 setState 会把页面卡死 */
+const FLUSH_MS = 200;
+const RECONNECT_MS = 2000;
+const MAX_RECONNECTS = 5;
+
+type Connection = "connecting" | "live" | "reconnecting" | "closed" | "history" | "not-running";
+type Filter = "all" | "active" | "failed";
+type TaskInfo = { originPath: string; targetPath: string; account: string };
+
+type Action = { type: "apply"; events: LogEvent[] } | { type: "reset" };
+
+function reducer(state: LogState, action: Action): LogState {
+  if (action.type === "reset") return createLogState();
+  return applyEvents(state, action.events);
+}
+
+const CONNECTION_LABEL: Record<Connection, string> = {
+  connecting: "连接中…",
+  live: "实时",
+  reconnecting: "连接断了，重连中…",
+  closed: "连接已关闭",
+  history: "历史记录",
+  "not-running": "任务未运行",
+};
+
+function fmtTime(ms: number | null): string {
+  return ms ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—";
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s} 秒`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+  return `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分`;
+}
+
+/**
+ * 静态导出没有运行时的动态路由段，任务 id 和执行记录 id 都走查询串：
+ * /log?taskId=…（实时）或 /log?taskId=…&executionId=…（历史）。
+ * useSearchParams 在静态渲染时必须包在 Suspense 里，否则 next build 直接报错。
+ */
+export default function LogPage() {
+  return (
+    <React.Suspense fallback={<Spinner label="加载中…" />}>
+      <LogRouter />
+    </React.Suspense>
+  );
+}
+
+function LogRouter() {
+  const search = useSearchParams();
+  const taskId = search.get("taskId") ?? "";
+  const executionId = search.get("executionId") ?? undefined;
+  if (!taskId) {
+    return (
+      <EmptyState
+        icon={ScrollText}
+        title="缺少 taskId 参数"
+        description="从任务列表的「实时日志」或「执行历史」进来才能看到日志"
+        action={
+          <Button variant="outline" asChild>
+            <Link href="/home">去任务列表</Link>
+          </Button>
+        }
+      />
+    );
+  }
+  // 参数变了整个视图重来，省得在效果里处理"半路换任务"
+  return <TaskLogView key={`${taskId}:${executionId ?? ""}`} taskId={taskId} executionId={executionId} />;
+}
+
+function TaskLogView({ taskId, executionId }: { taskId: string; executionId?: string }) {
+  const router = useRouter();
+  const [state, dispatch] = useReducer(reducer, undefined, createLogState);
+  const [connection, setConnection] = useState<Connection>("connecting");
+  const [taskInfo, setTaskInfo] = useState<TaskInfo | null>(null);
+  const [execution, setExecution] = useState<TaskExecutionHistory | null>(null);
+  const [filter, setFilter] = useState<Filter>("all");
+  const [cancelling, setCancelling] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+
+  // 任务路径：实时模式从任务列表里找；历史模式用记录里存的（任务可能已经删了）
+  useEffect(() => {
+    if (executionId) return;
+    let cancelled = false;
+    api.tasks
+      .list()
+      .then((rows) => {
+        if (cancelled) return;
+        const t = rows.find((r) => r.id === taskId);
+        if (t) setTaskInfo({ originPath: t.originPath, targetPath: t.targetPath, account: t.account });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [taskId, executionId]);
+
+  // 历史模式：一次取回记录（带日志行），按路径归并
+  useEffect(() => {
+    if (!executionId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const ex = await api.history.get(executionId);
+        if (cancelled) return;
+        // 记录还在跑（从历史页点进来的）：改看实时
+        if (ex.status === "running") {
+          router.replace(`/log?taskId=${encodeURIComponent(taskId)}`);
+          return;
+        }
+        setExecution(ex);
+        setTaskInfo({ originPath: ex.taskInfo.originPath, targetPath: ex.taskInfo.targetPath, account: ex.taskInfo.account });
+        const events = ex.logs.map(normalizeEvent).filter((e): e is LogEvent => e !== null);
+        // 旧记录没有开始事件：总数和开始时间从记录本身补
+        if (!events.some((e) => e.type === "start")) {
+          events.unshift({ type: "start", total: ex.summary.totalFiles, strmTotal: 0, downloadTotal: 0, at: ex.startTime });
+        }
+        // 记录本身的结论优先于日志行：旧记录可能没有结束事件，启动阶段失败的记录一行日志都没有
+        events.push({
+          type: "done",
+          status: ex.status,
+          finished: ex.summary.downloadedFiles,
+          failed: ex.summary.failedFiles ?? null,
+          total: ex.summary.totalFiles,
+          overall: null,
+          message: ex.summary.errorMessage ?? null,
+          stopped: ex.summary.stopped ?? null,
+          at: ex.endTime ?? null,
+        });
+        dispatch({ type: "reset" });
+        dispatch({ type: "apply", events });
+        setConnection("history");
+      } catch (err) {
+        if (cancelled) return;
+        const status = (err as { response?: { status?: number } } | null)?.response?.status;
+        setConnection(status === 404 ? "not-running" : "closed");
+        toast.error(status === 404 ? "这条执行记录不存在" : apiErrorMessage(err, "加载执行记录失败"));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [taskId, executionId, router]);
+
+  // 实时模式：SSE（传输层在 lib/sse.ts：看门狗、会话失效跳登录），断了自动重连；任务没在跑就跳到最近一次执行记录
+  useEffect(() => {
+    if (executionId) return;
+    let cancelled = false;
+    const controller = new AbortController();
+    const pending: LogEvent[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      flushTimer = null;
+      if (pending.length === 0) return;
+      dispatch({ type: "apply", events: pending.splice(0) });
+    };
+    const queue = (ev: LogEvent) => {
+      pending.push(ev);
+      if (!flushTimer) flushTimer = setTimeout(flush, FLUSH_MS);
+    };
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    (async () => {
+      let attempts = 0;
+      while (!cancelled) {
+        setConnection(attempts === 0 ? "connecting" : "reconnecting");
+        let finished = false;
+        try {
+          await streamSse<unknown>(`/api/taskLog/${encodeURIComponent(taskId)}`, {
+            method: "GET",
+            signal: controller.signal,
+            onOpen: () => {
+              setConnection("live");
+              // 服务端每次连上都把已有日志整个回放一遍：先清掉再合并，重连不会重复
+              dispatch({ type: "reset" });
+            },
+            onEvent: (raw) => {
+              const ev = normalizeEvent(raw);
+              if (!ev) return;
+              queue(ev);
+              if (ev.type === "done") finished = true;
+            },
+          });
+        } catch (err) {
+          if (cancelled) return;
+          const status = apiErrorStatus(err);
+          if (status === 404) {
+            // 没在跑：有历史就看最近一次，让 /log?taskId= 永远有东西可看
+            const list = await api.history.list(taskId).catch(() => []);
+            if (cancelled) return;
+            if (list[0]) {
+              router.replace(`/log?taskId=${encodeURIComponent(taskId)}&executionId=${encodeURIComponent(list[0].id)}`);
+              return;
+            }
+            setConnection("not-running");
+            return;
+          }
+          // 会话失效 / 要先改密码：streamSse 已经在跳页了，别再连
+          if (status === 401 || status === 403) {
+            setConnection("closed");
+            return;
+          }
+          console.error("task log stream error", err);
+        }
+        if (cancelled) return;
+        flush();
+        if (finished) {
+          setConnection("closed");
+          return;
+        }
+        // 流没带结束事件就断了：多半是反代掐了空闲连接、或 60 秒没动静被看门狗掐了，任务还在跑；重连几次
+        attempts += 1;
+        if (attempts > MAX_RECONNECTS) {
+          setConnection("closed");
+          return;
+        }
+        await sleep(RECONNECT_MS);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (flushTimer) clearTimeout(flushTimer);
+    };
+  }, [taskId, executionId, router]);
+
+  // 用时每秒走一下
+  const running = state.status === "running" && connection !== "history" && connection !== "not-running";
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [running]);
+
+  const cancelTask = async () => {
+    setCancelling(true);
+    try {
+      await api.tasks.cancel(taskId);
+      toast.success("已发出取消");
+    } catch (err) {
+      toast.error(apiErrorMessage(err, "取消任务失败"));
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const counts = useMemo(() => countFiles(state), [state]);
+  // 只在结束后展示，跑着的时候不用每次刷新都分一遍组
+  const failureGroups = useMemo(() => (running ? [] : groupFailures(state)), [state, running]);
+  const startedAt = state.startedAt ?? execution?.startTime ?? null;
+  const endedAt = state.endedAt ?? execution?.endTime ?? null;
+  const duration = startedAt ? (endedAt ?? now) - startedAt : null;
+  const kindKnown = (state.strmTotal ?? 0) + (state.downloadTotal ?? 0) > 0;
+
+  const rows = useMemo(() => {
+    const all = [...state.files.values()];
+    const picked =
+      filter === "failed"
+        ? all.filter((f) => f.error)
+        : filter === "active"
+          ? all.filter((f) => !f.error && f.percent < 100)
+          : all;
+    return picked.slice(-MAX_ROWS).reverse();
+  }, [state.files, filter]);
+
+  const statusMeta = connection === "not-running" ? null : RUN_STATUS[state.status];
+  const title = taskInfo?.originPath || `任务 ${taskId.slice(0, 8)}…`;
+
+  return (
+    <div className="space-y-6">
+      <div className="space-y-3">
+        {/* 顶栏也常驻一个返回键；这里这个做成手指能点中的高度 */}
+        <Link href="/home" className="inline-flex h-9 items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
+          <ArrowLeft className="size-4" />
+          返回任务列表
+        </Link>
+        <PageHeader
+          icon={ScrollText}
+          title={<span title={taskId}>{title}</span>}
+          description={taskInfo ? `→ ${taskInfo.targetPath} · 账户 ${taskInfo.account}` : undefined}
+          actions={
+            <>
+              {statusMeta ? (
+                <StatusBadge tone={statusMeta.tone} pulse={running}>
+                  {state.starting ? "启动中" : statusMeta.label}
+                </StatusBadge>
+              ) : (
+                <StatusBadge tone="neutral">未运行</StatusBadge>
+              )}
+              {running && state.starting && <span className="text-xs text-muted-foreground">读取目录阶段暂不能取消</span>}
+              {running && !state.starting && (
+                <Button variant="destructive" size="sm" onClick={cancelTask} disabled={cancelling}>
+                  {cancelling ? <Loader2 className="size-4 animate-spin" /> : <Square className="size-4" />}
+                  取消任务
+                </Button>
+              )}
+              <Button variant="outline" size="sm" asChild>
+                <Link href={`/history?taskId=${encodeURIComponent(taskId)}`}>
+                  <History className="size-4" />
+                  执行历史
+                </Link>
+              </Button>
+            </>
+          }
+        />
+      </div>
+
+      {connection === "not-running" ? (
+        <EmptyState
+          icon={ScrollText}
+          title="这个任务没在运行，也还没有执行记录"
+          description="到任务列表点「开始」跑一次。"
+          action={
+            <Button variant="outline" asChild>
+              <Link href="/home">去任务列表</Link>
+            </Button>
+          }
+        />
+      ) : (
+        <>
+          <div className={`space-y-4 rounded-xl border bg-card p-5 ${running ? "running-outline" : ""}`}>
+            <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4 lg:grid-cols-7">
+              <Stat label="总文件" value={counts.total ?? "—"} hint={kindKnown ? `strm ${state.strmTotal} · 下载 ${state.downloadTotal}` : undefined} />
+              <Stat label="已完成" value={counts.done} />
+              <Stat label="失败" value={counts.failed} tone={counts.failed > 0 ? "bad" : undefined} />
+              <Stat label="进行中" value={counts.active} />
+              <Stat label="未开始" value={counts.pending ?? "—"} />
+              <Stat label="用时" value={duration != null ? fmtDuration(duration) : "—"} hint={startedAt ? `开始于 ${fmtTime(startedAt)}` : undefined} />
+              <Stat label="连接" value={CONNECTION_LABEL[connection]} tone={connection === "reconnecting" ? "warn" : undefined} />
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span>总进度</span>
+                <span className="font-medium tabular-nums text-foreground">{counts.percent.toFixed(2)}%</span>
+              </div>
+              {/* 颜色跟状态标签走，同一个语义色；跑着的时候条上会有一道扫过去的高光 */}
+              <ProgressBar percent={counts.percent} tone={statusMeta?.tone ?? "neutral"} running={running} size="md" />
+            </div>
+            {execution && execution.summary.deletedFiles > 0 && (
+              <p className="text-xs text-muted-foreground">这次同步清理了 {execution.summary.deletedFiles} 个本地多余文件</p>
+            )}
+          </div>
+
+          {state.fatalError && (
+            <Banner tone="bad" icon={<XCircle className="size-4" />}>
+              任务出错：{state.fatalError}
+            </Banner>
+          )}
+          {!state.fatalError && state.status === "failed" && state.stopped && (
+            <Banner tone="bad" icon={<XCircle className="size-4" />}>
+              同步中止：{state.stopped.message}
+              {state.stopped.remaining > 0 && `，还有 ${state.stopped.remaining} 个文件没轮到`}
+              {state.stopped.advice && <div className="mt-1 font-normal">{state.stopped.advice}</div>}
+            </Banner>
+          )}
+          {!state.fatalError && state.status === "failed" && !state.stopped && state.finalMessage && (
+            <Banner tone="bad" icon={<AlertTriangle className="size-4" />}>
+              {state.finalMessage}
+              {counts.failed > 0 && (
+                <button type="button" className="ml-2 underline" onClick={() => setFilter("failed")}>
+                  只看失败的
+                </button>
+              )}
+            </Banner>
+          )}
+          {failureGroups.length > 0 && !running && <FailureGroups groups={failureGroups} taskId={taskId} onFilter={() => setFilter("failed")} />}
+          {state.status === "cancelled" && (
+            <Banner tone="warn" icon={<Square className="size-4" />}>
+              {state.finalMessage ?? "任务已取消"}
+            </Banner>
+          )}
+          {/* 启动阶段就结束的"无事可做"：正常跑完的结束事件不带 message */}
+          {state.status === "completed" && state.finalMessage && (
+            <Banner tone="info" icon={<CheckCircle2 className="size-4" />}>
+              {state.finalMessage}
+            </Banner>
+          )}
+
+          <div className="overflow-hidden rounded-xl border bg-card">
+            <div className="flex flex-wrap items-center gap-1 border-b bg-muted/40 px-3 py-2 text-xs">
+              <FilterTab active={filter === "all"} onClick={() => setFilter("all")}>
+                全部 {state.files.size}
+              </FilterTab>
+              <FilterTab active={filter === "active"} onClick={() => setFilter("active")}>
+                进行中 {counts.active}
+              </FilterTab>
+              <FilterTab active={filter === "failed"} onClick={() => setFilter("failed")}>
+                失败 {counts.failed}
+              </FilterTab>
+              {state.files.size > MAX_ROWS && (
+                <span className="ml-auto text-muted-foreground">只显示最近 {MAX_ROWS} 条</span>
+              )}
+            </div>
+            <div className="scroll-fade">
+              <div className="max-h-[60vh] overflow-y-auto">
+                {rows.length === 0 ? (
+                  <div className="p-8 text-center text-sm text-muted-foreground">
+                    {connection === "connecting"
+                      ? "连接中…"
+                      : filter !== "all"
+                        ? "没有这一类的文件"
+                        : connection === "history"
+                          ? "这条记录没有文件级日志"
+                          : state.starting
+                            ? (
+                              <span className="inline-flex items-center gap-2">
+                                <Loader2 className="size-4 animate-spin" />
+                                正在读取远端目录，拿到文件清单后开始处理…
+                              </span>
+                            )
+                            : "还没有文件开始处理"}
+                  </div>
+                ) : (
+                  rows.map((f) => <FileLine key={f.path} file={f} running={running} />)
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 数字滚到位而不是跳变。计数每来一个文件就变一次，直接换数字会闪 */
+function CountUpValue({ value }: { value: number }) {
+  return <>{useCountUp(value)}</>;
+}
+
+function Stat({ label, value, hint, tone }: { label: string; value: string | number; hint?: string; tone?: "bad" | "warn" }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className={`truncate font-medium tabular-nums ${tone === "bad" ? "text-destructive" : tone === "warn" ? "text-warning" : ""}`} title={hint}>
+        {/* 用时和连接状态是文字，原样显示 */}
+        {typeof value === "number" ? <CountUpValue value={value} /> : value}
+      </div>
+      {hint && <div className="truncate text-xs text-muted-foreground">{hint}</div>}
+    </div>
+  );
+}
+
+function Banner({ tone, icon, children }: { tone: "bad" | "warn" | "info"; icon: React.ReactNode; children: React.ReactNode }) {
+  const cls =
+    tone === "bad"
+      ? "border-destructive/40 bg-destructive/5 text-destructive"
+      : tone === "warn"
+        ? "border-warning/40 bg-warning/10 text-warning"
+        : "border-border bg-card text-muted-foreground";
+  return (
+    <div className={`flex items-start gap-2 rounded-md border p-3 text-sm break-all ${cls}`}>
+      <span className="mt-0.5 shrink-0">{icon}</span>
+      <div>{children}</div>
+    </div>
+  );
+}
+
+function FilterTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded px-2 py-1 tabular-nums ${active ? "bg-card font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** 失败的文件按原因分组：一句说明、一句建议、一个按钮（去整理 / 看账号 / 开设置） */
+function FailureGroups({ groups, taskId, onFilter }: { groups: FailureGroup[]; taskId: string; onFilter: () => void }) {
+  return (
+    <section className="space-y-3 rounded-xl border border-destructive/40 bg-card p-4">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <AlertTriangle className="size-4 text-destructive" />
+          失败原因
+        </div>
+        <button type="button" className="text-xs text-muted-foreground underline hover:text-foreground" onClick={onFilter}>
+          只看失败的
+        </button>
+      </div>
+      {groups.map((g) => {
+        const link = g.action ? failureActionLink(g.action, taskId) : null;
+        return (
+          <div key={g.reason} className="flex flex-wrap items-start gap-2 text-sm">
+            <StatusBadge tone={g.reason === "gone" ? "neutral" : "danger"} className="tabular-nums">
+              {FILE_FAILURE_LABEL[g.reason] ?? g.reason} · {g.files.length}
+            </StatusBadge>
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="break-all">{g.message || g.files[0]?.error}</div>
+              {g.advice && <div className="text-xs text-muted-foreground break-all">{g.advice}</div>}
+            </div>
+            {link && (
+              <Link href={link.href} className={buttonVariants({ variant: "outline", size: "sm" })}>
+                {link.label}
+              </Link>
+            )}
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+function FileLine({ file, running }: { file: FileRow; running: boolean }) {
+  const failed = Boolean(file.error);
+  const done = !failed && file.percent >= 100;
+  // 任务已经结束（取消 / 出错）时还没到 100% 的文件不会再动了，别让它一直转圈
+  const interrupted = !failed && !done && !running;
+  return (
+    // 手机上文件名占满一行，类型和进度折到下一行；sm 起恢复成一行
+    <div className={`flex items-start gap-3 border-b px-4 py-2 last:border-b-0 sm:items-center ${running ? "stream-row" : ""}`}>
+      <span className="mt-0.5 shrink-0 sm:mt-0">
+        {failed ? (
+          <XCircle className="size-4 text-destructive" />
+        ) : done ? (
+          <CheckCircle2 className="size-4 text-success" />
+        ) : interrupted ? (
+          <Square className="size-4 text-muted-foreground" />
+        ) : (
+          <Loader2 className="size-4 animate-spin text-brand" />
+        )}
+      </span>
+      <div className="flex min-w-0 flex-1 flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm break-all">{file.path}</div>
+          {file.error && (
+            <div className="text-xs break-all" title={file.error}>
+              <span className="text-destructive">{file.message ?? file.error}</span>
+              {file.attempted === false && <span className="ml-1 text-muted-foreground">（没去碰文件系统）</span>}
+              {file.advice && <span className="ml-1 text-muted-foreground">{file.advice}</span>}
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-2 text-xs sm:shrink-0">
+          {file.kind !== "unknown" && (
+            <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-xs font-normal text-muted-foreground">
+              {file.kind === "strm" ? "strm" : "下载"}
+            </Badge>
+          )}
+          <div className="sm:w-28 sm:text-right">
+            {failed ? (
+              <span className="text-destructive">失败</span>
+            ) : done ? (
+              <span className="text-muted-foreground">完成</span>
+            ) : interrupted ? (
+              <span className="text-muted-foreground tabular-nums">中断于 {Math.floor(file.percent)}%</span>
+            ) : (
+              <div className="flex items-center gap-2 sm:justify-end">
+                <ProgressBar percent={file.percent} tone="info" running={running} className="w-16" />
+                <span className="w-9 text-muted-foreground tabular-nums">{Math.floor(file.percent)}%</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v2]
+  pull_request:
+    branches: [main, v2]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# 两个作业都只读仓库；token 默认权限跟着仓库设置走，这里明确收窄
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # pnpm -r typecheck 覆盖 shared / backend / frontend 三个包
+      - run: pnpm typecheck
+
+      # 前后端的 eslint（pnpm -r lint）。前端的也在 next build 里跑，但那在 docker 作业里、
+      # 失败信息混在构建日志中；这里单独跑一遍，几秒钟就能给出准确的行号
+      - name: Lint
+        run: pnpm lint
+
+      # 以前靠人记住的一条 grep：凭据的常见形状（JWT、网盘 cookie、bot token、api_key）不能进源码、方案和测试夹具
+      - name: Hygiene
+        run: bash scripts/check-hygiene.sh
+
+      # 用例会改写 settings 表、在 DATA_DIR 里建删目录，必须指到临时目录——
+      # src/test/setup.ts 见不到这两个变量会直接拒绝运行
+      - name: Unit and integration tests
+        working-directory: apps/backend
+        env:
+          CONFIG_DIR: ${{ runner.temp }}/openstrm-config
+          DATA_DIR: ${{ runner.temp }}/openstrm-data
+        run: pnpm test
+      - name: Frontend unit tests
+        working-directory: apps/frontend
+        run: pnpm test
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # 只构不推、只 amd64；多架构留给 release
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: openstrm:ci
+          # scope 和 release.yml 的 amd64 作业一致：打 tag 时的 amd64 构建能直接复用这里的层，
+          # 否则每次发版都从零装依赖、重跑 next build
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+
+      # 构建成功不代表能跑，必须真起一次。判据是服务在不在应答，不是进程名。
+      - name: Smoke test
+        run: |
+          set -u
+          docker run -d --name smoke \
+            -p 3000:3000 -p 8091:8091 openstrm:ci
+
+          # 端口有响应即算存活。curl 连不上时自己就会打印 000，
+          # 这里的 || true 只用来吞掉它的非零退出码（run 默认带 -e），
+          # 不能再 echo 一个 000——那样输出会变成 000000，判据就永远为真了。
+          probe() {
+            curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" 2>/dev/null || true
+          }
+
+          for i in $(seq 1 30); do
+            [ "$(probe http://127.0.0.1:3000/)" = "200" ] && { ready=1; break; }
+            sleep 2
+          done
+
+          echo "--- 容器日志 ---"
+          docker logs smoke 2>&1 | tail -30
+
+          [ "${ready:-0}" = "1" ] || { echo "::error::管理界面未在 60 秒内就绪"; exit 1; }
+          echo "  管理界面 :3000/ -> 200"
+
+          # 界面和 API 在同一个进程、同一个端口上：未登录访问设置接口必须是 401，
+          # 是 401 说明路由、鉴权和错误壳都活着
+          code=$(probe http://127.0.0.1:3000/api/settings)
+          [ "$code" = "401" ] || { echo "::error::API :3000/api/settings 期望 401，实际 $code"; exit 1; }
+          echo "  API :3000/api/settings -> 401"
+
+          # 镜像自带的 HEALTHCHECK 走的是 /api/health，等它把容器判成 healthy
+          for i in $(seq 1 12); do
+            [ "$(docker inspect --format '{{.State.Health.Status}}' smoke)" = "healthy" ] && { healthy=1; break; }
+            sleep 5
+          done
+          [ "${healthy:-0}" = "1" ] || { echo "::error::HEALTHCHECK 未在 60 秒内变为 healthy"; docker inspect --format '{{json .State.Health}}' smoke; exit 1; }
+          echo "  HEALTHCHECK -> healthy"
+
+          # 代理只要求"在监听"：没配 Emby 时回源失败是正常的，
+          # 返回 500 也说明进程活着，只有 000 才是没起来
+          code=$(probe http://127.0.0.1:8091/System/Info/Public)
+          [ "$code" != "000" ] || { echo "::error::代理 :8091 无响应"; exit 1; }
+          echo "  代理 :8091 -> $code"
+
+          # 迁移文件必须进了镜像，否则容器起来面对的是空库
+          docker exec smoke sh -c 'ls /app/backend/dist/db/migrations/*.sql >/dev/null' \
+            || { echo "::error::镜像里没有迁移文件"; exit 1; }
+
+          # 启动日志里不该有模块解析失败
+          if docker logs smoke 2>&1 | grep -q "Cannot find package\|Cannot find module"; then
+            echo "::error::启动日志出现模块解析失败"
+            exit 1
+          fi
+          echo "冒烟测试通过"
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f smoke || true

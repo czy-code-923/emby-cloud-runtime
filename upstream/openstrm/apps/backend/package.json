@@ -1,0 +1,58 @@
+{
+  "name": "@openstrm/backend",
+  "version": "2.28.0",
+  "private": true,
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:proxy": "tsx watch src/proxy.ts",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -R src/db/migrations dist/db/migrations",
+    "start": "node dist/index.js",
+    "start:proxy": "node dist/proxy.js",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/db/migrate-cli.ts",
+    "db:studio": "drizzle-kit studio",
+    "test": "node --import tsx --import ./src/test/setup.ts --test --test-reporter=spec --test-concurrency=1 'src/**/*.test.ts' 'src/**/*.itest.ts'",
+    "test:e2e": "tsx src/routes/proxy/proxy.e2e.ts",
+    "test:file": "node --import tsx --import ./src/test/setup.ts --test --test-concurrency=1 --test-reporter=spec",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@fastify/compress": "^8.3.1",
+    "@fastify/cors": "^11.2.0",
+    "@fastify/http-proxy": "^11.4.3",
+    "@fastify/reply-from": "^12.6.1",
+    "@fastify/static": "^10.1.3",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@openstrm/shared": "workspace:*",
+    "axios": "^1.11.0",
+    "better-sqlite3": "^12.4.0",
+    "bottleneck": "^2.19.5",
+    "cron": "^4.3.3",
+    "drizzle-orm": "^0.45.2",
+    "fastify": "^5.2.1",
+    "fastify-plugin": "^5.0.1",
+    "jose": "^6.1.0",
+    "lru-cache": "^11.0.2",
+    "mediainfo.js": "0.3.8",
+    "pino": "^9.14.0",
+    "rxjs": "^7.8.2",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^24",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "^9",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.68.0"
+  }
+}

@@ -1,0 +1,241 @@
+import axios from "axios";
+import path from "node:path";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
+import { defer, lastValueFrom, Observable, retry, throwError, timer } from "rxjs";
+import type { AccountInfo } from "@openstrm/shared";
+import { providerFor } from "../drive/registry.js";
+import type { DriveProvider } from "../drive/types.js";
+import { isAbortError } from "../../lib/errors.js";
+import { readAppSettings } from "../../db/repositories/settings.js";
+import { strmContent, toStrmPath } from "../strm/naming.js";
+import { moduleLogger } from "../../lib/logger.js";
+import { DEFAULT_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, guardIdleStream } from "../../lib/http.js";
+import { enqueueForAccount } from "../throttle.js";
+import { classifyFileFailure, nameTooLongError, overlongSegment } from "./failure.js";
+
+const log = moduleLogger("download");
+
+interface Progress {
+  filePath?: string;
+  percent?: number;
+  overallPercent?: string;
+  done?: boolean;
+  error?: string;
+}
+
+export interface LinkOptions {
+  maxRetries?: number;
+  retryDelay?: number;
+  /** 任务取消时中止：进行中的接口请求掐断，排在限流器里的不再发 */
+  signal?: AbortSignal;
+}
+
+/** 取到的直链，以及取文件时必须一起带的头（夸克的直链和 cookie / UA 绑定；115 和 OpenList 没有） */
+export interface ResolvedDownload {
+  url: string;
+  headers?: Record<string, string>;
+}
+
+/**
+ * 文件的下载直链。网络断、5xx、限流这类临时失败隔 retryDelay 重试，最多 maxRetries 次；
+ * 远端明确说没有这个文件、凭据缺失这类 PermanentError 直接失败——以前也重试三次，一个不存在的文件白等六秒。
+ */
+export async function resolveDownload(
+  filePath: string,
+  account: string,
+  accounts: AccountInfo[],
+  { maxRetries = 3, retryDelay = 2000, signal }: LinkOptions = {},
+): Promise<ResolvedDownload> {
+  const accountInfo = accounts.find((acc) => acc.name === account);
+  if (!accountInfo) throw new Error(`No cookie found for account: ${account}`);
+  // 各家的限流在各自的 Provider / 客户端里做（115 的 request115、夸克的 request、OpenList 的 downloadLink），这里不再套
+  const provider = providerFor(accountInfo);
+  const fetchLink = (): Promise<ResolvedDownload> => provider.downloadLink(filePath, { signal });
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchLink();
+    } catch (err) {
+      if (attempt >= maxRetries || isPermanentFailure(err, provider)) throw err;
+      log.warn(`获取下载链接失败，正在重试 ${attempt + 1}/${maxRetries}`);
+      await sleep(retryDelay, undefined, { signal });
+    }
+  }
+}
+
+/** 只要直链本身的调用方（生活事件、分享 strm）用这个；要连头一起拿的用 resolveDownload */
+export async function getRealDownloadLink(
+  filePath: string,
+  account: string,
+  accounts: AccountInfo[],
+  opts: LinkOptions = {},
+): Promise<string> {
+  return (await resolveDownload(filePath, account, accounts, opts)).url;
+}
+
+export interface DownloadOptions {
+  asStrm?: boolean;
+  displayPath?: string;
+  strmPrefix?: string;
+  enablePathEncoding?: boolean;
+  /** 下载流多久没数据算卡死。默认 STREAM_IDLE_TIMEOUT_MS，测试调小 */
+  idleTimeoutMs?: number;
+  /** 取文件时额外带的头（夸克直链要 Cookie / Referer / 取链时的 UA）；里面的 User-Agent 盖过设置里的 */
+  headers?: Record<string, string>;
+  /** 有的话重试判断会先问它账号问题（cookie 失效 / 风控不重试） */
+  provider?: Pick<DriveProvider, "classifyError">;
+}
+
+export function downloadOrCreateStrm(url: string, savePath: string, opts?: DownloadOptions): Observable<Progress> {
+  const asStrm = !!opts?.asStrm;
+  const displayPath = opts?.displayPath ?? savePath;
+  const strmPrefix = opts?.strmPrefix ?? "";
+  const enablePathEncoding = !!opts?.enablePathEncoding;
+  const idleTimeoutMs = opts?.idleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS;
+  const dir = path.dirname(savePath);
+
+  return new Observable<Progress>((observer) => {
+    // 本地路径里有超过 255 字节的一段就写不进去：先看一眼，不去建半截目录（strm 按 .strm 名算，下载按 .part 名算）
+    const overlong = overlongSegment(asStrm ? toStrmPath(savePath) : `${savePath}.part`);
+    if (overlong) {
+      queueMicrotask(() => observer.error(nameTooLongError(overlong)));
+      return;
+    }
+    if (asStrm) {
+      // 异步写：全量任务一次会订阅几万个，同步 writeFileSync 就是几万次阻塞写挤在一个 tick 里
+      (async () => {
+        await fsp.mkdir(dir, { recursive: true });
+        await fsp.writeFile(toStrmPath(savePath), strmContent(strmPrefix, url, enablePathEncoding), "utf8");
+        observer.next({ percent: 100, filePath: displayPath });
+        observer.complete();
+      })().catch((err) => observer.error(err));
+      return;
+    }
+    const userAgent = readAppSettings()["user-agent"];
+    const controller = new AbortController();
+    // 先写到 .part，写完再改名：中途断掉的半截文件不会顶着正式文件名，
+    // 下次同步按文件名对照时也就不会把它当成"已存在"而永远不重下
+    const partPath = `${savePath}.part`;
+    let writer: fs.WriteStream | null = null;
+    let settled = false;
+    const discardPart = () => fsp.rm(partPath, { force: true }).catch(() => {});
+    const failWith = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      // 写盘失败（磁盘满等）也要把请求掐掉：不然下面挂着的 data 监听会让旧响应把整个 body 拉完，
+      // 而 retry 那边已经开始下一次尝试了。对已经出错 / 已中止的请求，abort 是空操作
+      controller.abort();
+      writer?.destroy();
+      void discardPart();
+      observer.error(err);
+    };
+
+    fsp
+      .mkdir(dir, { recursive: true })
+      .then(() =>
+        axios.get(url, {
+          headers: { "User-Agent": userAgent, ...opts?.headers },
+          responseType: "stream",
+          timeout: DEFAULT_TIMEOUT_MS,
+          signal: controller.signal,
+        }),
+      )
+      .then((response) => {
+        if (settled) {
+          response.data.destroy();
+          return;
+        }
+        const total = parseInt(response.headers["content-length"] || "0", 10);
+        let received = 0;
+        // 进度只在整数百分比变化时发一次：一个大文件几万个 chunk，每个都发一条会把 SSE 和日志缓冲灌满。
+        // 最多报到 99——100 只在改名完成后发一次，收到 100 就等于文件已经就位
+        let lastStep = -1;
+        writer = fs.createWriteStream(partPath);
+        // 卡住的下载会被销毁并走到 failWith，由 downloadOrCreateStrmLimited 的 retry 重来
+        guardIdleStream(response.data, idleTimeoutMs, `下载 ${displayPath}`);
+        response.data.on("data", (chunk: Buffer) => {
+          received += chunk.length;
+          const step = total ? Math.min(Math.floor((received / total) * 100), 99) : 0;
+          if (step === lastStep) return;
+          lastStep = step;
+          observer.next({ percent: step, filePath: displayPath });
+        });
+        response.data.on("error", failWith);
+        writer.on("error", failWith);
+        writer.on("finish", () => {
+          fsp.rename(partPath, savePath).then(() => {
+            if (settled) return;
+            settled = true;
+            observer.next({ percent: 100, filePath: displayPath });
+            observer.complete();
+          }, failWith);
+        });
+        response.data.pipe(writer);
+      })
+      .catch(failWith);
+
+    // 退订（任务取消）：中止请求、关掉写入、删掉半截文件
+    return () => {
+      if (settled) return;
+      settled = true;
+      controller.abort();
+      writer?.destroy();
+      void discardPart();
+    };
+  });
+}
+
+/** 写一个 strm（Promise 版）。要进度流的全量任务用 downloadOrCreateStrm，其它调用方用这个 */
+export async function writeStrm(
+  remotePath: string,
+  savePath: string,
+  opts?: Pick<DownloadOptions, "displayPath" | "strmPrefix" | "enablePathEncoding">,
+): Promise<void> {
+  await lastValueFrom(downloadOrCreateStrm(remotePath, savePath, { ...opts, asStrm: true }));
+}
+
+/**
+ * 下载一个文件到 savePath（Promise 版），.part 改名完成才 resolve。
+ * 下载流是多值的（每个整数百分比一条），别在它上面用 firstValueFrom：拿到第一条就退订会把下载掐掉
+ */
+export async function downloadFile(
+  url: string,
+  savePath: string,
+  opts?: Pick<DownloadOptions, "displayPath" | "idleTimeoutMs" | "headers">,
+): Promise<void> {
+  await lastValueFrom(downloadOrCreateStrm(url, savePath, { ...opts, asStrm: false }));
+}
+
+export function downloadOrCreateStrmLimited(
+  filePathOrUrl: string,
+  savePath: string,
+  account: string,
+  opts?: DownloadOptions,
+  maxRetries = 10,
+  retryDelay = 2000
+): Observable<Progress> {
+  return defer(() =>
+    enqueueForAccount(account, "download", () => downloadOrCreateStrm(filePathOrUrl, savePath, opts)),
+  ).pipe(
+    retry({
+      count: maxRetries,
+      delay: (error, retryCount) => {
+        // 404 / 410 换多少次都一样：链接指向的文件已经没了，别再拿同一个链接重试 10 次白等 20 秒
+        if (isPermanentFailure(error, opts?.provider)) return throwError(() => error);
+        log.warn(`下载失败，正在重试 ${retryCount}/${maxRetries}`);
+        return timer(retryDelay);
+      },
+    })
+  );
+}
+
+/**
+ * 换多少次都一样的失败，交给 download/failure.ts 的分类器判：本地写不进去、cookie 失效、风控、文件没了都不重试，
+ * 网络断、超时、5xx、限流才重试。和写 strm 那条流用的是同一套规则
+ */
+function isPermanentFailure(err: unknown, provider?: Pick<DriveProvider, "classifyError">): boolean {
+  if (isAbortError(err)) return true;
+  return !classifyFileFailure(err, { relPath: "", kind: "download", provider }).retryable;
+}

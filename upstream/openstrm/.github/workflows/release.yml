@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: docker.io
+
+jobs:
+  # 打 tag 不等于 CI 过了：tag 可以打在 CI 还没跑完、甚至已经失败的提交上。
+  # 这里再跑一遍类型检查、lint 和测试，不过就不构建、不推 latest。
+  test:
+    name: Typecheck, lint and tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - name: Unit and integration tests
+        working-directory: apps/backend
+        env:
+          CONFIG_DIR: ${{ runner.temp }}/openstrm-config
+          DATA_DIR: ${{ runner.temp }}/openstrm-data
+        run: pnpm test
+      - name: Frontend unit tests
+        working-directory: apps/frontend
+        run: pnpm test
+
+  # 两个架构各用原生 runner 分别构建，再合并成多架构 manifest——
+  # QEMU 模拟下 next build 慢得多。
+  #
+  # digest 走 artifact 传给 merge 作业：矩阵作业的 outputs 会互相覆盖。
+  build:
+    name: Build ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 镜像名必须全小写，而 github.repository 可能带大写（本仓库就是 openStrm）。
+      # metadata-action 会自己转小写，但 push-by-digest 和 imagetools 用的是原始值。
+      - name: Resolve image name
+        id: image
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          echo "name=${REGISTRY}/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # APP_VERSION 要的是裸版本号：本地退回的 package.json 就是这个格式，侧栏显示时才补 v。
+      # tag 本身带 v，原样传进去侧栏会显示成 vv2.0.0，这里先去掉。
+      - name: Resolve app version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.value }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest and release
+    runs-on: ubuntu-latest
+    needs: build
+    # 镜像推的是 Docker Hub，用不到 packages 权限；contents: write 是给建 GitHub Release 的
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 镜像名必须全小写，而 github.repository 可能带大写（本仓库就是 openStrm）。
+      # metadata-action 会自己转小写，但 push-by-digest 和 imagetools 用的是原始值。
+      - name: Resolve image name
+        id: image
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          echo "name=${REGISTRY}/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # v 前缀必须交给 flavor：type=semver 碰上预发布版本会丢掉 pattern，
+      # 改用写死的 {{version}}，v2.0.0-rc.7 于是被推成了 2.0.0-rc.7。
+      # flavor 的 prefix 是在那之后才拼上去的，两种标签都保得住 v；
+      # latest 默认不吃 prefix，也不会变成 vlatest。
+      #
+      # latest 只跟正式版走：latest=auto 认得预发布版本，自己就不会动 latest，
+      # 免得尝鲜版把 latest 的用户一起带走。
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: |
+            latest=auto
+            prefix=v
+          tags: |
+            type=semver,pattern={{version}}
+
+      # 标签名是推 tag 的人定的，不能用 ${{ }} 直接拼进脚本（一个引号就能改写命令）；走环境变量
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$META_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Verify manifest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          # 判据和上面的 latest=auto 一致：带连字符的就是预发布
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

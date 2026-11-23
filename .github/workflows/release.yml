@@ -29,8 +29,9 @@ jobs:
           cache-dependency-path: upstream/twilight/go.sum
       - name: Validate deployment files
         run: |
-          bash -n scripts/*.sh
+          bash -n install.sh uninstall.sh scripts/*.sh
           python3 -m py_compile scripts/*.py
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
           cp .env.example .env
           sed -i 's/^POSTGRES_PASSWORD=$/POSTGRES_PASSWORD=ci_disposable_only/;s/^TWILIGHT_TWO_FACTOR_KEY=$/TWILIGHT_TWO_FACTOR_KEY=ci_only/;s/^BOT_INTERNAL_SECRET=$/BOT_INTERNAL_SECRET=ci_only/' .env
           docker compose config --quiet
@@ -51,10 +52,10 @@ jobs:
         run: |
           go mod verify
           go vet ./...
-          go test -p 1 ./internal/security ./internal/store ./internal/api -run 'Test.*(Setup|Login|Session|Config|TwoFactor|Register|Password)' -count=1 -timeout=25m
+          go test -p 1 ./internal/security ./internal/store ./internal/api -run 'Test.*(Setup|Login|Session|Config|TwoFactor|Register|Password|DeploymentUpdate)' -count=1 -timeout=25m
   images:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
@@ -67,8 +68,13 @@ jobs:
           mkdir -p dist
           docker save "emby-cloud-backend:$version" | gzip -1 > "dist/backend-$version-amd64.tar.gz"
           docker save "emby-cloud-webui:$version" | gzip -1 > "dist/webui-$version-amd64.tar.gz"
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
-      - name: Stage a draft prerelease
+          python3 scripts/package-release.py
+      - name: Exercise install, upgrade, rollback and uninstall on disposable runner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y age
+          sudo --preserve-env=GITHUB_ACTIONS python3 tests/lifecycle.py
+      - name: Stage a draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -77,7 +83,8 @@ jobs:
             echo 'Refusing to replace an already published release; increment VERSION.'
             exit 1
           fi
-          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --draft --prerelease --target "$GITHUB_SHA" --title "v$version · 隔离管理基础版" --notes-file docs/release-notes.md
+          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --draft --target "$GITHUB_SHA" --title "v$version · 安装与面板升级版" --notes-file docs/release-notes.md
+          gh release edit "v$version" --draft=true --target "$GITHUB_SHA" --title "v$version · 安装与面板升级版" --notes-file docs/release-notes.md
           gh release upload "v$version" dist/* --clobber
   publish:
     needs: [verify, images]

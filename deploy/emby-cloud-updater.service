@@ -1,0 +1,21 @@
+[Unit]
+Description=Emby Cloud verified release updater
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/emby-cloud/manager.py serve
+WorkingDirectory=/srv/emby-cloud
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=emby-cloud-updater
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=256M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

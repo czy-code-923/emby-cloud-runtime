@@ -33,6 +33,7 @@ import {
   Shield,
   Code2,
   BarChart3,
+  Download,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -93,6 +94,7 @@ export const adminNavItems: SidebarNavItem[] = [
   { href: "/admin/violations", labelKey: "navigation.violations", icon: ShieldAlert, category: "security" },
 
   { href: "/admin/config", labelKey: "navigation.configAdmin", icon: FileCode, category: "system" },
+  { href: "/admin/updates", label: "版本与升级", icon: Download, category: "system" },
   { href: "/admin/database", labelKey: "navigation.databaseBackup", icon: Database, category: "system" },
   { href: "/admin/scheduler", labelKey: "navigation.scheduler", icon: TimerReset, category: "system" },
   { href: "/admin/logs", labelKey: "navigation.runtimeLogs", icon: ScrollText, category: "system" },

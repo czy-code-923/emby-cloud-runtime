@@ -1,0 +1,21 @@
+.git
+.claude
+**/node_modules
+**/dist
+apps/frontend/.next
+apps/frontend/out
+**/*.tsbuildinfo
+
+# 本地运行产生的东西，绝不该进构建上下文：数据库里有 cookie 和密钥
+config
+data
+logs
+cache
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.env
+.env.local
+
+# 参考用的外部仓库
+p115client

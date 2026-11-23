@@ -1,0 +1,223 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1776792376258,
+      "tag": "0000_hesitant_bullseye",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1776800687005,
+      "tag": "0001_yielding_warbird",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1776878975777,
+      "tag": "0002_awesome_hobgoblin",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1776892000000,
+      "tag": "0003_calm_cipher",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1776972766792,
+      "tag": "0004_eminent_solo",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1776975564505,
+      "tag": "0005_fine_black_bolt",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1787239004696,
+      "tag": "0006_ancient_doorman",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1787852876502,
+      "tag": "0007_drop_retired_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1787925414486,
+      "tag": "0008_lean_blue_shield",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1788187329772,
+      "tag": "0009_share_follows",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1788896354670,
+      "tag": "0010_drive_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1789139997830,
+      "tag": "0011_organize",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1789402518003,
+      "tag": "0012_organize_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1789499658981,
+      "tag": "0013_organize_excluded",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1789570028135,
+      "tag": "0014_organize_resolutions",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1790001094255,
+      "tag": "0015_agent",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1790014750957,
+      "tag": "0016_oauth",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1790623064436,
+      "tag": "0017_library_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1790689086770,
+      "tag": "0018_library_units",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1790705852374,
+      "tag": "0019_library_saves",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1790710240519,
+      "tag": "0020_library_unit_genres",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1790965847984,
+      "tag": "0021_throttle_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1791999504836,
+      "tag": "0022_monitor_fingerprints",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1792006936014,
+      "tag": "0023_follow_organized",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1792430643079,
+      "tag": "0024_local_naming",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1792436084281,
+      "tag": "0025_media_probes",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1792439045851,
+      "tag": "0026_unit_overrides",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1792440906213,
+      "tag": "0027_unit_kinds",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1792594697608,
+      "tag": "0028_organize_missing_skips",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1793979375736,
+      "tag": "0029_media_probes_path_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1794344243589,
+      "tag": "0030_cd2_account",
+      "breakpoints": true
+    }
+  ]
+}

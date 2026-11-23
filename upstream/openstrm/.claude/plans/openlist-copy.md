@@ -1,0 +1,1028 @@
+# 复制到 OpenList：从「云下载专属」变成通用的后续动作（设计）
+
+> 状态：**三个阶段已实施**（`55ebe6c` / `2852933` / `f534d20`，未推送、未发版；末节有实施记录和和设计稿不一样的地方）；**2026-09-22 真机验证过**，真机暴露的两个大问题和一批小问题已修（见末节「真机验证」，改动在工作区，未提交）。2026-09-22。起因：用户问「复制到 OpenList 是不是可以优化一下了」，并确认四个方向都要，外加「不止 115，夸克、以后接入的网盘都能触发复制」。
+
+## 现状
+
+配置 `settings.openlistCopy`（`packages/shared/src/types/settings.ts:120`）：一个 OpenList 账号 + `srcDir`（115 默认下载目录**在 OpenList 里的完整路径**，手打）+ `dstDir`（目标目录，手打）。
+
+能用它的只有一条路：云下载页添加任务、**且下到 115 默认目录**（不选任务、不选目录）时勾「下载完成后让 OpenList 复制走」。别的一律拒绝：
+
+```ts
+// services/offline/service.ts:329
+if (opts.copyToOpenlist) {
+  if (task || dirId != null) throw new HttpError(400, "「复制到 OpenList」只支持下载到 115 默认目录");
+```
+
+之后的机制是对的，值得整个搬走复用（`services/offline/service.ts:647 submitOpenlistCopy` / `:698 pollOpenlistCopies`）：
+
+- 115 下完 → 带 `refresh:true` 列 `srcDir`（不刷新看不见刚下完的文件）→ 产物名出现了才提交 `/api/fs/copy`；没出现不算失败，最多等 10 轮（`copyWaits`，和「115 列表里找不到任务」的 `misses` 分开计）。
+- `/api/fs/copy` 对目录是「父任务展开子任务」，父任务结束只代表列目录完成，真正的进度在 `/api/task/copy/undone|done` 里，所以要一直盯到 undone 里没有自己的任务，再去 done 里对成败（按 `endedAt` 滤掉陈年同名任务）。
+- 回执落在 settings 表的 `offline.followups` 键，重启不丢；7 天没结果就放弃；提交失败重试 3 次。
+
+**四个短板**（对应用户点的四项）：
+
+1. 只认 115 默认目录。根因是 `srcDir` 是一条手打的死路径，没有「网盘路径 → OpenList 路径」的换算。
+2. 只有云下载能触发。转存 / 追更 / 网盘监控落下的新文件都没法复制走。
+3. 复制完只发一条 Telegram（`notify({type:"offline-copied"})`），Emby 不知道、源文件留在网盘上。
+4. 复制失败只能重下 115 任务（`offlineRestart`），没法单独重试复制。
+
+还有一条用户明确提的：**不止 115**。夸克、以后的网盘都要能触发。现在这套只存在于 `offline/service.ts` 这条 115 专属的流水线里。
+
+## 关键缺口：网盘路径 ↔ OpenList 路径
+
+`DriveProvider`（`services/drive/types.ts:89`）有 `resolvePath` / `listDir` / `listSubtree` / `write`，但**没有任何东西知道这个网盘挂在 OpenList 的哪个路径下**；`AccountInfo` 里也没有。全站唯一的映射就是那条 `srcDir`。
+
+所以第一件事是把映射补成配置：
+
+```ts
+export type OpenlistCopySettings = {
+  account?: string;                    // 用哪个 openlist 账号调 API（不变）
+  dstDir?: string;                     // 默认目标目录（不变）
+  /** 网盘账号名 → 它在 OpenList 里的挂载根，例如 { my115: "/115", quark1: "/quark" } */
+  mounts?: Record<string, string>;
+  /** 复制成功后把网盘上那份删掉（搬运）。默认 false */
+  deleteAfterCopy?: boolean;
+  srcDir?: string;                     // 旧字段，只给「115 默认下载目录」那条路兜底，见「迁移」
+};
+```
+
+有了 `mounts`，任意网盘路径都能换算：`openlistPath = mounts[account] + 网盘绝对路径`。115 挂在 `/115`、任务目录是 `/tv`，那么 `/tv/某剧/S01E01.mkv` 在 OpenList 里就是 `/115/tv/某剧/S01E01.mkv`。夸克、以后的网盘同理，功能代码里不出现 `accountType === "…"`（`services/drive/types.ts:1` 的规矩）。
+
+**为什么放设置里而不是账号表**：挂载点是「这个网盘在那个 OpenList 实例里的位置」，是两个账号之间的关系，不是网盘账号自己的属性；而且复制功能本来就只认一个 OpenList 账号（`openlistCopy.account`），放一起改一处就够，也不用动 `AccountInfo` 和账号页。
+
+**界面**：设置页「复制到 OpenList」里，账号下面列出所有 115 / 夸克账号，每个给一行挂载根（`InputGroup` + 浏览按钮，直接从那个 OpenList 账号的根目录挑，`api.directory.remote`）。填完点「检查」：列一遍 `mounts[account]`，把这个账号下每个任务的 `originPath` 拼上去验证存在，不存在就指出是哪一条。
+
+## 方案
+
+### 1. 把复制抽成一个服务：`services/copy/service.ts`
+
+从 `offline/service.ts` 里搬出来，改成不认来源、只认「网盘账号 + 一批网盘绝对路径 + 目标目录」：
+
+```ts
+export interface CopyRequest {
+  account: string;        // 网盘账号名（115 / 夸克 / …）
+  paths: string[];        // 网盘绝对路径，文件或目录
+  dstDir?: string;        // OpenList 目标目录；不给用设置里的 dstDir
+  taskId?: string;        // 有任务就记上，界面和「整理挪目录」时要用
+  trigger: CopyTrigger;   // "offline" | "share" | "follow" | "monitor" | "manual"
+}
+/** 登记待复制；同步返回，内部排队，绝不往调用方抛 */
+export function enqueueCopy(req: CopyRequest): void;
+```
+
+队列记录落 settings KV 的新键 `copy.queue`（`db/keys.ts`），形状照着 `OfflineFollowup`（`offline/service.ts:66`）：`{ id, account, srcPath, name, dstDir, taskId, trigger, status, detail, attempts, waits, misses, copyTaskId, submittedAt, addedAt }`。一个 `createPollingLoop`（30 秒，没待办自己停）负责推进，阶段和今天完全一样：**等产物在 OpenList 里可见 → 提交复制 → 盯任务 → 成败落地**。云下载那条流水线改成只管登记，不再自己做复制。
+
+去重靠 `(account, srcPath, dstDir)`：队列里已经有同一条待办就不重复登记（监控会对同一个文件反复报事件）。提交前再列一遍目标目录，已经有同名的就跳过记「目标已存在」——`/api/fs/copy` 的 `overwrite` 一直是 `false`，不拦的话 OpenList 那边会堆同名任务。
+
+**合并**：同一轮里同一个源目录下的多个名字合成一次 `/api/fs/copy`（`openlistCopy(account, srcDir, dstDir, names[])` 本来就收数组）。监控是一个文件一个事件，不合并会把几百个文件排成几百个任务。
+
+### 2. 四个触发点
+
+都在「新文件已经落到网盘上」那一刻，和 `maybeAutoOrganize` / `scheduleEmbyRefresh` 并排，一样是 `void`、失败只记日志：
+
+| 来源 | 接在哪 | 已有的路径信息 |
+|---|---|---|
+| 云下载 | `offline/service.ts:629` 旁边（strm 回执完成处）；默认目录那条保持现在的即时登记 | `task.originPath` + `f.subPath` + 产物名 |
+| 转存 | `share/receive.ts:107` 旁边（`maybeAutoOrganize` 已经在那儿算好 `paths`） | `fullOriginPath` + 每个 `item.name` |
+| 追更 | `follow/service.ts:575` 旁边，用现成的 `landed`（任务相对路径） | `task.originPath` + `landed[]` |
+| 监控 | `life/monitor.ts:389` 旁边，同样守 `res.arrived && res.changed` 和 `ownOk`（整理自己造成的事件不能再复制一遍） | `ev.path` 就是网盘绝对路径 |
+
+监控那条沿用 `maybeAutoOrganize` 的 `debounce`（30 秒）思路：攒一会儿再登记，正好也让上面的「同源目录合并」生效。
+
+### 3. 开关：任务级 + 一次性覆盖
+
+照抄 `organize` 的那套（`TaskDefinition.organize` → `taskInputSchema` → `AddTaskDialog`，见 `services/organize/settings.ts:81`）：
+
+```ts
+// packages/shared/src/types/task.ts
+copyToOpenlist?: { enabled?: boolean; dstDir?: string };   // dstDir 不填用全局的
+```
+
+- 任务弹框里一个开关 +（开了才出现的）目标目录选择器，说明写「转存 / 追更 / 云下载 / 监控到新文件时，让 OpenList 把它复制到这里」。
+- 一次性覆盖：转存弹框、`POST /api/share`、`POST /api/library/:id/save-to-task` 加 `copy?: boolean`，和现有的 `organize?: boolean` 同一个位置、同一套写法。
+- 全局前提缺失（没配 OpenList 账号 / 这个网盘账号没填挂载根）→ 一律当关，和「没配 TMDB key 就不自动整理」（`organize/auto.ts:59`）一个路子。
+- 任务存的是 JSON blob（`db/repositories/tasks.ts:8`），**不用迁移**。
+
+### 4. 复制完之后
+
+按顺序，每一步失败都不影响前一步的「已复制」：
+
+1. `scheduleEmbyRefresh()`——复制到本地盘的就是真文件，Emby 得扫一遍才看得见。
+2. 目标目录正好落在某个 **OpenList 账号任务** 的 `originPath` 下时，按那个任务的策略 `maybeAutoOrganize({ task, paths, trigger: "copy" })`。落在别处（纯备份目录）就不整理。
+3. `deleteAfterCopy` 开着时，删掉网盘上那份——**走 Provider 的 `write.remove`**（`services/drive/types.ts:86`），不走 OpenList 的 `/fs/move`：OpenList 的移动不跨存储，而且删源必须用网盘自己的接口才准。只有 `status === "done"` 且目标目录里确认看得见同名条目才删。
+4. `notify`：现有的 `offline-copied` / `offline-copy-failed` 改成通用的 `copy-done` / `copy-failed`（带 trigger 和任务名），旧的两个保留一轮以免 Telegram 设置里的开关语义突变。
+
+### 5. 失败能重试
+
+- 新路由：`GET /api/copy`（最近的队列记录）、`POST /api/copy/:id/retry`（失败的重新排队，计数清零）、`DELETE /api/copy/:id`（不跟了）。
+- 界面：云下载页现在那行 `FollowupLine`（`app/offline/page.tsx:627`）照旧显示，失败时多一个「重试复制」按钮；任务卡片上显示「复制中 N / 失败 N」，点开是同一个列表。
+- 失败原因写全：OpenList 那边的 `error` 原文 + 我们这边的阶段（没看见产物 / 提交失败 / 复制失败 / 目标已存在）。
+
+### 6. 整理挪了目录怎么办
+
+队列里带 `taskId` 的待办记的是网盘绝对路径，整理会在网盘上改名 / 移动。照 `rewriteOfflineSubPaths`（`offline/service.ts:759`）和 `rewriteFollowSubPaths`（`follow/service.ts:641`）再写一个 `rewriteCopyPaths(taskId, mappings, dryRun)`，接在整理执行完的同一处。
+
+## 迁移
+
+`mounts` 是新键，`dstDir`、`account` 不动。唯一尴尬的是 `srcDir`：它是「115 默认下载目录在 OpenList 里的完整路径」，从它反推不出挂载根（不知道默认目录在 115 上的路径是什么）。
+
+两条路，**建议第一条**：
+
+1. **查一次 115 的默认下载目录路径**（`offlineDownPaths` 给的是 id + 名字），有了它就能从旧的 `srcDir` 反推出挂载根，自动填进 `mounts`，`srcDir` 随后作废（`0017_*.sql` 照 `0007_drop_retired_settings.sql` 的样子删键）。
+   **前提没验**：`fsFiles` 现在只取了响应里的 `data` / `count`（`services/cloud-115/client.ts:342`），115 的文件列表接口是不是真带祖先链（`path: [{file_id,file_name}…]`）要先打一次接口确认；确认不了就直接走第二条，别为它硬凑。
+2. 反推不了就保留 `srcDir` 只服务「下到 115 默认目录」这一条老路，设置页标成「旧配置」，新装的人只填 `mounts`。
+
+无论哪条，**已经配好的人升级后不能失效**：`mounts` 空 + `srcDir` 有值时，默认目录那条照旧工作。
+
+## 分阶段
+
+1. **打底**：`mounts` 配置 + 设置页那一节重做（挂载根 + 检查按钮）+ `services/copy/service.ts`（队列、循环、去重、合并）+ 云下载改成调它、解除「只能默认目录」+ 重试路由和按钮。这一阶段做完，115 和夸克的云下载 / 任意目录都能复制走。
+2. **铺开**：任务级开关 + 转存 / 追更 / 监控三个触发点 + 一次性覆盖参数 + 任务卡片上的状态。
+3. **收尾**：复制完 Emby 刷新、落在 OpenList 任务里就自动整理、`deleteAfterCopy`、通知事件改名、`rewriteCopyPaths`。
+
+## 不做
+
+- **多个 OpenList 账号同时当目标**：复制功能仍然只认一个 `openlistCopy.account`。真有两个目标的需求再说。
+- **OpenList → 网盘 的反向复制**：现在没有场景。
+- **覆盖同名**：`overwrite` 保持 `false`，撞名就跳过并记原因，不悄悄盖掉别人的文件。
+- **按文件类型过滤**：先整目录 / 整条目复制；要不要只复制视频文件等做完一轮再看。
+
+## 风险
+
+- **夸克的可见性延迟**比 115 更没谱（监控那边本来就是靠轮询对比），`copyWaits` 的轮数可能要按网盘分开配；先沿用 10 轮，真机验的时候盯这个数。
+- **监控 + 自动整理同时开**：整理会把文件挪走，队列里的路径可能在复制前就失效。靠 `ownOk` 守住整理自己造成的事件 + `rewriteCopyPaths` 跟着改；真机要专门验「监控到新文件 → 自动整理 → 复制」这条串起来的顺序。
+- **大目录**：一个目录几百个文件时 OpenList 会展开成几百个子任务，`/api/task/copy/undone` 一轮拉回来的量不小；按名字匹配（`r.name.includes(f.name)`）在同名文件多的时候可能串味，阶段一就把匹配改成「父任务 id + 提交时间窗」双条件。
+- **删源**（`deleteAfterCopy`）是不可逆的，默认关，界面上要说清「复制成功且目标里确认看得见才删」，并且第一版只对「整条目复制」生效，不对单文件事件生效。
+
+## 测试
+
+- 单测：路径换算（`mounts` + 网盘路径 → OpenList 路径，含中文、空格、结尾斜杠）、去重、同源目录合并、`rewriteCopyPaths`。
+- 假 OpenList：给 `Deps.openlist`（`offline/service.ts:150` 已有这个注入口，搬过去继续用）写一个假实现，覆盖「产物迟迟不可见」「父任务展开子任务」「done 里有陈年同名任务」三种。
+- FakeDrive 覆盖 `write.remove`（删源）那一步。
+- 真机：115 + 夸克各跑一遍「转存 → 复制 → Emby 刷新」，以及「监控到新文件 → 复制」。
+
+## 实施记录（2026-09-22）
+
+三个阶段一口气做完，三个提交，都在 v2 上（未推送、未发版）：
+
+| 提交 | 内容 |
+|---|---|
+| `55ebe6c` | 挂载映射 + `services/copy`（`paths.ts` / `queue.ts` / `service.ts`）+ 云下载改成交接 + `/api/copy` + 设置页一节重做 + 云下载页的队列面板 |
+| `2852933` | 任务级开关（`TaskDefinition.copyToOpenlist`）+ 转存 / 追更 / 监控三个触发点 + 一次性勾选 |
+| `f534d20` | 复制完：Emby 刷新、目标落在 OpenList 任务里就自动整理（`trigger: "copy"`）、按任务删源、通知改名、`rewriteCopyPaths` |
+
+**和设计稿不一样的几处**（都是评审 / 实现时发现的）：
+
+- **目标目录按层级摆，不是平铺**。设计稿只说了 `dstDir`，但监控是一个文件一条事件，平铺过去一季四十集会挤进同一个目录还撞名。`CopyRequest` 因此多了 `rootPath`（通常是 `task.originPath`），`dstDirFor` 把相对那一段的目录结构原样搬到目标下面。
+- **提交前先 `mkdir`**：`/fs/copy` 不会自己建目标目录。
+- **源目录在 OpenList 里不存在 → 第一轮就失败**（挂载根填错了），和「产物还没出现」（等 10 轮）分开。两个计数器 `waits` / `misses` 各管一个阶段，换阶段清零对方。
+- **保留期拆开**：失败留 7 天、办完留 2 天、上限 500 条。监控一个文件一条记录，共用一个窗口的话一批成功会把唯一能动手的失败记录挤掉。
+- **合批在 tick 里做，不在登记时 debounce**：登记就落 KV（进程被杀不丢），`SETTLE_MS = 10s` 只是让同目录的兄弟文件凑进同一批。
+- **删源核对 nodeId**：整理可能已经把文件挪走、原路径上换成了另一个同名文件，只按路径删会删错。
+- **追更给转存传 `copy: false`**，自己按整轮的新增登记一次，来源才显示成「追更」而不是「转存」。
+- **`resolveDirPath` 做成了 offline 的注入点**：`handoffCopy` 要把 115 的目标目录 id 反解成路径，测试里不能打接口。
+
+**验证**：后端 990 个测试全过（新增 43 个：`copy.itest.ts` 31、`paths.test.ts` 7、路由 4、监控 2、追更 1、crud 1，外加云下载那边重写的几条）、三包 tsc / eslint、`next build` 都过。本机用一个假 OpenList（`http.createServer`，实现 login / fs.list / fs.mkdir / fs.copy / task.copy.undone|done）在浏览器里走通了整条链路：设置页填挂载根 → 「检查这些目录」通过 → 队列面板显示失败记录 → 点「重试复制」→ 列源目录、建目标目录、提交复制（`names: ["E01.mkv"]`、`overwrite: false`）→ 盯任务 → 「已复制」，循环自己停。任务弹框的开关、目标目录、删源三件也在浏览器里看过。
+
+**还没验的**：真机（真 115 / 夸克 + 真 OpenList）；转存 / 追更 / 监控三个触发点只有 itest，没在真机上跑过；旧 `srcDir` → 挂载根的自动换算没有真 115 账号可验（逻辑有测试，接口那步没有）。
+
+### 两轮评审的修补（2026-09-22，同日）
+
+三个提交做完之后自查了两轮，21 条全部修完（按仓库惯例不留「收益小」的尾巴）。按危害排：
+
+**会丢数据 / 丢活儿的**
+
+- **队列的读—改—写夹着网络等待**：一轮 tick 里要 await 好几秒的 OpenList 调用，期间监控 / 转存随时往同一个键里加记录、界面也可能删记录，原来「开头读一份、结尾整份写回」会把期间别人写的整片抹掉。循环里的改动改走 `commitCopies(changed)`：重读、按 id 合并、再写；`queue.ts` 开头写了这条硬要求。
+- **`persist()` 把 `touched` 清空了**：一轮里分多组提交，第一组 persist 之后集合被清掉，后面几组的改动就再也没写回去。集合改成只进不清，每次 persist 全量合并。
+- **裁剪把能动手的失败记录挤掉**：监控是一个文件一条记录，一季四十集成功之后，共用一个 500 条窗口会把唯一还能重试的失败记录冲走。改成三桶：pending 不限（限了会把已经提交给 OpenList 的挤出去，那些复制就再没人跟了）、失败 7 天 / 200 条、办完 2 天 / 500 条。
+- **云下载回执谎报兑现**：`enqueueCopy` 原来返回 `void`，队列没收下（配置被删、挂载根没填）时回执照样记「已交给复制队列」，这次复制既不在队列里也没人知道它没了。改成返回 `{ queued, skipped }`，`handoffCopy` 据此把回执判失败。
+- **没有目标目录时复制到根**：设置里的默认目标目录和任务上的都为空时，`dstDir` 算出来是 `/`。改成登记直接拒绝并说明原因。
+- **删源只看名字在不在**：OpenList 一开始就把目标目录建出来了，里面可能一个文件都没搬完。`verifyCopied` 对目录再比一层子项名，缺一个就不删；`adopted`（升级前接管、不知道源在哪）的一律不删。
+- **任务级开关被设置页的值绕过**：`copyOptionsFor` 里删源只在任务自己的开关打开时才生效。
+
+**认错对象 / 状态机**
+
+- 两条记录按任务名互相抢结果 → `claimed` 集合避开别人明确认领的 id；`adopted` 的 `taskKey` 返回空串，只按 id 认。
+- 提交一批后按位置绑任务 id，只在「回来的任务数 == 提交的名字数」时才绑，否则全部按名字认。
+- 手动点过「重试」之后，目标里已有同名不能再悄悄跳过（`retried` 标记，改成如实失败）。
+- `rewriteCopyPaths` 只改了目录没改文件名（整理改名之后永远等不到那个文件），目标目录也停在改名前的层级 → 名字一起改、`dstDir` 按 `dstBase` 重算。这个函数原来零覆盖，补了 `queue.test.ts`。
+- `normDir` 会 trim，网盘上以空格结尾的目录名会被改坏 → 只有手打的设置值走新的 `normConfigDir`，网盘路径一律不 trim。
+
+**通知 / 界面 / 其它**
+
+- 一个文件一条通知 → 一轮合成一条（成 / 败各一条，多了写「等 N 个」），Telegram 那边不会因为限流把后面的整片丢掉；失败**一定发**，四个触发点都是没人看着的后台活儿。
+- `GET /api/copy` 读了两遍队列、还把全部记录发给只显示 20 条的面板 → 读一遍、`limit` 默认 50、带 `total`。
+- 面板轮询抖一下就整块消失 → 留着上一份、旁边写一句。
+- 设置页挂载根那一行缺 key（浏览器控制台有 React 警告）。
+
+**补的测试**：`queue.test.ts`（11 条，裁剪 / 合并 / 去重 / 改路径）、`remove-source.itest.ts`（7 条，删源走真的 Provider + FakeDrive，覆盖 nodeId 对不上、目录没复制全、网盘报错、没开开关四种不删的情形）；`copy.itest.ts` 里「done 里的陈年同名任务」那条原来根本没走到 `endedAt` 过滤（任务名对不上，靠「找不到」通过的），改成名字能对上、只靠结束时间区分。
+
+**验证**：`pnpm test` 1017 个全过、三包 tsc / eslint、`next build` 都过。
+
+## 真机验证（2026-09-22）
+
+用户说「真机验证一下」。
+
+**环境**：本机 Docker 起一个 OpenList（v4.2.6）当实验品，挂三个存储——`/115`（115 Cloud 驱动，用 `config/openstrm.db` 里 115 账号的 cookie）、`/quark`（Quark 驱动，夸克账号的 cookie）、`/local`（Local 驱动，挂到 scratch 目录，当复制目标）。后端跑在 `config/openstrm.db` 的只读拷贝上（4100，只监听 127.0.0.1）：生产任务、HDHive 全删，Telegram 换成假 token + `TELEGRAM_API_BASE` 指到本机假服务（记下每条 sendMessage），Emby 指到本机假服务（记下 `/Library/Refresh`），监控按 latest 模式只看启动之后的事件。前端 dev 3223。115 根下建 `/copylab115`、`/copylab115-staging`，夸克根下建 `/copylabqk`，都在生产任务目录之外。测试视频用 ffmpeg 造（200 多 KB）；夸克那边用之前给过的测试分享（一集 900 MB 左右，OpenList 从夸克拉约 2.3 MB/s）。本机配置库里的 TMDB key 是两个空格，整理识别靠目录名里的 `[tmdbid=…]` 标签 + 往 scratch 库的 `tmdb_cache` 里预置那部剧的详情和第一季。
+
+**走通的（都在真网盘 + 真 OpenList 上）**：
+
+| 场景 | 结果 |
+|---|---|
+| 旧配置换算 | 库里只放 `srcDir: /115/云下载`、不放 mounts，启动时真 115 查到默认下载目录是 `/云下载`，换算成 `115 → /115`，srcDir 删掉 |
+| 接管在途的复制 | 启动前先让 OpenList 真提交一个复制，库里造一条老版本的 `openlist-copy` 回执指着它的任务号；启动时接管、盯到完成 |
+| 设置页 | 挂载根行、浏览 OpenList 目录选挂载根、保存 |
+| 网盘监控（115） | 发布目录从 staging 挪进任务目录：监控 5 秒内看到、生成 strm、登记一条目录复制；OpenList 展开成父任务 + 两个子任务，全部完成，md5 一致；Telegram「已复制到 OpenList（网盘监控）」，30 秒后 Emby 刷新 |
+| 转存（夸克） | 分享弹框只勾一集 + 一次性勾「转存后复制」（任务开关关着）：登记带夸克给的顶层 fid，906 MB 复制完大小一致、ffprobe 正常 |
+| 追更（夸克）+ 删源 | 订阅建好后从 known 里删掉 EP08 模拟分享者新增，前三次检查按服务端信号跳过（设计如此），第四次转存 EP08 → 复制 → 目标里确认看得见 → 夸克上删进回收站；夸克监控下一轮看到新增不重复登记（去重），再下一轮看到删除把本地 strm 清掉 |
+| 云下载（115） | 云下载弹框下到任务目录（任务开着复制）：115 真下完 → 生成 strm → 按任务自己的目标目录登记 → 复制完成，md5 和原始 URL 一致 |
+| 失败 + 重试 | 挂载根改成 `/115x`：第一轮就失败、说清是挂载根，Telegram 发失败通知；改回来点「重试复制」→ 完成 |
+| 复制完自动整理（目标侧） | OpenList 任务 `originPath=/local/lib115`、自动整理「把握大的直接执行」：复制完 30 秒建 trigger=copy 的 run，按 id 标签识别，在 OpenList 本地存储上改名进 `人生切割术 (2022) [tmdbid=95396]/Season 01/` |
+| 监控 → 源侧自动整理 → 复制（设计稿「风险」里点名要验的） | 见下面修好之后那一节 |
+
+**真机暴露的问题**（按危害排；全部已修，见下一节）：
+
+1. **OpenList 的父目录缓存让「新建 / 改过名的目录」被当成挂载根填错**。发布目录在 115 上改了名，下一集的复制第一轮就失败：「OpenList 里没有 /115/copylab115/Severance.S01.1080p [tmdbid=95396]，检查一下账号 115 的挂载根填对没有」，还发了失败通知。手工复现：直接刷新子目录 `object not found`，父目录缓存里还是旧名字，刷新父目录之后子目录立刻能列。凡是 OpenList 之外在网盘上新建 / 改名的目录都会中：转存 / 追更存进新建的子目录、整理建的作品目录和季目录、用户在网盘 App 里改的名。
+2. **源侧自动整理和复制互相不认账**。设计稿说「靠 rewriteCopyPaths 跟着改」，实际只喂了目录级映射（`dirMappings`：只有发布目录被整个腾空删掉才有），最常见的「一集挪进作品目录、顺手改名、发布目录里还剩别的集」根本没有映射，队列里还是旧路径，等 10 轮后失败。转存 / 追更 / 云下载是立刻建整理 run 的，复制要晾 10 秒 + 等下一轮，任务开着自动整理时几乎必中；监控是整理攒 30 秒、复制 10～40 秒，一半对一半。就算复制抢在前面，一季几十集的目录复制是 OpenList 逐个起子任务，整理中途把文件挪走，排在后面的子任务就找不到源文件。
+3. 队列面板在「已复制」的行上也给了「重试」：点了之后目标里已经有这个文件，记录被改成「失败」并发一条失败通知；升级接管来的记录点了一定 409。
+4. 转存弹框选「后台」时不排复制（后端只在同步模式里登记），任务开着复制也一样悄悄不复制。
+5. 追更、115 转存登记时没有网盘节点 id，删源前的「路径上还是不是当初那一份」核对被跳过。
+6. 设置页「检查这些目录」：挂载根只看能不能打开——夸克那一行填成 `/115` 也打得开，照样说没问题（设计稿本来要把任务目录拼上去验）；默认目标目录还不存在就报错，实际上复制前会自己 mkdir。
+7. 云下载弹框：任务目录模式下写着「复制到 /local/copy」（设置页的默认值），实际按任务自己的目标目录复制；任务开着复制时勾选框却显示没勾；复制的勾选框排在「网盘里的任意目录」下面，看着像只对它有效。
+8. 任务弹框的「复制到哪」只能手打，没有设置页那样的 OpenList 目录选择（设计稿写的是目录选择器）。
+9. 设计稿第二阶段的「任务卡片上显示复制中 N / 失败 N」没做，复制队列只在云下载页，转存 / 追更 / 监控触发的复制在任务页看不到。
+10. 小的：夸克那一行挂载根的占位写着 `/115`；选择弹框标题「选择kuake（夸克）」；已复制的说明「→ /local/lib115 · OpenList 已复制到 /local/lib115」重复；一轮落在好几个目录时通知只写第一个目录；失败通知不说去哪重试；`GET /api/copy` 仍把队列读了两遍（状态函数里又读一次）。
+
+### 真机之后的修补（2026-09-22，工作区，未提交）
+
+- **`listSource`**（services/copy/service.ts）：源目录找不到时，从挂载根往下逐级带 refresh 列一遍再试。挂载根本身列不出来才第一轮失败（「OpenList 里没有挂载根 …」）；挂载根在、源目录还是没有，按「还没出现」计 waits，满 10 轮失败并说「网盘上这个目录可能被挪走或改名了」。
+- **整理 → 复制按文件跟**：`afterApply` / `afterRevert` 把这次真正挪过 / 改过名的文件（`movedFiles`，任务相对路径）连同腾空删掉的目录一起交给 `rewriteCopyPaths`。文件待办改到新位置（目标目录按新层级重算）；目录待办里有文件被挪走的，每个文件另起一条（继承删源意图，节点 id 提交时再钉）、目录被腾空删掉的记成跳过并说明；目录级映射兜底不变。
+- **等整理办完再复制**：`CopyRequest.holdForOrganize` → 记录上的 `holdUntil`（兜底 10 分钟）。四个触发点在刚为同一批路径排了会直接执行的自动整理时设它（`effectiveAutoMode === "auto"`；只出待确认清单的不等）。整理到头（执行完、没有要动的、留着等人确认、失败或取消，以及建 run 本身失败）调 `releaseCopyHolds(taskId, run 创建之前)`：只放在这次整理开始之前登记的，之后登记的等下一次。
+- **套在一起的记录不同时提交**（`overlapHold`）：夸克监控只报最上层的新目录，转存 / 追更按文件登记，第一次存进新建子目录时会套上。目录等里面按文件登记的先复制完（之后目标里已有这个目录，目录按「已存在」跳过）；里面的等外面已经在复制的目录办完。免得两个 OpenList 任务同时写同一个文件。
+- **删源的节点 id 提交时钉住**：要删源又没带 id 的，提交前按路径向网盘取一次；取不到就这条不删源并在说明里写原因（`sourceKept`），接口报错按重试算。
+- 后台模式转存也登记复制（不压着等整理——后台模式不整理）；转存弹框的「转存后复制」两种模式都显示。
+- 界面：面板只在失败 / 跳过、且不是接管来的行上给「重试」；设置页挂载根按网盘类型给示例、选择弹框标题「选择 kuake（夸克） 的挂载根」、「检查」把每个任务的 originPath 拼上挂载根去找（找不到说「挂载根多半填错了」），目标目录不存在只提示「第一次复制时会自动建」、它所在的存储打不开才报错；任务弹框「复制到哪」加 OpenList 目录选择、占位写出默认目标目录；云下载弹框「下载完之后」单独一节，任务模式按任务自己的目标目录、任务开着复制时勾选框锁成勾上；任务列表加「复制」标和「复制中 N / 复制失败 N」，点开跳到云下载页的复制队列（`#copy-queue`）。
+- 小修：已复制的说明改成「复制完成」；一轮落在好几个目录时通知写「X 等 N 个目录」；失败通知末尾加「在『云下载』页的复制队列里可以重试」；`getCopyWatcherStatus(rows)` 接收已读出的队列；`__test_flushAutoOrganize` 按开始时的那一批遍历（遇到 409 重新排进 pending 会一直转下去，新测试第一次跑就挂住了）。
+
+**测试**：后端 1040 个全过（新增 23：copy.itest 11 条——父目录缓存没跟上 / 挂载根真没有 / 源目录真不在 / 两种套叠 / 等整理与兜底 / 钉节点三种 / 多目录通知；queue.test 5 条——按文件改路径、目录拆分、没腾空、拆分去重、放行只放整理之前的；remove-source 2 条——复制期间被挪走、钉住后被换成同名的；run.itest 1 条——自动整理挪走改名后队列跟过去、留待确认时放行；auto.itest 2 条——建 run 失败放行、409 接着压；followup.itest 1 条、share.itest 1 条后台模式登记），三包 tsc / eslint 干净。
+
+**修好之后在真机上复跑**：
+
+- 重试那条撞过缓存问题的记录 → 提交、完成；目标侧自动整理把它挪进 `人生切割术 (2022) [tmdbid=95396]/Season 01/人生切割术 - S01E06.mkv`。
+- 父目录缓存：在 115 上（OpenList 之外）新建 `NewShow.S01`，确认 OpenList 的 `/115/copylab115` 缓存里没有它，再挪一集进去 → 第一轮就提交、完成，md5 一致。
+- 监控 → 源侧自动整理 → 复制：115 任务开「把握大的直接执行」，E07 挪进带 id 标签的发布目录 → 登记时压着（「等自动整理先在网盘上改完名再复制」）→ 30 秒后整理在 115 上建作品目录 / 季目录、挪走并改名 → 队列里那条改成 `人生切割术 (2022) [tmdbid=95396]/Season 01/人生切割术 - S01E07.mkv`、目标按新层级、放行 → 下一轮提交（源目录是整理刚建的，靠上面那条修复才列得出来）→ 完成，md5 一致；监控把整理自己的三条事件认出来没有重复登记；目标侧整理看到已经规范，0 项要动。
+- 界面：任务列表的徽标和跳转、面板只在失败行给重试、设置页检查（正确配置提示目标目录会自动建；夸克挂载根故意填 `/115` 报「任务目录在 OpenList 里找不到（/115/copylabqk）」）、占位 / 弹框标题、任务弹框目录选择、云下载弹框两种模式的复制说明、转存弹框后台模式下的复制勾选，都在浏览器里看过。
+
+**没覆盖的**：115 转存 / 追更（手里没有 115 的分享链接；它们和夸克走同一段代码，区别只在 115 转存不给节点 id，已经由提交时钉住兜上）；夸克上「监控报新目录 + 转存按文件登记」真的撞在同一轮的时机（夸克快照 5 分钟一轮，窗口十几秒，靠 copy.itest 覆盖）；删源 + 夸克监控之外的「没开监控」情形下本地 strm 会留着指向已删的文件，要等下一次全量同步（开着「删除本地多余文件」）才清，行为和设计一致，没改。
+
+### 115 分享真机验证（2026-09-23）
+
+用户给了一个 115 分享（`115cdn.com` 域名，末日地堡 2023：S1 四集、S3 十集，每集 3.6～7.6 GB）。环境同上一节（OpenList 这次只挂 `/115` + `/local`），测试目录 `/copylab115`，任务开着复制 + 删源；OpenList 从 115 拉约 9.8 MB/s，一集 6～7 分钟。每集核对完大小 / ffprobe 就删掉本地那份。
+
+走通的：
+
+- **同步转存 → 复制**（S03E04）：`115cdn.com` 链接认得出；监控随后收到 115 的「接收文件」事件，按文件报、和转存那条同路径，去重没有重复登记；复制中途重启后端，队列接着盯到完成；大小逐字节一致。
+- **后台转存 → 复制 + 删源**（S03E03）：后台模式照样登记复制（这次修的）；提交时绕开缓存钉住 115 节点 id，复制完删进回收站。
+- **追更 → 复制 + 删源**（S03E01）：订阅 Season 3，从 known 里抹掉一集，检查一次就转存（115 没有更新信号，直接列）→ 登记（来源「追更」）→ 钉住节点 → 复制 → 删源 → 本地 strm 一起删掉。
+
+真机暴露、已修的：
+
+1. **115 按路径找文件走的是进程内缓存 5 分钟的目录清单**：转存弹框刚列过任务目录，接着转存进来的文件在缓存里没有，提交时钉不住节点 → 删源被关掉（第一集就是这样：「提交时网盘上没找到这个路径的节点，核对不了，源文件没删」）；删源时同样会误判「源已不在原处」。修：复制这边的三处网盘查找（钉节点、删源、核对目录子项）改走 `lookupFresh`——父目录按路径解析，再 `listDir(…, { fresh: true })` 按名字找（整理那边挑同名早就这么绕）。remove-source.itest 加了一个带清单缓存的 FakeDrive 子类钉住它，把修复拿掉这条就挂。
+2. **删源之后本地 strm 没人删**：115 Provider 的 `remove` 当场清掉路径缓存（`dropSubtree` + `forgetPathsUnder`），随后那条删除事件又不带父目录 id，监控对不上任何任务，当成根目录下的文件跳过；夸克是快照对比所以上一轮没暴露。修：删源成功后复制服务自己删本地镜像（`removeLocalMirror`：只认同账号的任务，目录整个删、文件走整理的 `mirrorDelete`），不再指望监控；说明里写「网盘上那份已删，本地 strm 也删了」。
+
+后台模式转存那一次接口没返回（用户清完磁盘后接着查的）：
+
+- 现象：转存成功、复制已登记之后，`startTask` 卡在拉 115 远端目录树 8 分钟以上没回来，前端的 180 秒超时先到、报「保存失败」，任务历史也没这次记录；随后手动启动同一个任务 7.5 秒正常。
+- 排查：整树导出的每个请求都有超时、下载有空闲看门狗，唯一能等很久的是 `exportDirResult` 轮询导出状态（上限 10 分钟），所以那次多半是 115 的导出任务迟迟不报好。单独实测：同一账号同时导出两个目录、转存进目录后马上导出，都在 0.3～2 秒内好了；开 debug 日志按原条件（监控开着、任务开着复制 + 删源）走真接口后台转存一集，6.7 秒返回、导出第一次问就好了——**没复现**。
+- 不管 115 为什么偶尔不报好，设计上有个真问题：「后台」模式的转存要等 `startTask` 把整棵远端目录树拉完才回话，115 大目录（整个 /tv）正常导出也要几分钟，前端照样会超时报「保存失败」。**已改**：只等 8 秒（`ASYNC_START_GRACE_MS`），起得快照常回结果，没回来就先回「已触发后台同步」（带任务 id，界面照样能链到日志），同步接着跑，起不来的原因 `startTask` 自己记进任务历史并发通知。share.itest 加了一条：卡住拉目录树那一步，接口照样立刻回话、转存已成。
+- 导出状态轮询加了 debug 日志（回复变了才记），下次再卡能看到 115 到底回了什么。
+- 顺带看到的：刚导出过的目录紧接着删会被 115 拒（errno 990009「删除[X]操作尚未执行完成，请稍后再试」），隔几秒再删就过；连着删两个别的目录没事，删文件没遇到。复制的删源删的是文件、而且不会刚好碰上导出，没加重试，记在这里。
+
+最后这一集也按原条件复跑到底：复制完删源、本地 strm 一起删掉，大小逐字节一致。收尾删容器、退出 Docker，磁盘余量回到 83 GB。
+
+**测试**：后端 1042 个全过（新增 115 目录缓存、后台转存不等目录树两条；删源的几条加了本地 strm 删除的断言），三包 tsc / eslint 干净。
+
+**真机实验的坑**：OpenList 跑在 Docker 里，本地存储是 bind mount，**删掉复制过来的文件后空间不会马上回来**——Docker 的虚拟机还占着这些文件，要删容器、退出 Docker 才释放（这次一度只剩 2.8 GB，退出后回到 15 GB）。大文件真机实验要先看磁盘余量、每集做完就停容器，或者直接挑小文件。
+
+
+## 手动发起复制（2026-09-25，方案）
+
+用户的场景：转存时没勾复制（任务也没开），看了一会发现播放卡顿，想把这一部单独复制到 OpenList 挂的本地磁盘；界面和智能体里都要能发起。
+
+### 现状
+
+- 复制只在四个时机登记：转存（勾了复制 / 任务开着）、追更、网盘监控、云下载下完。队列面板只能看 / 重试 / 去掉，`routes/copy` 的注释写明没有「新建」。
+- 事后把任务上的复制开关打开，只管以后新落进来的文件，已经在网盘上的不会补。
+- 唯一的补救口子：智能体 `share_save` 10 分钟内同参数再调、带 `copy: true`，只给上次真正转存的条目补登记（登记前到网盘核对还在原位）。界面转存的、过了 10 分钟的都用不上。
+- 绕路都不好：界面重新转存一次会往网盘再存一份；直接在 OpenList 网页里复制不经过队列，复制完不刷 Emby、不整理、不删源，队列里也看不到。
+- 代码里 `CopyTrigger` 早留了 `"manual"`（界面标签「手动」），一直没有入口。
+
+### 方案
+
+**1. 服务层：`services/copy/manual.ts` 的 `enqueueManualCopy`**
+
+入参：任务、相对任务网盘目录的路径（`normalizeSubPath` 口径，至少一段、最多 50 条）、可选目标目录、`signal`。
+
+校验（都在动网盘之前）：
+
+- `copyBlockerFor(settings)(task)` 不为 null → 400 `COPY_NOT_READY`，和转存框、任务列表同一套判断（含「OpenList 账号的任务用不着复制」）。
+- 给了目标目录：`copyDstProblem`——只能是任务上 / 设置页的目标目录，或它们下面的目录（云下载已经是这条规则）。
+- 任务正在整理（`autoOrganizeBusy`，或有 planning / applying 的 run，手动的也算）→ 409「整理完再复制」。登记时压着等整理的那套（`holdForOrganize`）用不上：`releaseCopyHolds` 只放整理开始之前登记的，这里登记的会干等 10 分钟兜底；直说更清楚。
+- 路径不能是任务根本身：整目录复制会把 `tv` 摆成 `dst/tv`，和别的记录的层级（`dst/某剧`）对不上。要整任务就选它下面的条目。
+
+到网盘核对每条路径（`provider.resolvePath`）：不存在 → 这条记 `missing`；拿到 `isDir` 和 `nodeId`（删源时核对，目录复制完核对全不全也靠 `isDir`）。
+
+**补齐**（这个方案里最大的一块，见下面「为什么要补齐」）：源是目录、OpenList 目标目录里已经有同名目录 → 不登记整目录（会按「目标里已有」跳过，什么都不复制），改成按缺的补：源子树（`listSubtree` / `walkSubtree`）和目标逐层比对（`deps.openlist.listNames`，每个已存在的目标目录列一次），目标里缺的文件按文件登记、缺的子目录整目录登记；只比名字（和队列一致，残缺文件照旧走「重试 → 报失败叫人删」那条路）。上限：源 5000 个文件 / 200 个目录，超了 400「太大，缩小范围」。源是文件、目标已有同名 → 这条记 `exists`。
+
+登记：`copyOptionsFor(task, true, settings, dstDir)` → `enqueueCopy({ account, sources: [{ path, isDir, nodeId }], rootPath: task.originPath, taskId, trigger: "manual", dstDir, deleteSource })`。`forced = true` 所以任务没开复制也登记；**删不删源只看任务开关**（`byTask && deleteSource`），和转存框的一次性勾选同一个原则。
+
+返回 `{ queued, dstDir, deleteSource, items: [{ path, outcome }], reason? }`，`outcome` 是 `queued` / `filled`（补了 n 条）/ `duplicate`（已经排着或刚复制过）/ `exists` / `missing`。
+
+和已有记录的关系：`findDuplicate` 去重照旧；这条整目录记录会把之后网盘监控按文件报上来的并进来（`coversRecord` 对任何来源的外层都生效）；已经按文件排着的转存 / 追更记录不并（那两条只并监控的），整目录本来要等它们复制完、再按「目标里已有」跳过——正是补齐要接住的情形，所以登记时目标里已有同名目录就直接走补齐，不让整目录白等。
+
+复制完的后续照旧：刷 Emby、目标落在某个 OpenList 任务下就按它的策略自动整理、任务开着删源就删网盘源文件和本地 strm。
+
+**2. REST**：`POST /api/copy`，body `{ taskId, paths, dstDir? }`，回上面的结果；`config: { agentScope: "write", agentToolset: "transfer" }`（和 `/retry` 同档）。
+
+**3. 智能体：`copy_add`**（transfer 组、write 档、注解 readOnly false / destructive false / idempotent false / openWorld true，工具 35 → 36）
+
+- 输入 `task`（id 或路径 / 最后一段）、`paths`（相对任务网盘目录，和 `share_save` 的 `subPath`、`drive_browse` 同口径）、`dstDir?`。
+- 路径怎么找不加新工具：`strm_search` 按片名找本地 strm，结果里有对应的网盘路径，作品目录就是第一段；`drive_browse` 看目录。描述里写明。
+- 描述要写的：**调用前把复制什么、到哪、删不删源告诉用户，同意再调**；任务开着「复制后删源」会删网盘源文件和本地 strm；目标里已有同名目录时只补缺的；不能选任务根；整理进行中会拒。
+- 结果用 `copyOutcomeView` 同口径回显，外加 `items`；next 指向 `copy_list`。
+- `USAGE_NOTES` 加一条：「看片卡顿、想把某部片放到本地磁盘」→ `strm_search` 找到网盘路径 → 征得同意 → `copy_add`。
+- REST 档位声明如上；工具快照更新。
+
+**4. 界面**
+
+- 云下载页复制队列面板加「新建复制」：选任务（OpenList 账号的任务不列；`copyBlocked` 的灰掉并说原因）→ 用 `TreeSelectDialog`（`multiple`）浏览这个任务的网盘目录，目录、文件都能勾——`/api/directory/remote/list` 现在只回目录，加 `withFiles` 参数带上文件（名字、大小）→ 目标目录默认任务上 / 设置页的，能在它下面选子目录（复用云下载弹框那段 OpenList 浏览）→ 任务开着删源就红字说明「复制成功后会删掉网盘上的源文件和本地 strm」→ 提交后 toast 说排上几条、补了几条、已有 / 不存在几条。
+- strm 管理页：目录行菜单和顶部「工具」菜单加「复制到 OpenList」，把当前目录预填进同一个弹框（本地相对路径就是网盘相对路径）；strm 文件行也给，用 `expectedRemotePath` 算出视频文件的路径。任务 `copyBlocked` 时菜单项灰掉、写原因。
+- 海报墙是背景装饰，没有可点的作品，不做入口。Telegram 不做。
+
+### 为什么要补齐
+
+「后来才开复制」是最常见的来由：任务开了复制之后追更 / 监控把新集复制过去了，目标里已经有这个剧的目录，只是缺前面的集。这时整目录登记会被「目标里已有同名」跳过（OpenList `/fs/copy` 对已存在的目标名直接报 `file exists`，队列只能跳过），用户和智能体都没有别的办法——界面上还能一个个勾文件，智能体连文件名都拿不到。所以补齐放进第一版，不拆到以后。
+
+### 定下来的、不做的
+
+- **不加一次性删源**：那是新的删除路径，智能体那边还要走 danger 档、当面确认。要删源的把任务上的开关打开即可，和现在的原则一致。
+- **不给任务之外的目录**（`account` + 绝对路径）：层级、整理、Emby 刷新都靠任务；以后有需要再加。
+- 任务根本身不让选；整理进行中 409；补齐只比名字。
+- `share_save` 10 分钟内补复制那条路留着不动。
+
+### 测试
+
+- `services/copy/manual.test`（FakeDrive + OpenList 桩）：整目录登记；目标已有同名目录时补缺（缺文件按文件、缺子目录整目录、都齐了一条不登记）；文件已存在；路径不存在；任务根拒；任务整理中 409；`COPY_NOT_READY`；`dstDir` 越界；删源跟任务开关；随后监控报上来的被并进这条；太大拒。
+- `routes/copy/copy.itest`：POST 的档位、参数校验。
+- `routes/mcp/mcp-copy.itest`：`copy_add` 三种结果、只读令牌看不到、REST 档位。
+- 前端：弹框在 scratch 后端上冒烟；strm 页入口预填。
+
+### 量
+
+后端约 300 行 + 测试；前端弹框约 300 行 + 两处入口。做完一起评审，随下一个 rc 发。
+
+## 复制后的去向：不动 / 删除 / 归档（2026-09-25，方案）
+
+用户提的：复制成功后三选一——不动、删除、归档；归档就是建一个归档文件夹，把源文件挪进去。
+
+### 评估
+
+赞成。三种各有用处：
+
+- **不动**：云上留着，但 Emby 里同一集会有两份（云上的 strm 和本地那份）。
+- **删除**：115 / 夸克的删除进回收站，过期就清空了；不可逆。
+- **归档**：明确留一份，又从活动目录里拿掉——本地 strm 跟着删，Emby 里只剩本地那份；想恢复就挪回去。比删除安全，比不动干净。
+
+### 归档目录放哪
+
+任务目录下固定叫「归档」，和整理的「重复文件」一个做法；里面按任务相对路径原样摆：
+
+- `tv/某剧/S01/E01.mkv` → `tv/归档/某剧/S01/E01.mkv`
+- 整目录复制的 `tv/某剧` → `tv/归档/某剧`
+
+为什么放任务里、不放账号级的独立目录：
+
+- 不用配置、不用选路径。
+- 「不进媒体库」的排除现成的：「重复文件」目录已经在全量同步（`task/runner.ts` 的 `listSubtree` 过滤）、网盘监控（`life/handlers.ts` 的 `matchTask`）、整理（`buildUnits` 前的过滤）三处被跳过，归档区照抄同一套。
+- 任务建在网盘根（`/`）的也能用；账号级目录在这种任务下面根本放不到外面去。
+- 还原就是挪回上一级，下次同步 / 监控自然把 strm 长回来。
+
+代价：任务根下本来就有个叫「归档」的目录，升级后会被当成归档区、不再同步（和「重复文件」一样），升级说明里写一句。名字先定「归档」，怕撞再换 `_归档`。
+
+### 数据模型
+
+- 任务：`copyToOpenlist.afterCopy: "keep" | "delete" | "archive"`，默认 `keep`。旧的 `deleteSource: true` 读成 `delete`：任务是整段 JSON 存的（`tasks.data`），在 `repositories/tasks` 读出时归一，不用 SQL 迁移；写回只写 `afterCopy`。
+- 复制记录：`afterCopy` 登记时冻结（和现在的 `deleteSource` 同一位置、同一时机）；旧记录在 `listCopies` 读出时归一；`sourceKept` 扩成「源没动的原因」。
+- 云下载回执：`copyDeleteSource` → `copyAfterCopy`，加任务那一刻冻结，旧字段读时归一。
+- 追更合并结果、监控（监控登记的一律 `keep`）、`coversRecord`（inner 不是 `keep` 时要和 outer 一样才算被包着）、`upgradeDeleteSource` → `upgradeAfterCopy`（`keep` 能被补成 `archive` / `delete`；`archive` 和 `delete` 撞上算先登记的，说明里写一句）。
+- 现在 `deleteSource` 一共 51 处（15 个文件），都要过一遍。
+
+### 执行
+
+`afterCopiedInner` 同一道门：先 `verifyCopied`（目标里看得见、目录逐项齐了）、节点 id 核对，过了才按 `afterCopy` 动：
+
+- `keep`：什么都不做。
+- `delete`：现有 `removeSource`。
+- `archive`：新加 `archiveSource(account, path, nodeId, task)`——算出归档路径 = `originPath/归档/相对路径`，`write.mkdir` 把父目录链建出来，`write.move` 挪过去。归档里已经有同名 → 源留着，说明「归档里已经有同名，源文件没动」（目录合并放第二期）；网盘不支持写 → `unsupported`，同删除。
+
+归档成功后同样 `removeLocalMirror`：本地 strm 指着的路径已经空了，留着就是 Emby 里放不了的条目。监控随后会看到一次移动：旧路径在任务里、新路径在归档区被 `matchTask` 跳过 → 走「移出监控范围删本地」，本地早删了，空操作。
+
+排除归档区的三处和「重复文件」并成一个 `isStagingDir(rel)`：`runner.listSubtree`、`handlers.matchTask`、整理 `buildUnits`。strm 校验 / 海报 / strm 页只看本地，不生成归档区的 strm，不用动；手动复制的补齐只比源和目标，不受影响。
+
+### 界面
+
+- 任务弹框：「复制后删源」开关换成三选一单选：不动 / 归档（写清放在任务目录下的「归档」里、怎么还原）/ 删除（红字：进回收站，过期清空，不可逆）。
+- 队列面板每条显示「复制后：归档到 …」「复制后：删除」。
+- 新建复制弹框（见「手动发起复制」）默认跟任务，可以改，三种都给，选删除要二次确认。
+- 转存框 / 云下载框的一次性勾选只写「复制」，不加去向——那条原则不变。
+- Telegram 云下载文案里的「删源」改成按 `afterCopy` 说。
+
+### 智能体
+
+- `copy_add` 加 `afterCopy?`：不给按任务；`keep` / `archive` 走 write 档（归档是网盘上的一次移动，可逆）；`delete` 要令牌有 danger 档，没有就 `SCOPE` 错误、提示让用户到设置页勾。描述写明：调用前把去向说给用户；归档放在哪、怎么还原。
+- `share_save` / `offline_add` 不加去向参数，跟任务（和界面一致）。
+- 结果里的 `copy.deleteSource` 保留（`afterCopy === "delete"`），加 `afterCopy`；`tasks_list` 的 `copyToOpenlist`、`copy_list` 的每条都带 `afterCopy`；`USAGE_NOTES` 那条改写；工具快照更新。
+
+### 不做
+
+- 归档目录合并（归档里已有同名目录时把里面的文件一个个挪进去）：第二期。
+- 账号级归档目录。
+- 「从归档恢复」的动作：先手动挪回；以后要再给。
+
+### 测试
+
+- `copy.itest`：归档全流程（建目录链、移动、本地 strm 删、说明）；归档里已有同名；不支持写；三种去向各自的说明；旧字段归一（任务 / 记录 / 回执）；`coversRecord` / `upgradeAfterCopy` 的新规则。
+- `runner` / `handlers` / `organize`：归档区被跳过。
+- `mcp-copy.itest`：`copy_add` 三种 `afterCopy`，没 danger 档要删被拒。
+- 前端：任务弹框、队列面板、新建复制弹框在 scratch 后端上冒烟。
+
+### 量
+
+后端约 400 行 + 测试（含 51 处 `deleteSource` 的改动），前端约 200 行。和「手动发起复制」一起做、一起评审，随下一个 rc 发。
+
+用户 2026-09-25 说「按你的推荐制定计划开始吧」：归档目录定名「归档」。
+
+### 进度（两件一起）
+
+- [x] A1 共享类型 / 任务 schema / 任务仓库读时归一：`afterCopy`
+- [x] A2 复制队列与服务：记录、登记、包着 / 补去向的规则、执行三分支、归档实现
+- [x] A3 归档区排除：全量同步、监控、整理
+- [x] A4 云下载回执、追更合并、监控登记（Telegram 文案里本来就没写删源，不用动）
+- [x] A5 智能体：结果 / tasks_list / copy_list 带 `afterCopy`，说明改写
+- [x] A6 界面：任务弹框三选一、队列面板显示去向
+- [x] B1 `enqueueManualCopy`（含补齐）+ `POST /api/copy`
+- [x] B2 `copy_add` 工具 + 快照 + USAGE_NOTES
+- [x] B3 远程列目录带文件；新建复制弹框；strm 页入口
+- [x] 测试、tsc / eslint
+- [x] 浏览器冒烟（scratch 后端 4100 + dev 3223）
+- [x] 评审（15 + 次要项全修，见末节）
+
+### 实施记录（2026-09-25，两件一起）
+
+**去向 `afterCopy`**
+
+- 共享类型 `CopyAfterCopy`；`TaskCopySettings.afterCopy`，`deleteSource` 留作旧字段。`lib/after-copy.ts`：`afterCopyOf`、`normalizeTaskCopy`、`AFTER_COPY_LABEL`。
+- 任务仓库读写时把 `deleteSource` 收成 `afterCopy`（只在带旧字段时动，没填的不硬写 `keep`）；`insertTask` 返回归一后的样子，POST 的响应也就是归一过的。没有 SQL 迁移。
+- 复制记录 `afterCopy` 必填，`listCopies` 读出时把老记录的 `deleteSource` 收进去；`CopyRequest.afterCopy`、`CopyEnqueueResult.pendingAfterCopy`、`CopyOutcome.afterCopy`（`deleteSource` 保留 = `afterCopy === "delete"`，`withAfterCopy` 一起给）。
+- `coversRecord`：inner 不是「不动」时要和 outer 同一种去向；`upgradeAfterCopy`：只把「不动」的补成整条目带来的去向，删除和归档撞上算先登记的。
+- 执行：同一道门（`verifyCopied` + 节点 id）之后按去向分支；`archiveSourceReal` 算出 `originPath/归档/相对路径`、`ensureDriveDir` 按父目录 id 逐级列（绕开路径缓存）建目录链、`write.move`；归档里已有同名 → `exists`，平铺复制的（没有 rootPath）→ `no-root`，都留着源、写说明。归档成功同样删本地 strm。
+- 暂存区：`organize/duplicates.ts` 加 `ARCHIVE_DIR = "归档"`、`isStagingDir`；全量同步、监控 `matchTask`、整理 `buildUnits` 和自动整理的触发路径都换成它。
+- 云下载回执 `copyAfterCopy`（旧 `copyDeleteSource` 读时归一）；`AddOfflineResponse.copyAfterCopy`；追更合并取第一组不是「不动」的；监控登记一律 `keep`。
+- 智能体：`copyOutcomeView` / `taskCopyView` / `copy_list` / `copy_retry` 都带 `afterCopy` + `afterCopyText` + 老的 `deleteSource`；`afterCopyNote` 统一说法；说明、`USAGE_NOTES`、概念一句都改了。
+- 界面：任务弹框换成三选一 Select（写 `afterCopy`）；任务列表徽标提示按去向说；队列面板每条显示「复制后归档 / 删除」。
+- 测试：`deleteSource` 的 51 处引用连同测试一起改；`paths.test` 加老数据归一、任务没开复制时一次性发起不认去向；`followup.itest` 加归档冻结；`crud.itest` 验 POST 响应归一。
+
+**手动发起复制**
+
+- `services/copy/manual.ts`：`enqueueManualCopy`（校验 → 到网盘 `resolvePath` → 目标里没有整条登记 / 有同名目录走 `planFill` 补缺 / 有同名文件跳过 → 逐条 `enqueueCopy(trigger: "manual")`）；`TargetListing` 每个目标目录只列一次、上限 200 个；`sourceTree` 有 `walkSubtree` 用它，115 从 `listSubtree` 的文件路径推目录；上限 5000 个文件。任务正在整理（planning / applying / reverting 的 run，或攒着的自动整理）→ 409 `TASK_ORGANIZING`。
+- `service.ts` 导出 `listOpenlistNames`（走 deps，测试能换桩）。
+- `POST /api/copy`（write + transfer；`afterCopy: "delete"` 要 `requireAgentScope(danger)`，会话不受限）。
+- `copy_add` 工具（transfer 组、write 档；`delete` 没有 danger 档报 `INSUFFICIENT_SCOPE`，提示改 archive）；把服务层的 `COPY_NOT_READY` / `TASK_ORGANIZING` / `COPY_DST_INVALID` / `TOO_LARGE` / `VALIDATION` 换成带提示的 ToolError；结果 = `copyOutcomeView` + `items`（每条带 `outcomeText`）。工具 36 个，快照已更新；`USAGE_NOTES` 加了「看片卡顿 → strm_search → 当面确认 → copy_add」。
+- `/api/directory/remote/list` 加 `withFiles`（文件排在目录后面，带 size）。
+- 界面：`components/AddCopyDialog.tsx`（任务 → `TreeSelectDialog` 多选目录 / 文件 → 目标根下选子目录 → 去向三选一，默认跟任务；选删除要二次确认；提交后逐条显示结果）；队列面板加「新建复制」（队列空着但配好了也显示）；strm 管理页目录行菜单 / 顶部工具菜单 / strm 文件行都有「复制到 OpenList」，strm 文件按 `expectedRemotePath` 换成任务相对路径。
+- 测试：`manual.itest`（整目录 / 补齐 / 文件三态 / 115 式 / 拒绝六种 / 去向 / 重复与并进）；`routes/copy` 的 POST 与档位；`mcp-copy` 的 `copy_add`（含只读令牌看不到、删除要 danger）。
+- 全量 1298 个通过；三包 tsc、两端 eslint 干净。
+- 浏览器冒烟（全新 scratch 库起 4100、dev 3223，夸克假账号 + 两个任务 + 本地 strm；远程列目录和 POST /api/copy 在页面里换成 XHR 桩）：云下载页「新建复制」→ 选任务（Radix Select 用 keydown Enter）→ 树里勾目录和文件、展开子目录 → 去向改成删除（提示变红）→ 二次确认 → 结果逐条带徽标 + toast；strm 页目录行菜单、顶部工具菜单（根目录灰掉）、strm 文件行按钮都能预填进弹框，strm 文件按应指向的网盘路径换成任务相对路径；任务弹框三选一显示当前值；任务列表徽标提示按去向说。
+  - 冒烟撞到一处：云下载页没有 115 账号时整页只有「去添加账号」，复制队列面板根本不渲染——只有夸克账号的用户看不到队列、也发不起复制。改成那个分支也渲染面板（面板没配好又空着时自己不显示）。
+
+### 评审与修补（2026-09-25，`/code-review max`）
+
+15 条主要发现 + 一批次要项，全部核实成立，除两条说明外都修了：
+
+1. **删除档只按明说的 `afterCopy` 把关**：没明说、按任务设置落到删除的也会删。改成服务层按最终去向把关（`ManualCopyInput.allowDelete`，路由按会话 / 令牌有没有 danger 档给，工具按 `hasScope`），路由和工具都补了用例。
+2. **`归档` 这个名字撞上用户原有目录**：远端不再列它，本地 `removeExtraFiles` 会把里面已有的 strm 当多余删掉。名字不改（和「重复文件」一个做法，用户定的），但全量同步的本地清单也跳过暂存区，原有 strm 不会被删；升级说明里要写这一条。用例在 runner.itest。
+3. **手动登记的路径没查队列里包着它的整目录**：一次里选了父子路径、或队列里已有整目录复制时，子路径单独登记，整目录到时被「目标里已有」跳过。改成子路径去掉、队列里有还没提交的整目录包着（`findCoveringRecord`，任何来源都算）就记成 `covered`。
+4. **列 OpenList 目标失败一律当「还没有」**：OpenList 挂了会整目录登记、到时跳过、缺的永远补不上。改成只有 `isMissingDir`（明确说没有）才算没有，其它一律报错、整个请求不登记。
+5. **逐条登记、逐条校验**：后一条的 TOO_LARGE / 报错让前一条已经排上（可能带删源）。改成两阶段：先只看不改（所有 await 都在这一段），再一口气登记（一次 `enqueueCopy`，按 `perSource` 归到每条路径）。
+6. **回话里的去向照抄请求的**：已经排着一条要删源的，这次说归档、没再排，回的却是归档。改成和 `enqueueCopyFor` 同一个口径（`pendingAfterCopy`）。
+7. **115 按路径找刚落进来的文件看的是 5 分钟的缓存**：报「网盘上没有」。改用 `lookupFresh`（按父目录绕开缓存列）。
+8. **路由不传 AbortSignal、前端 120 秒超时、网盘错误没走 `driveErrorToHttp`**：`abandonedSignal` 从资源搜索路由抽到 `lib/abandoned-signal.ts`，前端超时改 330 秒（和 strm 校验一样），网盘错误映射成上游错误。
+9. **`normalizeSubPath` 削每段空格**：「Season 1 」这种名字找不到。改用 `strm/manage.ts` 的 `normalizeRel`（只收拢斜杠，拒 `..` 和 NUL）；`enqueueCopy` 里那句 `s.path.trim()` 也去掉了。用例：尾空格目录。
+10. **暂存区能当源**：`uniquePaths` 拒 `isStagingDir`；`archiveSourceReal` 对本来就在归档里的回 `staged`，不会把「归档」挪进「归档」。
+11. **弹框把 OpenList 账号的任务过滤掉，strm 页却给了入口**：下拉框空着、什么也说不出。改成不过滤、按后端算好的 `copyBlocked` 说原因，strm 页的入口在 `copyBlocked` 时灰掉并把原因放到 title。
+12. **`copy_add` 套用 `copyOutcomeView`**：一条没排、带目标根就被说成「已经排着」。改成自己的 `manualCopyView`，按 items 说话。
+13. **strm 页按文件名算的 `expectedRemotePath` 找网盘文件**：改用 `actualRemotePath ?? expectedRemotePath`，内容解析不出的单独提示。
+14. **整理忙的检查只在开头看一次**：登记前再看一次（登记那一段没有 await）。
+15. **归档整条路没测试、归档里已有同名时通知不提**：新加 `archive-source.itest.ts`（目录链、真挪、本地 strm、同一轮里目录链只建一次、已有同名、本来就在归档里、平铺 / 不支持写 / 节点换了）；复制成功但源文件没按设置处理的，`copy-done` 通知带 `kept` 说一声。
+
+次要项：`ensureDriveDir` 每轮缓存目录链；`enqueueCopy` 找重复改成按「账号 + 目录 + 名字」索引；`Omit<CopyRequest, "deleteSource">` 改正；扩展名判断和 115 导出树用同一条规则（`drive/walk.ts` 的 `looksLikeFileName`，整理的 `listTree` 也引它）；`AddTaskDialog` 关着时不预选旧去向；`afterCopyOf` 认不得的值当不动、`afterCopiedInner` 不再把 else 当归档；`AFTER_COPY_LABEL` / `taskAfterCopy` 挪到 `lib/openlist-copy.ts`，前端三处 `deleteSource` 兜底删掉；`normalizeRecord` 复用 `afterCopyOf`；`transfer.ts` 两处用 `withAfterCopy`；弹框里自己猜「卡在哪」的三元删掉；`manual.ts` 两处到不了的保护删掉；`withoutWalk` 抽进 `test/fake-drive.ts`（整理和手动复制的测试共用）。
+
+没改的两条：`planFill` 要先整棵列才知道文件数（115 是一次导出，列之前没法知道大小）；三处「mkdir -p」（转存的 `ensureSubDir`、整理的 `ensureDir`、归档的 `ensureDriveDir`）各自带着不同的缓存和错误口径，合并的收益抵不过风险。
+
+全量后端测试通过，三包 tsc、两端 eslint 干净。
+
+## 真机验证：手动发起复制 / 复制后的去向（2026-09-28，v2.12.1-rc.3）
+
+用户说「把这一次和上一个 rc 都真机验证一下吧」。
+
+**环境**：
+- 后端同 organize.md 同日那一节（配置库只读拷贝、4100 只绑本机、Telegram 假服务）。
+- Docker 起 OpenList v4.2.6，挂 `/115`、`/quark`（cookie 取自拷贝库）和 `/local`（scratch 目录，当复制目标）。
+- 前端 dev 3223 接实验后端，浏览器里登录（临时口令换的会话令牌）。
+- 测试文件是 ffmpeg 造的 200 多 KB 小视频，传进两个网盘的 `/v0928lab`，验完删了（进回收站）。
+
+**走通的**：
+
+| 场景 | 结果 |
+|---|---|
+| 云下载页「新建复制」（115，文件，不动） | 目录树列出真 115 上的目录和文件；复制完 md5 一致，源文件还在，来源「手动」 |
+| strm 管理页目录行「复制到 OpenList」（115，目标里已有 E01） | 弹框预填任务和路径；结果「补了缺的（2）」，E02、E03 复制过去、md5 一致，E01 没动 |
+| strm 文件行入口 | 按 strm 内容换回真实的 `.mkv` 路径；目标里已有 → 「目标里已有同名」 |
+| `copy_add` 整目录 + 归档（115） | 第二次（去掉上一条记录后重发）成功：建「归档」、挪过去、本地 strm 删掉 |
+| `copy_add` 删除，日常令牌 | `INSUFFICIENT_SCOPE`，什么也没排 |
+| `copy_add` 文件 + 删除（夸克，完全令牌） | md5 一致，夸克上删掉（进回收站），本地 strm 删掉 |
+| 任务设「开复制 + 归档」、`copy_add` 不传去向（夸克） | 按任务归档，整目录进 `copyqk/归档/怒呛人生`，本地 strm 删掉 |
+| 界面「复制后删除」（115） | 二次确认「复制并删除」；md5 一致，115 上删掉，本地 strm 删掉 |
+| 暂存区 | 两个任务的全量同步都「no files to download」，归档里的不长 strm；整理预览 0 个单元；115 监控看到挪进归档的事件，按暂存区跳过，不生成 strm、不登记复制 |
+| 界面显示 | 队列面板每条带「手动」「复制后删除 / 归档」和去向说明；任务弹框三选一显示当前值；Telegram「已复制到 OpenList（手动）」，没按设置处理的带原因 |
+
+**真机暴露的问题**（都还没改）：
+
+1. **复制后归档 / 删除碰上一次临时错误就不再做了**。第一次 115 归档撞上接口 30 秒没回：复制成功了，源目录留在原处，说明和通知写「归档源文件失败：timeout of 30000ms exceeded」。记录已经是「已复制」，面板上没有补做这一步的入口，只能到网盘里手动挪。
+2. **网盘接口超时的报错是英文原话**：手动复制接口回 500「timeout of 30000ms exceeded」，队列说明、通知里也是这句。在 3223 上看到的只有「发起复制失败」：next dev 的 `/api` 反代自己 30 秒就断了，这一点只影响开发环境。
+3. `copy_add` 没有删除档时，报错总说「（这个任务设的就是复制后删除）」；这次是明说 `afterCopy: "delete"`，任务根本没开复制。
+4. 新建复制的目录树里列出了「归档」，选了提交会被拒（后端不许暂存区当源）。
+5. 一条都没排上（目标里已有 / 已经齐了）时，结果里仍写「复制在后台跑，大约 30 秒推进一轮」。
+6. 监控对暂存区里的事件写「…不在任何任务的 originPath 下」，其实它在任务目录里，只是落在暂存区。
+
+**没弄清的**：115 接口卡 30 秒只在实验后端进程里出现过。11:52、11:53、12:01 三次，前两次是手动复制登记时按父目录列目录，第三次在归档那一步，具体哪个接口没记下来。
+
+- 同一时间另起的进程每次都 1～2 秒回来；一个长跑的探测进程每 45 秒查一次、查了 8 轮，一次没卡。
+- 挂上记录 115 请求耗时的预加载、重启后端之后，再没出现。
+- Node 24 的全局连接池空闲 5 秒就关连接，「复用死连接」解释不通。记在这里，下次再遇到先看是哪个接口。
+
+**测试环境的坑**：
+- `sqlite3 -readonly config/openstrm.db` 打不开，要用 `file:config/openstrm.db?mode=ro&immutable=1`。
+- OpenList 的 `/api/admin/storage/list` 是 GET。
+- 两个任务都用默认目标目录、任务根下又有同名目录时，补齐按名字比会互相当成「已经齐了」。测去向时给任务单独设目标目录。
+- 同一源、同一目标刚复制过的会按「刚复制过」去重，要重做得先在队列里去掉那条。
+
+**推荐的修法**：
+
+1. **复制后的去向遇到临时错误自动再试**：
+   - 网络断、超时、5xx / 429 这类错误不当最终结果。记录照旧是「已复制」，另记「去向待重试」（次数、下次时间）。复制推进时到点再做一次：1 分钟、5 分钟、15 分钟，最多三次。
+   - 说明和通知先写「归档（删除）源文件没成（网盘接口超时），稍后自动再试」；三次都不成，才按现在的样子写「没按设置处理」并通知。
+   - 重试前照旧先核对（复制还在、节点 id 对得上）。上一次其实已经挪走 / 删掉、只是没等到回话的：归档看归档目录里有没有这个名字，有就算归档成了；删除找不到源就写「网盘上已经没有这一份（多半上次已经删掉）」。
+   - 明确的失败（节点换了、归档里已有同名、不支持写）照旧不重试。
+2. **超时说人话**：
+   - `driveErrorToHttp` 和复制的去向说明把 axios 超时换成「网盘接口 30 秒没有回应，稍后再试」，原话放括号里留底。
+   - 115 请求超时时记一条带接口路径的警告日志，下次再卡能看到是哪个接口。
+3. `copy_add` 的删除档报错：只在没明说、按任务设置落到删除时才说「这个任务设的就是复制后删除」，明说的直接说「afterCopy: "delete" 要…」。
+4. 新建复制的目录树不列任务根下的暂存区（「归档」「重复文件」）。名字放进 shared，前后端共用一份。
+5. 结果里一条都没排上时，不显示「复制在后台跑…」那句。
+6. 监控对暂存区里的事件写「在任务的暂存区（归档 / 重复文件）里，不处理」。
+
+测试：
+- `copy.itest`：去向重试（超时后到点再做成功；三次都超时才最终失败并通知；上次其实挪成了算归档；明确失败不重试）。
+- `errors` 单测：超时换成中文。
+- `mcp-copy.itest`：删除档报错的两种说法。
+- 监控：暂存区的说明。
+- 前端：弹框在 scratch 后端上看一眼。
+
+用户说「按照你的推荐制定计划开始吧」。
+
+### 实施计划（真机问题的修补）
+
+1. **去向晚点再试**（`copy/queue.ts`、`copy/service.ts`）：
+   - 记录加 `afterRetry?: { attempts; nextAt }`：复制成功、去向碰上临时错误时记上，记录照旧是「已复制」。
+   - 临时错误：网络断、超时（`driveErrorFacts().transport`）、网盘异步任务失败、5xx / 429。账号失效、风控不算。
+   - 去向那段从 `afterCopiedInner` 抽成 `applyAfterCopy(c, cfg, retry)`。第一次和重试都走它；Emby 刷新、目标侧整理只在第一次做。
+   - 间隔 1 / 5 / 15 分钟，三次用完按「没按设置处理」收场（`sourceKept`），说明末尾写「自动重试 3 次都没成」。
+   - 推进循环：到点的一起处理，这一轮手里的也登记进 `tickRecords`（去掉一条时同步标掉）；循环在「有排队的，或者有等着重试去向的」时继续（`hasCopyWork`），启动时也按它起。
+   - 重试时从「复制完成」重新拼说明。源不见了的情况：
+     - 删除：当成上次已经删掉了，照删本地 strm，说明写「网盘上已经没有这一份（多半上次已经删掉）」；
+     - 归档：`archiveSource` 带上 `retry`，看归档目录里有没有同名、节点 id 对得上的，有就算归档成了。
+   - 通知：
+     - 第一次复制完成的 `copy-done` 带 `retrying`，写「稍后自动再试」；
+     - 三次都不成，另发一条 `copy-kept`「复制后源文件没按设置处理」；
+     - 重试成了不再发。
+2. **超时说人话**：
+   - `lib/errors.ts` 加 `networkErrorText(err)`：axios 超时回「网盘接口 N 秒没有回应，稍后再试」，连不上回「连不上网盘接口（代码），稍后再试」，别的回 null。
+   - `driveErrorToHttp` 兜底那支、复制去向的说明用它。
+   - 115 请求超时记一条警告，带接口路径（不带请求头）。
+3. `copy_add` 删除档的报错按「明说的 / 按任务设置的」分开说。
+4. 前端新建复制：
+   - 任务根那一层不列「归档」「重复文件」（名字记在 `lib/openlist-copy.ts`，和后端 `organize/duplicates.ts` 保持一致）；
+   - 一条都没排上时不显示「复制在后台跑…」。
+5. 监控：落在任务暂存区里的事件说「在任务的暂存区（归档 / 重复文件）里，不处理」；挪进暂存区的说「挪进暂存区，已删除本地 …」。
+6. 测试：
+   - `copy.itest`：超时后到点重试成功；三次都不成才收场并通知；删除 / 归档上次其实做成了；明确失败不重试；去掉的不再重试；只有重试时循环也转。
+   - `drive/errors`：超时、连不上的说法。
+   - `mcp-copy.itest`：删除档报错两种说法。
+   - `life/handlers`：暂存区的说明。
+   - 前端 tsc / eslint。
+7. 收尾：后端全量、三包 tsc、两端 eslint；提交（不推送）。
+
+### 进度（真机问题的修补）
+
+- [x] 1 去向晚点再试
+- [x] 2 超时说人话
+- [x] 3 copy_add 报错
+- [x] 4 前端两处
+- [x] 5 监控说明
+- [x] 6 测试
+- [x] 7 收尾
+
+### 实施记录（真机问题的修补，2026-09-28）
+
+- **去向晚点再试**：
+  - `copy/queue.ts`：记录加 `afterRetry { attempts, nextAt, why }`；`awaitingAfterRetry`、`hasCopyWork`（排着的，或去向等着晚点再做的）。
+  - `copy/service.ts`：
+    - 去向那段抽成 `applyAfterCopy(c, cfg, retry)`。Emby 刷新、目标侧整理还在 `afterCopiedInner`，只做一次。
+    - 临时错误（`transientAfterCopyError`）：`driveErrorFacts` 的 transport / taskFailed、5xx / 429；账号问题（`accountIssueOf`）和中止不算。间隔 1 / 5 / 15 分钟（`AFTER_RETRY_DELAYS_MS`）。
+    - 说明写「删源文件没成（…），1 分钟后自动再试（1/3）」；第四次还不成写「删源文件失败：…（自动重试 3 次都没成）」。
+    - `tickCopies` 把到点的也拿进来，登记进 `tickRecords`；`retryAfterCopies` 从「复制完成」重拼说明再做，每条做完落库一次。复制设置被删了的直接收场（`settleAfterRetry`）。
+    - 删除：重试时源不见了，当成上次已经删掉，照删本地 strm。
+    - 归档：`archiveSourceReal` 带 `retry`，源不见了就看归档目录里同名的，节点 id 对得上才算归档成了，说明带「（上次其实已经挪过去了）」。
+    - 循环的 `shouldContinue` 和 `startCopyWatcher` 改看 `hasCopyWork`。
+  - `telegram/notify.ts`：`copy-done` 加 `retrying`（「源文件稍后自动再处理：…」）；新加 `copy-kept`（「复制后源文件没按设置处理」），和复制的其它通知一样走 offline 开关。重试那次收场没成的（超时用完、核对没过、节点换了等）都进 `copy-kept`；做成了不发。
+- **超时说人话**：
+  - `lib/errors.ts` 加 `networkErrorText`：axios 超时回「网盘接口 30 秒没有回应，稍后再试（原话）」，连不上回「连不上网盘接口（代码），稍后再试」。
+  - `driveErrorToHttp` 兜底那支在前面带上是哪一步（「发起复制失败：…」）。
+  - 复制去向的说明用它。
+  - 115 的 `request115` 超时记 warn：主机 + 路径、方法、账号、限流通道，不带请求头和查询参数。
+- `copy_add`：明说 `afterCopy: "delete"` 的报错是「afterCopy: "delete"（复制完删掉网盘上的源文件）要令牌有「删除」档」，按任务设置落到删除的照旧。
+- 前端：
+  - `lib/openlist-copy.ts` 加 `STAGING_DIRS`（和后端 `organize/duplicates.ts` 同名，改时两边一起动；shared 包只导出类型，放不了运行时常量）。
+  - `AddCopyDialog` 的源目录树在任务根那一层滤掉它们；一条没排上时不显示「复制在后台跑…」。
+- 监控：`handlers.ts` 加 `stagingOf` / `unmatchedReason`。
+  - 暂存区里的新增 / 删除说「在任务的暂存区（归档）里，不处理」；
+  - 挪进暂存区的说「移动进任务的暂存区（归档），已删除 …」。
+- 测试：
+  - `copy.itest` 加 5 个：超时后到点再删成、四次都超时才收场并发 `copy-kept`、上次其实删掉了、明确失败（普通报错、4xx）不重试、去掉的不再重试；删源的桩改成能按次抛错。
+  - `archive-source.itest` 加 2 个：归档超时后到点挪成；上次其实挪过去了能认出来，id 对不上的不认、收场另发通知。
+  - `lib/errors.test`、`drive/errors.test`、`life/handlers.itest`、`mcp-copy.itest`、`telegram/notify.itest` 各加 / 改 1 个。
+- 变异核对：下面 13 处逐一去掉，对应用例各自失败，恢复后全过。
+  - 临时错误一律不认；循环只看排着的；推进时不做到点的；不到点也做；
+  - 删除重试时源不见不算删掉；归档不认上次挪成的；认的时候不核对 id；
+  - 重试收场不另发通知；第一次通知不说稍后再试；次数不设上限；
+  - 超时不换人话；监控不分暂存区；`copy_add` 报错不分明说。
+- 后端全量 1323 个通过；三包 tsc、两端 eslint 通过。前端两处改动没在浏览器里看，只过了 tsc / eslint；真机没复验（造不出 115 超时，靠用例）。
+
+### 真机验证（修补之后，2026-09-28）
+
+用户说「真机测一下」。
+
+**环境**：
+- 同上一节：配置库只读拷贝、4100 只绑本机、OpenList 挂真 115 / 夸克和本地目录、Telegram 假服务、前端 dev 3223。
+- 测试文件是几百 KB 的小视频，放在两个网盘的 `/v0928lab2`。
+- 网盘超时造不出来，用预加载脚本在 axios 上按规则注入（规则文件改了就生效，同一规则的次数跨改动保留）：
+  - `before`：请求不发出去，直接当 30 秒超时；
+  - `after`：请求照发、网盘那边做成了，回话丢掉当超时，就是「其实做成了、只是没等到回话」。
+- 除了注入，网盘、OpenList 复制、归档、删除、通知都是真的。
+
+| 场景 | 注入 | 结果 |
+|---|---|---|
+| 115 剧A：整目录复制 + 归档 | `files/move` before ×1 | 第一次「归档源文件没成（…），1 分钟后自动再试（1/3）」，源和本地 strm 不动；1 分钟后挪进「归档」，本地 strm 删掉，不再发通知 |
+| 115 剧B：整目录复制 + 归档 | `files/move` after ×1 | 115 上真挪过去了、回话丢了，记成稍后再试；重试时认出「已归档到 …（上次其实已经挪过去了）」，没挪第二次，本地 strm 删掉 |
+| 115 剧C：文件复制 + 删除 | `rb/delete` after ×1 | 115 上真删了（进回收站）；重试时「网盘上已经没有这一份（多半上次已经删掉了），本地 strm 也删了」 |
+| 夸克 剧Q：整目录复制 + 归档 | `file/move` before ×4 | 1 / 5 / 15 分钟各重试一次，第四次收场，见表下 |
+| 115 剧D：界面新建复制 | 登记时 `GET files` before ×1 | toast「发起复制失败：网盘接口 30 秒没有回应，稍后再试（timeout of 30000ms exceeded）」，弹框留着；再点一次排上、复制完成 |
+
+- 通知：第一次复制完成合成一条「已复制到 OpenList（手动）」，末尾写「源文件稍后自动再处理：…」三项；重试成了的不再发。
+- 剧Q 在 13:27、13:28、13:33、13:49 各失败一次（1 / 5 / 15 分钟的间隔都对上了）。第四次收场：
+  - 说明「复制完成；归档源文件失败：网盘接口 30 秒没有回应（自动重试 3 次都没成）」；
+  - Telegram 单发「⚠️ 复制后源文件没按设置处理（手动）…复制已经完成；网盘上那份还在原处，需要的话手动处理」；
+  - 夸克上源目录还在原处（旁边多一个第一次建好的空「归档」），本地 strm 保留；
+  - 这一条收场后循环自己停了（「复制队列已清空，循环停止」）。
+  - 整个过程后端没有一条 error。
+- 115 超时时后端记了 warn「115 接口 30 秒没有回应」，带 `webapi.115.com/rb/delete`、`files/move`、方法、限流通道。
+- 重启：剧Q 等最后一次时重启后端，队列里一条排着的都没有，循环照样起来（「复制队列循环启动」），到点接着做。
+- 界面：
+  - 新建复制的目录树根上只有「剧D」「剧C」，「归档」没列；
+  - 再对剧D 发起一次，结果「目标里已经都有了」，没有「复制在后台跑」那句。
+- `copy_add`（日常令牌、明说删除）：「afterCopy: "delete"（复制完删掉网盘上的源文件）要令牌有「删除」档」。
+- 监控：两次挪进归档都记成「/v0928lab2/c115/归档/剧A 在任务的暂存区（归档）里，不处理」。115 的挪动事件不带旧路径，按新增处理。
+
+**真机上改的一处**：复制说明和通知里原因用了带「稍后再试（英文原话）」的长说法，后面紧跟「1 分钟后自动再试」，读着别扭，还像在叫人自己重试。`networkErrorText` 加 `brief`，复制的去向只要原因本身：
+- 「删源文件没成（网盘接口 30 秒没有回应），1 分钟后自动再试（1/3）」；
+- 「删源文件失败：网盘接口 30 秒没有回应（自动重试 3 次都没成）」。
+
+接口报错照旧是长说法。对应用例改了期望，加了 `brief` 的单测。
+
+## 事后处理源文件：copy_after（2026-10-07）
+
+起因：用户转述智能体的话「当前这个 MCP 版本没有单独的『把已复制完成的源文件移到归档』接口」。查了，属实，而且不只 MCP 没有：
+
+- 去向（afterCopy）只能在登记那一刻定（任务设置，或 copy_add 这一次指定），记录上「登记时冻结」；`upgradeAfterCopy` 只补还在排队的。
+- 对复制好的再 copy_add 传 archive：`enqueueManualCopy` 看到目标里已经有同名就判「目标里已经都有了」，一条不登记，归档意图静默丢掉。
+- REST 只有看 / 发起 / 重试 / 去掉，面板只有重试和去掉；drive_browse 只读、organize 是改名、strm_delete 只删本地，智能体完全做不到。
+- 伏笔：2026-09-25 方案把「从归档恢复」留到以后；真机那次记过「记录已经是已复制，面板上没有补做这一步的入口」，后来只加了临时错误自动重试。
+
+用户说「按你的推荐开始吧」。
+
+### 方案
+
+**服务层**：新模块 `copy/after.ts`，`settleAfterCopy({ afterCopy: "archive" | "delete", ids? | task + paths?, dstDir?, allowDelete, signal?, onProgress? })`。
+
+- 两种指法归到同一条处理路径：按路径为主（办完的记录只留两天，更早复制的只能这么指；和 copy_add 同一口径，`uniquePaths` 同一套校验），按 id 为辅（界面按钮、copy_list 给的 id）。
+- 核对比复制完自动处理那道门严一层：源还在原处（知道节点 id 的要对得上）、目标里这一份齐了——目录逐层比名字（复用 `planFill`），文件比大小。为此 `TargetListing` 改成带类型 / 大小的 `entries()`（`names()` 由它派生），`planFill` 返回 `{ missing, mismatched }`（手动复制只看 `missing`），`deps.openlist` 多一个可选的 `listEntries`（桩只给 `listNames` 的照样能跑、只比名字）。不齐的 `incomplete`，让人先 copy_add 补（它只补缺的）。
+- 动手复用 `applyAfterCopy`：导出，签名改成 `(c, cfg, { retry, verified })`，返回结构化的 `AfterCopyOutcome`（archived / removed / retry / kept），说明、`sourceKept`、`afterRetry` 照旧写在记录上。`verified: true` 跳过它自己那层一级核对。归档 / 删除 + 删本地 strm + 临时错误挂 `afterRetry` 由循环再做（这边 `startCopyWatcher` 把循环拉起来）都是现成的。当场回话、不发通知；挂到 `afterRetry` 的按老规矩由循环收尾通知。
+- 记录：队列里有复制好的那条就接着用（`afterCopy` 改成这次的、`sourceKept` 清掉、`doneAt` 刷新、detail 前缀「复制完成（事后归档）」）；没有的新记一条 done、trigger manual、detail「目标里已经有这一份，事后处理源文件」，用 `saveCopies` 整份写（`commitCopies` 的 added 会按「刚复制过」去重，人把文件挪回来再归档一次时会把新记录吞掉）。还在复制的用 `upgradeAfterCopy`（导出，参数放宽成 Pick）补去向，结果 `scheduled`；记录上已经有去向的不改（先登记的算）。
+- 两阶段：先只看不改（任何一条核对不了——网盘、OpenList 读不到——整个请求都不动；单条整目录太大 TOO_LARGE 只拦那一条），再逐条处理、随手写回；每条处理完叫一次 `onProgress`。动手前再看一眼任务有没有在整理。`resetArchiveDirCache` 开始前清一次目录链缓存（那份缓存本来是一轮一清的）。
+- 判定 `afterCopyBlocker` / `canAfterCopy`（service.ts，和 `retryBlocker` 并列）：done、不是接管、有 taskId 和 rootPath、没在自动重试、去向是不动或 `sourceKept` 有值（归档里有同名、超时三次没成的还能再来）。pending 另算。
+- 结果 `items[]` 每条：`outcome` = archived / deleted / retrying / kept / incomplete / missing / scheduled / pending / invalid，带 path（任务相对）、id、name、isDir、detail、to。
+
+**REST**：`POST /api/copy/after`（write + transfer；删除按最终去向由服务层把关，令牌要 danger，会话不受限），`GET /api/copy` 每条带 `canAfterCopy`。
+
+**工具** `copy_after`（transfer 组、write 档；注解 idempotent、非破坏性——归档可逆，删除靠档位把关，和 copy_add 一致）：ids 或 task + paths 二选一，afterCopy 必填；40 秒内直接回、超了交给作业用 job_status 等（和 share_save 同一套）。`copy_list` 每条带 `canAfterCopy`，有能处理的给一句提示；服务端说明的「概念」和 USAGE_NOTES 各加一句。工具 42 → 43。
+
+**界面**：队列面板 `canAfterCopy` 的记录多一个「归档源文件」按钮，确认框说清先核对、归档放哪、本地 strm 删、怎么恢复；结果按 outcome 提示。删除不进界面（任务级设置和智能体有）。
+
+**不做**：按记录 id 删除平铺复制（没任务）的源；「从归档恢复」仍是手动挪回。
+
+### 实施记录（2026-10-07）
+
+按方案做完，未提交。
+
+- `services/copy/service.ts`：`OpenlistTargetEntry`、`deps.openlist.listEntries?`、`listOpenlistEntries`；`applyAfterCopy` 导出 + 返回 `AfterCopyOutcome`（说明文案一字没改，archive-source / copy 的用例原样过）；`upgradeAfterCopy` 导出；`resetArchiveDirCache`；`afterCopyBlocker` / `canAfterCopy`。
+- `services/copy/manual.ts`：导出 `assertNotOrganizing`、`uniquePaths`、`TargetListing`（entries + names）、`planFill`（`FillPlan`）、`sizeMismatch`。
+- `services/copy/after.ts`（新）：上面那套。
+- `routes/copy/index.ts`：`POST /api/copy/after`、`canAfterCopy`。
+- `services/agent/tools/copy.ts`：`copy_after`、`copy_list` 的 `canAfterCopy` 和提示；`tools/index.ts` 登记；`instructions.ts` 两句；快照 +1。
+- 前端：`lib/api.ts` 的 `CopyItem.canAfterCopy`、`CopyAfterInput / Result`、`api.copy.after`；`CopyQueuePanel` 按钮 + 确认框 + 结果提示。
+- README「智能体接入」两处。
+- 测试：新 `copy/after.itest.ts` 10 条（按 id 归档、整目录缺项 / 大小对不上 / 齐了、排着的补去向、八种不能处理的原因、归档里同名 / 节点换了、按路径新记一条、按路径接着用旧记录 + 网盘没有 + 目标没有、十种拒绝、删除、超时挂重试到点挪成）；`routes/copy/copy.itest` +1、`routes/mcp/mcp-copy.itest` +1；manual / archive-source / copy / remove-source 四个文件 100 条原样过；工具快照更新。tsc、eslint 前后端都过。
+- 真机（2026-10-07 下午，用户批准后在 115 上做的）：本机 OpenList 容器挂 `115 Cloud`（cookie 来自配置库只读拷贝）+ `Local`（scratch 目录），scratch 后端 4100、前端 dev 3223；115 根下建 `/v1007lab`，经 OpenList 上传三个 340 KB 的测试视频，`POST /api/copy` 复制到 `/local`（约 70 秒完成，去向不动）。
+  - REST `POST /api/copy/after`（按 id）：3.6 秒，`archived`、`to: /v1007lab/归档`；记录 detail「复制完成（事后归档）；网盘上那份已归档到 /v1007lab/归档，本地 strm 也删了」，`canAfterCopy` 变 false；115 上 `/v1007lab/归档/after-test.mkv` 340827、原处没了；本地 strm 删了。**115 报的大小和 OpenList Local 报的一致**（340827），文件大小核对这一层在真机上不会误拦。
+  - MCP（官方 SDK 客户端连 /mcp，日常令牌）：`copy_list` 每条带 `canAfterCopy`、提示指向 copy_after；`copy_after` 传 delete 报 INSUFFICIENT_SCOPE（提示换 archive）；ids 和 task + paths 一起给报 VALIDATION；按 `task: "v1007lab", paths: ["after-test2.mkv"]` 3.65 秒 `archived`（state done、带 jobId，接着用了队列里那条记录）；再来一次 `missing`「网盘上没有这条路径（源文件已不在原处）」。
+  - 界面（3223）：队列面板只有去向是不动的那条有「归档源文件」按钮；确认框文案对；点「归档」约 4 秒后 toast「已归档到 /v1007lab/归档，本地 strm 已删」，行上变成「复制后归档」+ 新 detail，按钮消失。
+  - 收尾：`/115/v1007lab`（里面只剩「归档」+ 三个测试视频）经 OpenList `fs/remove` 删进 115 回收站，根目录列表里已经没有它；容器 `docker rm -f`，带 cookie 的 scratch 文件删掉。
+
+## 归档到暂存区：drive_archive（2026-10-08）
+
+起因：用户指出「现在提供的 copy_after 归档接口，只能归档已经完整复制到本地硬盘的文件」。查实：属实，而且是有意的——动手前核对源在原处、目标里齐了（目录逐层比名字、文件比大小），不齐的 `incomplete` 一个不动；复制中的只补去向。细节：115 整目录核对只比名字（导出树没大小），单文件比大小。现有工具链覆盖：没复制过 → `copy_add`（afterCopy: archive）；复制了一半 → `copy_add` 补齐再 `copy_after`；复制中 → `copy_after` 排成复制完归档。真正的空白是「不管有没有复制、单纯想把网盘上的目录 / 文件挪进归档」。
+
+用户只要补这个空白，问推荐。推荐**单独做一个动作**，不往 copy_after 上加「跳过核对」的开关：归档动作（`archiveSource` + 删本地 strm）本来就不依赖复制记录，单独做和加开关代价差不多；加开关得伪造一条「已复制」记录，队列和 copy_list 会把没复制过的显示成已复制；智能体碰到 incomplete 会顺手带上开关绕过核对；单独的动作不碰 OpenList 配置，没配复制的也能用暂存区。用户：「按你的推荐开始吧，界面也要」。
+
+### 方案
+
+**服务层** `services/copy/archive.ts`：`archiveToStaging({ task, paths, signal?, onProgress? })` → `{ done, archiveDir, items[] }`，每条 `outcome` = archived / kept / copying / missing / failed / skipped，带 path（任务相对）、name、isDir、detail、to。
+
+- 路径口径和 copy_add 一样：`uniquePaths(paths, "归档")`（不收任务目录本身、不收暂存区、父目录在就不单列子路径；报错动词参数化，`assertNotOrganizing(task, "归档")` 同理）。
+- 正在复制到 OpenList 的拒掉（队列里 pending 的记录，源是它、在它下面、或它在那条的源目录下面）：挪走了 OpenList 那边的复制就断了；提示等复制完或用 copy_after 排成复制完归档。
+- 任务正在整理时整个请求拒（409 TASK_ORGANIZING）；网盘不支持写 400 UNSUPPORTED。
+- 两阶段：先按父目录绕开缓存找节点（复用 after.ts 导出的 `Lookups`，网盘读不到整个请求都不动），再逐条 `archiveDriveSource`（service.ts 导出的 `deps.archiveSource` 包装，节点 id 钉住）→ `removeLocalMirrorOf` 删本地 strm → `markCopyRecords`（队列里同一个源、或它下面的复制好的记录标成 afterCopy = archive，面板按钮和 copy_after 不再给它）。
+- 幂等：源不在原处、`归档/<rel>` 里却有同名的，当上次已经挪过了（archived + 「上次挪过了」，done 也算）。归档里已有同名的 kept，不覆盖不合并。
+- 挪的时候出错：那条 failed（`networkErrorText` 换成人话）；是网络问题 / 临时错误（`transientAfterCopyError` 导出）就停手，后面的 skipped「前面一条碰上网络问题，这条没试」；单条被网盘拒的不影响别的。不进自动重试，再调一次即可。
+- 只做归档，不做删除；不发通知；不碰 OpenList。
+
+**REST** `POST /api/drive/archive`（新文件 `routes/drive/archive.ts`，body `{ taskId, paths }`，write + transfer，和 copy_after 同一档）。
+
+**工具** `drive_archive`（transfer.ts，transfer 组 write 档；注解 idempotent、非破坏性）：task + paths，40 秒内直接回否则交作业用 job_status 等（和 copy_after 同一套）；结果带 archiveDir、逐条 outcomeText、note / next、openInUi 指向 strm 管理页。`copy_after` 的描述和 incomplete 的 next 都指向它；instructions 概念句 + USAGE_NOTES 各加一句。工具 43 → 44。
+
+**界面**：`components/ArchiveDialog.tsx`（照 AddCopyDialog：选任务 → 从网盘里选目录 / 文件（根下暂存区不列）→ 确认框 → 结果列表按 outcome 标色，收进去了就叫 onDone 刷新）；strm 管理页：目录「更多操作」多一项「归档到暂存区」，strm 行多一个归档图标按钮（桌面 / 窄屏两套），顶部「工具」多一项「归档当前目录到暂存区」（任务根灰掉）；strm 行先读 strm 内容算出网盘路径（和复制同一个 `rowDrivePath`）。
+
+**不做**：按 id 删除；「从归档恢复」仍是手动挪回；115 整目录核对不比大小（用户只要补空白）。
+
+### 实施记录（2026-10-08）
+
+按方案做完，未提交。
+
+- `services/copy/manual.ts`：`uniquePaths(paths, action)` / `assertNotOrganizing(task, action)` 报错动词参数化（默认仍是「复制」）。
+- `services/copy/service.ts`：导出 `archiveDriveSource` / `removeLocalMirrorOf`（`deps` 的包装，调用时才取，桩照样生效）、`transientAfterCopyError`。`services/copy/after.ts`：导出 `Lookups`。
+- `services/copy/archive.ts`（新）：`archiveToStaging`。真机 MCP 复测时发现「源不在原处、归档里有同名」那条在第一阶段就下结论，不会补本地 strm 和记录（上次挪成了、回话丢在收尾之前的话本地 strm 会留下）——改成带 `earlier` 进第二阶段，只补收尾不动网盘。
+- `routes/drive/archive.ts`（新）`POST /api/drive/archive`，`index.ts` 登记。
+- `services/agent/tools/transfer.ts`：`drive_archive`（`archiveView` / `archiveError`）；`tools/index.ts` 登记；`instructions.ts` 概念句 + USAGE_NOTES 各一句；`tools/copy.ts` 的 copy_after 描述和 incomplete 的 next 指向 drive_archive；快照 43 → 44。
+- 前端：`lib/api.ts`（`DriveArchiveInput / Outcome / Result`、`api.drive.archive`）；`components/ArchiveDialog.tsx`（新）；`app/strm/page.tsx`（`rowDrivePath` 从 copyRow 里抽出来给复制 / 归档共用、`RowProps.onArchive`、DirMenu 一项、strm 行归档图标按钮两套布局、顶部「工具」一项、挂弹框，收进去了就 `b.refresh()`）。
+- README 三处：权限档「日常」、「复制到 OpenList」一节末尾、strm 管理一节后面一段。
+- 测试：`services/copy/archive.itest.ts` 6 条（收文件 / 收目录 + 记录联动 / 不动的几种 + 上次挪过了补收尾 / 拒绝 / 网络问题停手、修好再来不重复 / 单条失败不影响别的）；`routes/drive/archive.itest.ts` 1 条；`routes/mcp/mcp-copy.itest.ts` +1；tools 快照。全量 1533 过（在 earlier 改法之前跑的；之后三个文件 26 条复跑过）。tsc / eslint 前后端过，`next build` 过。
+- 真机（2026-10-08，115）：OpenList 容器挂 115 Cloud（cookie 来自配置库只读拷贝，容器只映射 127.0.0.1:5246）往 115 根下建 `/v1008lab/{某剧/S01/E01.mkv, 某剧/S01/E02.mkv, 电影/movie.mkv}`（ffmpeg 造的 88 KB 测试视频）；scratch 后端 4100（新库：115 账号 + v1008lab 任务 + 日常令牌，监控 / Telegram / Emby 关）跑一次同步生成 3 个 strm。
+  - REST `POST /api/drive/archive`（某剧/S01/E01.mkv）：6.2 秒，`archived`、`to: /v1008lab/归档/某剧/S01`、「本地 strm 也删了」；115 上原处没了，归档里有。
+  - MCP（官方 SDK 客户端，日常令牌，28 个工具里有 drive_archive）：「某剧」→ `kept`「归档目录里已经有同名的」（归档/某剧 已由上一步建出）；「某剧/S01/E02.mkv」→ `archived` 4 秒；同一条再调 → `archived`「已经在归档里（上次挪过了）」不重复；「归档/某剧」→ VALIDATION 带 drive_browse 提示。换上 earlier 改法重启后端再调一次 E02 → 同样「上次挪过了」。
+  - 界面（3223 dev → 4100，隐藏窗口用 JS 派事件）：strm 页 v1008lab 目录行「更多操作」里有「归档到暂存区」；弹框预填任务和「电影」；确认框文案；点「归档」约 5 秒后结果「电影 已归档 · 本地 strm 也删了」+ toast「收进暂存区 1 项，本地对应的 strm 已删」，列表刷新成空。
+  - 115 最终：`/v1008lab/归档/{某剧/S01/{E01,E02}.mkv, 电影/movie.mkv}`，`/v1008lab/某剧/S01` 留着空目录（收单个文件不收拾父目录，和 copy_after 一样）；本地 strm 全没了。
+  - 收尾：`/v1008lab` 经 OpenList `fs/remove` 删进 115 回收站（Provider 再看已是 missing）；容器 `rm -f`、带 cookie 的 scratch 目录整个删掉、Docker Desktop 停掉。
+- zsh 坑：`for args in "a b"; do cmd $args` 不分词（第一轮 MCP 全报 paths 空），要写 `${=args}`。
+
+**发布**：功能合成一个提交 b31af05（前面的 c0de163 只是把 rc.1 的发布记录补进 302-proxy-migration.md），`chore(release): v2.16.0-rc.2` = 09e4b1e，tag 已推（2026-10-08，main 未动）。
+Release 四作业（Typecheck, lint and tests / Build amd64 / Build arm64 / Merge manifest and release）与 CI@v2 两作业全绿，GitHub Release 是 prerelease，Docker Hub `v2.16.0-rc.2` 镜像 c1583e206da7（amd64 / arm64），latest 仍是 v2.15.0 的 b06e1e4dba65。
+
+## 清理归档：drive_archive_clean（2026-10-28）
+
+起因：用户「加一下清理归档的功能」。现状：任务目录下的「归档」（暂存区）只进不出——复制后归档、copy_after、drive_archive 三条路往里挪，腾空间只能到网盘里手动删；界面、REST、智能体都没有入口，也看不到归档里有什么（drive_browse 只列子目录和文件个数，归档里一层的单个文件看不到）。
+
+### 方案
+
+**服务层** `services/copy/archive-clean.ts`，两个入口：
+
+- `listArchive(task)` → `{ archiveDir, exists, items[] }`：只列归档目录的**一层**（名字、目录还是文件、大小、修改时间）。归档里原来的层级就是作品 / 目录名，一层正好是用户认得的粒度；要删更深的用 paths 指。115 的列表没有修改时间，夸克 / OpenList 有（夸克挪动会刷新 updated_at，差不多就是归档时间）。目录不存在当空的，不报错。
+- `cleanArchive({ task, paths? | all?, signal?, onProgress? })` → `{ done, archiveDir, items[] }`，每条 `outcome` = deleted / missing / failed / skipped。
+  - paths 相对归档目录（`uniqueArchivePaths`：不收空、`..`、重复，父目录在就不单列子路径；写成「归档/xxx」也认——drive_browse 给的是相对任务目录的路径，归档里不可能再套一层「归档」，剥掉没有歧义）；`all: true` 是归档目录现在这一层的全部条目；两个都给、都不给都是 VALIDATION。
+  - 两阶段同 archive.ts：先按父目录绕开缓存找节点（after.ts 的 `Lookups`；all 模式直接用 `listArchive` 的 fresh 列表），再逐条 `provider.write.remove`（115 / 夸克进回收站，OpenList 看存储后端），用列出来的节点 id 删；碰上网络问题停手、后面的 skipped；单条被网盘拒的不影响别的；不进自动重试，再调一次即可。
+  - 删完 `resetArchiveDirCache()`：同一轮复制里刚确认 / 建过的归档目录链可能已经被删掉了，让下一次归档重新到网盘确认。
+  - 不删「归档」目录本身（空壳留着，下次归档直接用）；不看复制队列（复制记录只是历史，`afterCopy = archive` 的记录照旧）；不拒整理中（整理不碰暂存区）；网盘不支持写 400 UNSUPPORTED。
+  - 本地没有对应的 strm（暂存区不镜像），不用动本地；监控看到的删除事件落在暂存区，照旧「不处理」。
+
+**REST**（`routes/drive/archive.ts` 追加）：`GET /api/drive/archive?taskId=`（read + transfer）列；`POST /api/drive/archive/clean`（danger + transfer，body `{ taskId, paths?, all? }`）删。
+
+**工具** `drive_archive_clean`（transfer 组、danger 档；注解 destructive、idempotent）：task + paths? + all?。都不给就只列（看归档里有什么，不删）；要删的先 `confirmFirst`（确认框里只说哪个任务、几条、进回收站，不放网盘里的名字），40 秒内直接回否则交作业用 job_status 等。结果逐条 outcomeText + note + next。描述写明：先列、把要删的告诉用户、同意后再传 paths / all。instructions 概念句 + USAGE_NOTES 各加一句。工具 44 → 45。
+
+**界面**：`components/CleanArchiveDialog.tsx`：选任务 → 自动列归档一层（目录 / 文件、大小、时间）→ 勾选（有「全选」，默认一个不勾）→ 红字确认（进回收站 / 不可逆 / 本地 strm 和 Emby 不受影响）→ 结果按 outcome 标色，能「回到列表」接着清。strm 管理页「工具」多一项「清理归档」。README 三处（strm 管理一节、权限档、智能体一节）。
+
+### 不做
+
+- 按天数自动清理（定时删网盘文件要产品决策；115 又没有时间可依据）。
+- 目录大小统计（115 要导出整树才知道，夸克要递归列）。
+- 清理「重复文件」目录（整理的撤销要把它们挪回去，删了撤销就退不回）。
+- 「从归档恢复」仍是到网盘里手动挪回。
+
+### 测试
+
+- `services/copy/archive-clean.itest.ts`：列（不存在 / 空 / 一层的目录和文件带大小时间）；按 paths 删文件和目录、「归档/」前缀、重复和父子路径；all；missing；拒绝（空、太多、`..`、归档目录本身、paths + all）；不支持写；网络问题停手、修好再来；单条被拒不影响别的；进度回调。
+- `routes/drive/archive.itest.ts` +1：GET 只读令牌能看、POST 写令牌 403、完全令牌能删、参数不对 400。
+- `routes/mcp/mcp-copy.itest.ts` +1：日常令牌看不到；完全令牌先列再删、all、paths + all 被拒。
+- 工具快照更新。
+- 真机：本机用 FakeDrive 预加载的 scratch 后端做浏览器冒烟；115 / 夸克上的真删要用户批准后再做。
+
+### 进度
+
+- [x] 服务层 + 用例
+- [x] REST + 用例
+- [x] 工具 + instructions + 快照 + 用例
+- [x] 界面 + README
+- [x] typecheck / lint / 全量测试 / 浏览器冒烟
+- [x] 115 / 夸克真机（2026-10-28，用户批准后做的，见下）
+- [ ] 评审
+
+### 实施记录（2026-10-28）
+
+按方案做完，未提交。
+
+- `services/copy/archive-clean.ts`（新）：`listArchive`（内部 `listArchiveEntries` 带节点 id，目录在前再按名字）、`uniqueArchivePaths`（剥「归档/」前缀、拒归档目录本身 / `..` / 超 `CLEAN_MAX`）、`cleanArchive`（paths / all 二选一；第一阶段 paths 用 `Lookups` 按父目录 fresh 找节点、all 直接用 fresh 列表；第二阶段逐条 `provider.write.remove`，网络问题停手、单条被拒不影响别的；删成了 `resetArchiveDirCache()`）。
+- `routes/drive/archive.ts`（追加）：`GET /api/drive/archive?taskId=`（read + transfer）、`POST /api/drive/archive/clean`（danger + transfer，body `{ taskId, paths?, all? }`）。
+- `services/agent/tools/transfer.ts`：`drive_archive_clean`（danger 档、transfer 组、destructive；不传 paths / all 回 `state: "listed"` 的清单，最多列 200 条；要删的先 `uniqueArchivePaths` 算出条数再 `confirmFirst`，all 先列、空的直接回；40 秒内直接回否则交作业）；`tools/index.ts` 登记；`instructions.ts` 概念句 + USAGE_NOTES 各一句；快照 44 → 45。
+- 前端：`lib/api.ts`（`DriveArchiveListItem / ListResult / CleanInput / CleanOutcome / CleanResult`、`api.drive.archiveList / archiveClean`）；`components/CleanArchiveDialog.tsx`（新：选任务 → 自动列一层 → 勾选 / 全选（默认不勾）→ 红字确认 → 结果按 outcome 标色 → 「回到列表」重列；按勾选的 paths 删，不用 all——列出来之后又进了新东西的用户没看过）；`app/strm/page.tsx` 「工具」多一项「清理归档」（ArchiveX 图标）。
+- README 三处：strm 管理一节、权限档「完全」、智能体一节。
+- 测试：`services/copy/archive-clean.itest.ts` 7 条（列 / 路径归一 / 按 paths 删 + 进度 / all + 目录本身留着 / 拒绝 + 不支持写 / 网络问题停手再来 / 单条被拒）；`routes/drive/archive.itest.ts` +1（GET 只读令牌能看、POST 读 / 写令牌 403、完全令牌能删、400 / 404 / 401）；`routes/mcp/mcp-copy.itest.ts` +1（日常令牌看不到、完全令牌先列再按「归档/」前缀删、all 留着目录本身、paths + all / `..` 被拒；新增 fullToken）；工具快照更新（`UPDATE_SNAPSHOTS=1`）。tsc / eslint 前后端都过；后端全量 1682 条全过（4 分 52 秒），前端单测 11 条过，`check-hygiene.sh` 过。
+- 浏览器冒烟（2026-10-28，不碰真网盘）：scratch 后端 4100 用 `node --import tsx --import <preload>` 预加载 `setDriveProviderFactory` 接进程内的 FakeDrive（115 / 夸克各一个账号，树里预置 `归档/东京三十岁左右`、`归档/lone-sample.mkv`、`归档/空目录`），新库口令换成临时随机的、建两个 lab 任务跑一次同步；前端 dev 3223。
+  - 深色宽屏：strm 页「工具」→「清理归档」，任务预选、列出 3 项（目录在前，文件带大小，有时间的带「今天 15:26」这类短写法，title 是完整时间）；勾两项 → 「删除（2）」→ 红字确认框 →「已删除」×2 + toast「从网盘上删掉 2 项」→「回到列表」只剩「空目录」；后端日志一行 `清理归档（fake115 /tv/归档）：东京三十岁左右=deleted，lone-sample.mkv=deleted`，没有告警。
+  - REST：`POST /api/drive/archive`（怒呛人生/S02）→ `GET` 列出「空目录」「怒呛人生」→ `POST …/clean {all:true}` 删 2 条、目录本身留着、再列是空的；paths + all 一起给 / 都不给都是 400 带中文原因。
+  - 浅色 + 窄屏（390px iframe）：弹框一列排版，时间列收起，按钮上下排；空归档显示「归档目录是空的」，再归档两项后点「刷新」列出来。
+  - 收尾：两个 scratch 进程已停，lab 库、临时口令、令牌文件已删；没碰任何真网盘。
+- 冒烟后又改了两处小的：列表里目录不给大小（夸克的目录 size 是 0，不是真的大小；archive-clean.itest 的列用例加了 `size: 0` 的目录）；`drive_archive_clean` 传 all 碰上空归档直接回 `state: "done"`（和删完一个形状）。tsc / eslint / 三个相关用例文件复跑过。
+
+### 真机验证（2026-10-28）
+
+用户「真机测试一下」，批准「两个网盘都做」。
+
+**环境**：lab 库从 `config/openstrm.db` 只读 `.backup` 到 scratchpad 的 lab2（迁移跑到 0028）；prep 脚本把口令换成临时随机的、Telegram / 网盘监控 / Emby / TMDB / HDHive / openlistCopy 清空、生产任务删掉、建 lab 任务 `lab115`（115 `/lab20261028`）和 `labqk`（夸克 `/lab20261028`）、建一个完全档的 MCP 令牌；media_library / share_follows / life_events / drive_snapshots 清空。后端 4100（`BACKEND_HOST=127.0.0.1`）、前端 dev 3223；OpenList 容器 `openlist-lab2` 只绑 127.0.0.1:5246（`-e PUID=0 -e PGID=0`，data 目录 777），挂 `115 Cloud` + `Quark`（cookie 取自 lab 库，写进 600 权限文件再读）。测试文件是 ffmpeg 造的 184 KB mkv，经 `fs/put` 传成 `/lab20261028/剧A/S01/E01.mkv`、`E02.mkv`、`/lab20261028/电影B/movie.mkv`。浏览器登录那一步鼠标点密码框会撞上密码管理器扩展（「Cannot access a chrome-extension:// URL」），改用 JS 的原生 setter 填表单再点登录。
+
+| 场景 | 结果 |
+|---|---|
+| 夸克 全量同步 | 3 个 strm 生成 |
+| 115 全量同步 | 刚建的目录 `files/getid` 回 0，报「远端目录树里找不到源目录」，17:04～17:09 每 30 秒重试都失败，17:09:58 才成（那时文件已归档，回「no files to download」）；`resolvePath` 走列目录一直找得到。记进 drive-notes.md |
+| 夸克 `POST /api/drive/archive`（剧A、电影B/movie.mkv） | 2 条 archived，`剧A` → `/lab20261028/归档`、movie.mkv → `/lab20261028/归档/电影B`，本地 strm 删了；OpenList refresh 列 `/quark/lab20261028/归档` = [剧A, 电影B] |
+| 夸克 界面「清理归档」 | 弹框预选 labqk，列出 电影B、剧A（夸克挪动刷新 updated_at，时间列「今天 17:05」）；勾 剧A → 「删除（1）」→ 红字确认 →「已删除」+ toast「从网盘上删掉 1 项」→「回到列表」只剩 电影B；OpenList 列 `/quark/lab20261028/归档` = [电影B] |
+| 夸克 MCP `drive_archive_clean`（官方 SDK 客户端，完全档令牌，31 个工具里有它） | `{}` → listed 1 项（带 modifiedAtText）；`paths: ["归档/电影B"]` → 2.3 秒 done、deleted；再 `{}` → 空；`all: true` → done 0「归档里没有东西」 |
+| 115 `POST /api/drive/archive`（剧A、电影B/movie.mkv） | 2 条 archived；列归档 = [电影B, 剧A]，没有时间（115 不给） |
+| 115 MCP `{}` | listed 2 项，items 里没有 size / modifiedAt |
+| 115 界面「清理归档」 | 列出 电影B、剧A，时间列「-」；勾 剧A → 确认 → 约 8 秒内「已删除」；「回到列表」后只剩 电影B（截图里是删完 all 之后「归档目录是空的」） |
+| 115 `POST /api/drive/archive/clean {all:true}` | done 1（电影B）；再列 `exists: true, items: []`；OpenList refresh 列 `/115/lab20261028/归档` = [] |
+| 收尾 | OpenList `fs/remove` 把 `/115/lab20261028`、`/quark/lab20261028` 删进回收站，两边根目录都没有它了 |
+
+**真机发现的问题**：没有和这次改动相关的。115 新建目录 getid 滞后是 115 自己的（同步才用 getid），记进 drive-notes.md「115」一节。
+
+日志：lab 后端日志里除了「仍在使用默认密码」（改口令前的那一条）没有告警和报错；`copy-archive` / `copy-archive-clean` 各一行 info 记每条的结果。
+
+收尾：lab 后端 / 前端进程已停；容器 `docker rm -f`，带 cookie 的 ol-data、lab 库拷贝、口令 / 令牌文件、测试视频全部删掉，Docker Desktop 停掉；`apps/backend/.lab-mcp.mts` 删掉。网盘上留下的东西：两个回收站里各一个 `lab20261028`（三个 184 KB 的测试视频 + 空目录），不清也没关系。
+
+**发布：v2.20.0-rc.1（2026-10-29，用户「不用 review 了，直接发个 rc」）**
+
+功能合成一个提交 afb0c65，方案记录 04f6b6d（连同工作区里压着的起播诊断选条目方案一起带上），`chore(release): v2.20.0-rc.1` = df13b8c，tag 已推，main 未动（仍在 4163124 = v2.19.0）。没有迁移。没评审（用户跳过）。
+Release #116 四作业（Typecheck, lint and tests / Build amd64 / Build arm64 / Merge manifest and release）与 CI #143 全绿；GitHub Release 是 prerelease；Docker Hub `v2.20.0-rc.1` 镜像 ee1dfc93cb11（amd64 652e900251aa / arm64 c53fbf560c16），latest 仍是 v2.19.0 的 8bc505cef31e。
+正式版说明要写的：strm 管理页「工具」多了「清理归档」；新接口 `GET /api/drive/archive`、`POST /api/drive/archive/clean`；智能体工具 `drive_archive_clean`（删除档，工具 44 → 45，选「全部」工具集的老令牌不用改，它在转存那一组里）。
+
+**发布：v2.20.0（2026-10-30，用户「发一个正式版吧」）**
+
+发布提交 a3a6377（`chore(release): v2.20.0`），tag `v2.20.0`，范围 `v2.19.0..v2.20.0`：f5713df 测试、afb0c65 清理归档（rc.1 之后没动）、1039472 ChatGPT 接入说明（README + 设置页一句文案，发版途中用户提的，记录在 agent-access.md「核实记录」）和方案记录。没有迁移。没评审（rc.1 时用户跳过，正式版没补）；真机是 2026-10-28 做的，见上节「真机验证」，rc.1 之后的改动只有文档和那一句文案。
+本地：tsc / eslint、后端 1682 条、前端 11 条全过（版本号改完后跑的）；之后改了设置页文案，复跑前端 tsc / eslint，并用全新 scratch 库 + 真 Chrome 冒烟（浅色 / 深色 / 宽屏 / 390px 窄屏，正常折行、无横向溢出、控制台无错），实验环境已删。
+Release #117 四作业 + CI@v2 #145 + CI@main #146 全绿；Docker Hub `v2.20.0` 与 `latest` 同为 2a5e52970214（amd64 665164e9d869 / arm64 84abc709a208）；GitHub Release 非 prerelease、是仓库最新。main 从 f5713df 快进到 a3a6377，main == v2 == v2.20.0。更正：上面 rc.1 记录写的 main「仍在 4163124」不对，当时 main 已在 f5713df（比 v2.19.0 多 665d461 方案记录和 f5713df 测试，都不带功能代码），这次仍是纯快进。升级说明交用户手动贴。
+
+## 任务目标目录与开关解耦、智能体按类型选子目录（2026-11-03，方案）
+
+起因：用户把「复制到 OpenList」的默认目标目录设成 `/hdd`，下面按 `tv` / `movie` 分了子目录，希望智能体复制时放进对应的子目录；现在它不会主动选。用户看过分析后「按你的推荐制定计划开始吧」。
+
+### 现状
+
+- 落点 = 目标目录 + 条目相对任务目录的路径（`dstDirFor`），任务目录自己那一段（`tv`、`movie`）不带过去：默认目标 `/hdd` 时 `/tv/某剧` 和 `/movie/某片` 都平铺成 `/hdd/某剧`、`/hdd/某片`。
+- 任务级 `copyToOpenlist.dstDir` 后端各路都认：`copyOptionsFor` / `copyDstProblem` / `copySettingsGap` 读它时不看 `enabled`，copy_add、share_save 的 `copy: true`、云下载、监控、追更、Telegram 都会落到它下面。卡在任务弹框：只有开关打开才显示并保存「复制到哪」，关着就整块记成 `{ enabled: false }`——这就是以前记下没做的「任务目标与开关解耦」。
+- 智能体：`copy_add` 有 `dstDir`、`offline_add` 有 `copyDstDir`，`share_save` 没有；三处描述都只说「不填用任务上或设置页的目标目录」，没说目标根下可能按类型分了子目录；`drive_browse` 本来就能列 OpenList 账号的目录（`providerFor` 支持 openlist），但没人提；`tasks_list` 只给开着复制的任务带 `copyToOpenlist`，关着的看不到任务上填的目标目录。
+
+### 方案
+
+**1. 任务目标目录与开关解耦（主要是前端）**
+
+- 任务弹框 `AddTaskDialog`：「复制到哪」不再跟着 `copyEnabled` 走（OpenList 账号的任务除外，那种任务用不着复制）：开关关着也显示、也保存。说明按开关状态分别说：关着时「关着自动复制也用得上：手动复制、转存 / 云下载时一次性勾的复制都落在这里；不填用设置页的默认目标目录」，开着时沿用现在的话。读设置页 `openlistCopy` 的 effect 改成弹框一打开就读（原来只在开关打开时读，占位里的默认目标目录和「从 OpenList 里选」按钮都靠它）。表单校验「不能是 OpenList 根」不再只在开关开着时做。保存：`copyToOpenlist: { enabled, ...(dstDir ? { dstDir } : {}), ...(enabled ? { afterCopy } : {}) }`——去向照旧只在开着时存（关着留着「删除 / 归档」的话，以后一次性勾复制会连带删源，这条原则不变）。
+- 后端数据和校验不动（schema 本来就收 `{ enabled: false, dstDir }`，仓库层不丢字段）。`tasks_list`：开着复制、或者填了目标目录的任务都带 `copyToOpenlist`，里面多一个 `enabled`；描述改成「enabled 开没开自动复制，dstDir 是复制到哪（开关关着时手动复制 / 一次性勾的复制也落在这里）」。
+- 任务列表的「复制」徽标照旧只看开关。`AddCopyDialog`、`AddOfflineTaskDialog` 本来就读任务上的 `dstDir`，不用改。
+
+**2. `share_save` 加 `copyDstDir`（和 `offline_add` 对齐）**
+
+- 服务层 `SaveSelectionOpts.copyDstDir?` → `enqueueReceivedCopy({ copyDstDir })` → `copyOptionsFor(task, copy, settings, copyDstDir)`。`saveSelectionToTask` 动网盘之前校验：给了却这次不会复制（`copy ?? task.copyToOpenlist.enabled` 为假）→ 400 `COPY_DST_UNUSED`；越界 → 400 `COPY_DST_INVALID`（`copyDstProblem`，只能是任务上 / 设置页的目标目录或它们下面）。REST `POST /api/share` 的 `receive` 收 `copyDstDir`。
+- 工具：参数描述同 `offline_add`；提交前先按同样三条校验（`VALIDATION` 带 hint）；去重「多要 copy 只补复制」那条路也带着 `copyDstDir`；进行中那次的回话（`prevCopy`）带 `dstDir`。
+- 转存弹框（界面）不加子目录选择，见「不做」。
+
+**3. 描述与须知：让模型知道去看子目录**
+
+- `copy_add.dstDir`、`share_save.copyDstDir`、`offline_add.copyDstDir` 的描述加一句：目标目录下按类型分了子目录（比如 tv / movie）的，先用 `drive_browse(account: OpenList 账号, path: 目标目录)` 看一眼，填成对应的子目录；任务上填了目标目录的不填就落在那里。
+- `drive_browse` 描述说明 account 也可以是 OpenList 账号（看复制目标目录下有哪些子目录）；`copy_list` 描述提一句 config 里有 OpenList 账号名和默认目标目录。
+- `USAGE_NOTES` 加一条同样的话；`AGENT_INSTRUCTIONS` 不动（要短）。
+- 工具快照更新（`UPDATE_SNAPSHOTS=1`）。
+
+### 不做
+
+- 默认目标目录支持 `{task}` 占位（`/hdd/{task}` 自动展开成任务目录名）：改动面大（`copyDstProblem` 的根、Telegram 浏览根、设置页「检查」、各弹框的占位），任务级目标目录已经能解决，以后真有很多任务再说。
+- 转存弹框（`SaveToDriveDialog`）选复制子目录：界面上按任务填目标目录就够了。
+- 按 TMDB 识别结果自动分 tv / movie：混合库靠整理模板的二级分类把作品归进子目录，复制照搬层级，不用动复制模块。
+- 已经平铺到目标根下的内容不自动挪。
+
+### 测试
+
+- `routes/mcp/mcp-copy.itest.ts`：`share_save` 的 `copyDstDir`（落点进记录和结果；越界 `VALIDATION` 网盘没动；没复制却给了报错；任务开着复制时不传 copy 也能指定）；`tasks_list` 关着开关但填了 `dstDir` 的任务带 `copyToOpenlist.enabled: false`、开着的带 `enabled: true`；`copy_add` 不给 `dstDir` 时落到任务上关着开关填的目标目录。
+- `routes/share/share.itest.ts`：REST `receive` 带 `copyDstDir` 的落点；越界 400、不复制却给了 400，网盘不碰。
+- `services/agent/tools/tools.test.ts` 快照。
+- 浏览器冒烟：任务弹框关着开关填「复制到哪」→ 保存 → 重开还在、列表徽标不出现；打开开关 → 去向一栏出现、校验照旧；新建复制弹框的默认目标用任务上填的。
+
+### 进度
+
+- [x] 后端：service / REST / 工具 / 须知 / 快照 / 用例
+- [x] 前端：任务弹框
+- [x] README
+- [x] typecheck / lint / 浏览器冒烟（全量测试见实施记录）
+- [x] 评审（`/code-review medium` 7 条全修，见下）
+
+### 实施记录（2026-11-03）
+
+按方案做完，未提交。
+
+- 后端
+  - `services/share/receive.ts`：`SaveSelectionOpts.copyDstDir`；`checkCopyDstDir`（动网盘之前：空串当没给；归一后为空 400 `VALIDATION`；这次不会复制（`copy ?? task.copyToOpenlist.enabled` 为假）400 `COPY_DST_UNUSED`；越界 400 `COPY_DST_INVALID`）；`enqueueReceivedCopy({ copyDstDir })` → `copyOptionsFor(task, copy, settings, dstDir)`。
+  - `routes/share/index.ts`：`receive` 收 `copyDstDir`。
+  - `services/agent/tools/transfer.ts`：`share_save` 加 `copyDstDir`（提交前三条校验和 offline_add 一样，都是 `VALIDATION` 带 hint；去重补复制也带着；`SaveMeta.copyDstDir`，进行中那次的回话带 `dstDir`）；`drive_browse` / `offline_add` 的描述。`tools/copy.ts`：`DST_SUBDIR_HINT`（三个目标参数共用的一句）、`taskCopyView` 关着开关但填了目标目录的也带（多 `enabled` 字段；关着的去向只会是不动、不算 blocked）、`copy_add` / `copy_list` 描述。`tools/core.ts` 的 tasks_list 描述；`instructions.ts` 的 USAGE_NOTES 加一条；工具快照 +4 行（share_save 的 copyDstDir）。
+- 前端 `app/home/components/AddTaskDialog.tsx`：读设置页 `openlistCopy` 的 effect 改成弹框一打开就读；「复制到哪」挪到开关外面（OpenList 账号的任务整块不显示），说明按开关状态分别说；去向一栏只在开着时显示；OpenList 根校验不再看开关；保存成 `{ enabled, dstDir?（OpenList 任务不存）, afterCopy?（只在开着时） }`。`lib/api.ts` 的 receive 入参类型加 `copyDstDir`（界面没入口，只是对齐 REST）。
+- README：115 云下载一节加「任务上能单独填目标目录、开关关着也能填」；智能体一节「转存、云下载指定复制到哪」+ 子目录那句。
+- 测试：`routes/mcp/mcp-copy.itest.ts` +1（copyDstDir 落点进记录和结果 / 越界 / 没复制却给了 / 开着复制的任务不传 copy 也能指定 / copy_add 不给 dstDir 落在任务上关着开关填的目标目录 / tasks_list 带 `enabled: false`），原「总览和任务列表」用例改成带 `enabled: true`；`routes/share/share.itest.ts` +1（REST `copyDstDir` 落点 + `COPY_DST_INVALID` / `COPY_DST_UNUSED` 两种 400，网盘没动）。typecheck / lint 前后端都过；定向跑：mcp-copy 21、share + mcp + agent 50、tools / prompts / paths 29、前端 11，全过；后端全量 1711 条全过（5 分 05 秒）；`check-hygiene.sh` 过。
+- 浏览器冒烟（2026-11-03）：全新 scratch 库起 4100（临时随机口令）+ dev 3223；假 115 账号 `a`、连不上的 OpenList 账号 `ol`（127.0.0.1:9）、设置 `openlistCopy = { account: ol, dstDir: /hdd, mounts: { a: /115 } }`、任务 tv / movie。tv 任务弹框：开关关着也显示「复制到哪」（占位「不填就用设置页的默认目标目录（/hdd）」+ 关着的说明）→ 填 `/hdd/tv` 保存 → toast「任务已保存」、列表没有「复制」徽标 → 重开值还在，`GET /api/task` 回 `{ enabled: false, dstDir: "/hdd/tv" }`、`copyBlocked: null` → 打开开关：去向一栏出现、值不丢（取消没存）。云下载页「新建复制」选 tv 任务：「复制到哪」显示 `/hdd/tv`。收尾：两个进程停掉，token、config 库的只读拷贝删掉；没碰真网盘。
+
+### 评审与修补（2026-11-03，`/code-review medium`）
+
+7 条全修：
+
+1. share_save 去重命中时 `copyDstDir` 被悄悄丢掉（去重键不含它；上次已经复制过就不再补）→ `duplicateResult` 在给了 `copyDstDir`、这次又没补复制时带 `copyDstDirNote`（上次那次复制到哪已经定了；要换地方请用户在云下载页去掉那几条再用 copy_add 指定）→ 回归：mcp-copy 新用例里同一分享换 copyDstDir 再调一次。
+2. `follow: true` + 一次性 `copy` / `copyDstDir`：追更订阅不带它们，之后的新增按任务上的开关和目标目录来（既有设计：一次性参数只管这一次）→ 改成说清楚：share_save 描述加一句，结果里带 `copyFollowNote`；没把一次性目标写进订阅（要让追更复制到同一处，任务上填目标目录即可）→ 回归：同一用例 follow: true 的调用。
+3. 关着开关但填了目标目录的任务，`tasks_list` 不算 `blocked`，模型会以为能复制、到 copy_add 才碰 COPY_NOT_READY → `taskCopyView` 一律算 `blockerOf(task)`，描述改成「复制不了的原因（开着的不会自动复制，关着的一次性复制会被拒）」→ 回归：同一用例清掉挂载根后 c-tv 带 blocked。
+4. 三条目标校验写了四遍（share_save 工具、receive.ts、offline_add 工具、manual.ts）→ 收成 `copy/paths.ts` 的 `checkCopyDstDir(task | null, copy, copyDstDir, settings)`（code：VALIDATION / COPY_ALWAYS_ON / COPY_DST_UNUSED / COPY_DST_INVALID），receive.ts、manual.ts（copy 固定 true）直接调，两个工具经 `copyDstDirArg` 换成带 hint 的 ToolError；offline_add 的错误码随之从 VALIDATION 变成 COPY_DST_UNUSED / COPY_DST_INVALID（mcp-copy 云下载用例改了断言）→ 回归：paths.test 新增 `checkCopyDstDir` 12 个断言。
+5. 任务弹框：OpenList 账号的任务不显示「复制到哪」，但留着个填成 / 的值会让保存卡在看不见的校验上 → 选成 OpenList 账号时连 `copyDstDir` 一起清掉（原来只关开关）。
+6. drive_browse 按账号浏览回的 `drivePath` 没有前导 /（`normalizeSubPath` 剥掉），模型照抄进 copyDstDir 虽然能用（normConfigDir 会补）但和「OpenList 完整路径」的说法对不上 → 按账号浏览时 `drivePath` 从根算、带前导 /（按任务的沿用任务目录写法），描述里说明 → 回归：mcp.itest 看目录用例加断言。段内 trim 掉尾空格是 drive_browse 既有限制，没动。
+7. REST 上任务开着复制却传 `copy: false` + `copyDstDir`，原来报「这次不会复制」（其实监控照样复制）→ `checkCopyDstDir` 先判这一种，回 COPY_ALWAYS_ON 说清楚 → 回归：paths.test 的 `checkCopyDstDir` 用例。
+
+修完：tsc / eslint 前后端过；定向跑 mcp-copy + paths + manual 47 条、mcp + share + tools + prompts + followup 84 条全过；后端全量 1712 条全过（4 分 46 秒），前端 11 条过。未提交。
+
+### 真机验证（2026-11-03，用户批准后做的）
+
+**环境**：lab 库从 `config/openstrm.db` 只读 `.backup`（`mode=ro&immutable=1`）到 scratchpad 的 lab 目录；prep 脚本（`.mts`，先 `initDb()` 跑迁移）把口令换成临时随机的、设置只留 strm / 下载扩展名、UA、限流（Telegram / 监控 / Emby / HDHive / TMDB / PanSou 全不带 = 关）、`openlistCopy = { account: ol-lab, dstDir: /local, mounts: { 115: /115 } }`、`agent.enabled`，生产任务删掉只建 `lab115`（115 `/lab20261103`，开关关着、`dstDir: /local/tv`，整理关），建 OpenList 账号 `ol-lab`（127.0.0.1:5246）和完全档令牌；share_follows / media_library / life_events / drive_snapshots / organize_* / task_history / path_cache 清空，`offline.followups` 和 life 游标删掉。后端 4100（`BACKEND_HOST=127.0.0.1`，用 tsx 的绝对路径起：后台命令里的 `cd` 不生效）、前端 dev 3223。OpenList 容器 `openlist-lab3` 只绑 127.0.0.1:5246（`-e PUID=0 -e PGID=0`，data 目录 777），挂 `115 Cloud`（cookie 取自 lab 库写进 600 文件，addition 只要 `cookie` + `root_folder_id`）和 `Local`（`/local`，host 上 bind 的目录，下面预建 `tv`、`movie`）。测试文件 ffmpeg 造的 44 KB mkv，经 `fs/put` 传成 `/115/lab20261103/剧A/S01/E01.mkv`、`E02.mkv`、`/115/lab20261103/电影B/movie.mkv`。
+
+| 场景 | 结果 |
+|---|---|
+| MCP `tasks_list` | lab115 带 `copyToOpenlist: { enabled: false, dstDir: /local/tv, afterCopy: keep }`，没有 blocked |
+| MCP `drive_browse(account: ol-lab, path: /local)` | `drivePath: /local`、`dirs: [movie, tv]`（真 OpenList 的 Local 存储） |
+| MCP `copy_list` | config：`openlistAccount: ol-lab`、`defaultDstDir: /local`、mounts |
+| MCP `copy_add(task: lab115, paths: [剧A])`（不给 dstDir） | queued 1，`dstDir: /local/tv`，note「复制到 /local/tv 下」 |
+| MCP `copy_add(paths: [电影B], dstDir: /local/movie)` | queued 1，`dstDir: /local/movie` |
+| MCP `copy_add(dstDir: /elsewhere)` | `COPY_DST_INVALID`「复制目标只能是 /local/tv 或 /local，或者它下面的目录」，没登记 |
+| 复制循环 | 登记后约 60 秒两条都 done「复制完成」；host 上 `local/tv/剧A/S01/E01.mkv`、`E02.mkv`、`local/movie/电影B/movie.mkv` 各 44288 字节；115 上源文件原样在（去向不动）；任务列表期间显示「复制中 2」徽标（开关关着也显示，徽标看的是队列） |
+| 界面 任务弹框 | 开关关着「复制到哪」显示 `/local/tv`；点「从 OpenList 里选」列出真 OpenList 根（local、115）→ 展开 local 列出 movie、tv → 选 movie 确认，字段回填 `/local/movie`（取消没存） |
+| share_save 的 copyDstDir | 没验：要真分享链接，用户没给；和 copy_add 走同一段登记（`copyOptionsFor` → `enqueueCopyFor`），集成测试覆盖 |
+
+**真机发现的问题**：没有。日志：lab 后端日志里没有 warn / error。
+
+收尾：lab 后端 / 前端进程已停；容器 `docker rm -f`，lab 目录（含 cookie 拷贝、口令、令牌）整个删掉，Docker Desktop 停掉；浏览器里的 token 清掉、标签页关掉。115 上的 `/lab20261103`（两个目录、三个 44 KB 的测试视频）当时没删成（OpenList `fs/remove` 被自动模式的权限拦下）；用户随后说「115上的东西你清理一下」，改用项目自己的 115 Provider（配置库再拷一份只读、`providerFor(115).write.remove`）删进回收站，`resolvePath` 复查已不在，拷贝随即删掉。
+
+### 发布：v2.23.0 正式版（2026-11-03）
+
+用户「发个正式版」（没发 rc）。提交：02e6bb9 `feat(copy)`（任务目标目录与开关解耦、share_save copyDstDir、checkCopyDstDir 统一校验、描述 / 须知、评审修补）+ 3366598 `docs(plans)`（本节方案 / 实施 / 评审 / 真机记录）+ ce50a1b `chore(release): v2.23.0`（三个 package.json 2.22.0 → 2.23.0，shared 仍 2.0.0）；tag 注释 `v2.23.0`。`git push origin v2 v2.23.0`，main 从 6bef2d0 快进到 ce50a1b（纯快进），**main == v2 == v2.23.0**。没有迁移、没有新设置项。升级说明（交用户手动贴）：任务弹框「复制到哪」开关关着也能填 / 保存（手动复制、一次性勾的复制落在那里）；智能体 share_save 新参数 copyDstDir、REST `/api/share` receive 收 copyDstDir；offline_add / share_save 指定目标的错误码改成 COPY_DST_UNUSED / COPY_DST_INVALID（原来是 VALIDATION）；tasks_list 对填了目标目录但关着开关的任务也带 copyToOpenlist（多 enabled 字段）；drive_browse 按账号浏览回的 drivePath 带前导 /；工具数不变（47），ChatGPT 要刷新工具列表才看得到新参数。
+
+结果：Release 四作业（Typecheck, lint and tests / Build amd64 / Build arm64 / Merge manifest and release）+ CI@v2 + CI@main 全绿（本机 13:44 推 → 13:54 验完）；Docker Hub `v2.23.0` 与 `latest` 同为 e33872d53717（amd64 + arm64）；GitHub Release 非 prerelease 且是仓库最新。**v2.23.0 正式版已发**。
+

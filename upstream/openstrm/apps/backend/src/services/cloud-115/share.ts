@@ -1,0 +1,274 @@
+/**
+ * 115 分享链接 API（对应 p115client P115ShareFileSystem）
+ * 用于解析分享链接、获取分享目录列表、下载链接、转存到我的网盘
+ */
+import type { AccountInfo } from "./client.js";
+import { ShareBusyError, shareSnap, shareDownloadUrl, shareReceive } from "./client.js";
+
+export type { AccountInfo };
+
+/** 提取码只有字母数字：链接后面粘着的标点（「?password=u796】」「…u796)」）不算 */
+const leadingCode = (s: string): string => /^[a-z0-9]*/i.exec(s.trim())?.[0] ?? "";
+
+/** 从分享链接解析出 share_code 和 receive_code */
+export function shareExtractPayload(link: string): { share_code: string; receive_code: string } {
+  // 首尾的 / 和 # 去掉；中间 # 往后是网页里的片段，不是分享的一部分
+  const raw = link.trim().replace(/^[/#]+|[/#]+$/g, "").replace(/#.*$/s, "");
+  // 裸分享码，或者短写法：码-提取码、码?password=提取码、码?提取码（不分大小写）。
+  // 要整段对上：以前没锚定，「码?password=提取码」会把 password 这个词当成提取码
+  const short = /^([a-z0-9]+)(?:-([a-z0-9]*)|\?(?:password=)?([a-z0-9]*))?$/i.exec(raw);
+  if (short) {
+    return { share_code: short[1], receive_code: short[2] ?? short[3] ?? "" };
+  }
+  // URL 形式：https://115cdn.com/s/swhk9bx3wwq?password=sff1 或 https://115.com/s/xxx?password=yyyy；
+  // 路径最后一段也可能是「码-提取码」（https://115.com/s/xxx-yyyy）
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      const u = new URL(raw);
+      const pathSegments = u.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+      const last = /^([a-z0-9]+)(?:-([a-z0-9]*))?$/i.exec(pathSegments[pathSegments.length - 1] ?? "");
+      if (last) {
+        return { share_code: last[1], receive_code: leadingCode(u.searchParams.get("password") ?? last[2] ?? "") };
+      }
+    } catch {
+      // fallback to regex
+    }
+  }
+  // 仅路径：取最后一个路径段为 share_code（也可能是「码-提取码」），query 中 password 为 receive_code
+  const pathMatch = raw.match(/.*\/([a-z0-9]+)(?:-([a-z0-9]*))?(?=\?|$)/i);
+  if (pathMatch) {
+    const shareCode = pathMatch[1];
+    const passwordMatch = raw.match(/password=([a-z0-9]+)/i);
+    return {
+      share_code: shareCode,
+      receive_code: passwordMatch ? passwordMatch[1].trim() : (pathMatch[2] ?? ""),
+    };
+  }
+  throw new Error("can't extract share_code from " + JSON.stringify(link));
+}
+
+/** 分享项属性（目录或文件） */
+export interface ShareAttr {
+  /** 分享内文件/目录 id，可能超出 JS 安全整数，接口为字符串时原样保留 */
+  id: number | string;
+  name: string;
+  is_dir: boolean;
+  parent_id: number | string;
+  size?: number;
+  sha1?: string;
+  /** 原始接口字段名可能为 n/fn, fid/cid, fc 等 */
+  [k: string]: unknown;
+}
+
+/** 将分享接口里的 id 转为 number 或 string，避免大整型被 Number() 截断 */
+function normalizeShareId(raw: unknown): number | string {
+  if (raw == null) return 0;
+  if (typeof raw === "bigint") return raw.toString();
+  if (typeof raw === "string") {
+    const t = raw.trim();
+    if (t === "" || t === "0") return 0;
+    if (!/^-?\d+$/.test(t)) return t;
+    const n = Number(t);
+    return Number.isSafeInteger(n) ? n : t;
+  }
+  if (typeof raw === "number") {
+    if (Number.isSafeInteger(raw)) return raw;
+    return String(raw);
+  }
+  return String(raw);
+}
+
+function normalizeShareAttr(item: Record<string, unknown>): ShareAttr {
+  if ("n" in item && typeof item.n === "string") {
+    const isDir = !("fid" in item);
+    return {
+      id: normalizeShareId(isDir ? item.cid : item.fid),
+      name: item.n as string,
+      is_dir: isDir,
+      parent_id: normalizeShareId(item.pid ?? item.cid ?? 0),
+      size: item.s != null ? Number(item.s) : undefined,
+      // web 接口的字段叫 sha，个别接口叫 sha1
+      sha1: (item.sha1 ?? item.sha) as string | undefined,
+      ...item,
+    };
+  }
+  if ("file_name" in item || "fn" in item) {
+    const name = (item.file_name ?? item.fn) as string;
+    const isDir = String(item.file_category ?? item.fc ?? "1") === "0";
+    const id = normalizeShareId(item.file_id ?? item.fid);
+    const pid = normalizeShareId(item.parent_id ?? item.pid ?? item.cid ?? 0);
+    return {
+      id,
+      name,
+      is_dir: isDir,
+      parent_id: pid,
+      size: item.file_size != null ? Number(item.file_size) : undefined,
+      sha1: (item.sha1 ?? item.sha) as string | undefined,
+      ...item,
+    };
+  }
+  return item as ShareAttr;
+}
+
+/**
+ * 115 分享接口回了 state=false：分享已取消 / 过期、提取码不对、登录失效之类都走这里（太频繁、繁忙这种一时的走 client.ts 的 ShareBusyError），
+ * 和网络错误（Cloud115Error）分开——追更靠这个区分"分享没了"和"这轮没连上"。
+ */
+export class ShareApiError extends Error {
+  constructor(
+    message: string,
+    readonly errno?: number,
+  ) {
+    super(message);
+    this.name = "ShareApiError";
+  }
+}
+
+/** 「一时不行」的说法：请求 / 操作过于频繁、系统繁忙、请稍后再试 */
+const SHARE_BUSY = /频繁|繁忙|稍后|稍候|过多|开小差|busy|too many|frequent/i;
+
+/** 分享接口回了 state=false / errno：分享没了、提取码不对是 ShareApiError，一时回不了话是 ShareBusyError */
+export function checkShareResponse<T extends { state?: boolean; errno?: number; error?: string }>(resp: T): T {
+  if (resp.state === false || (typeof resp.errno === "number" && resp.errno !== 0)) {
+    const errno = typeof resp.errno === "number" ? resp.errno : undefined;
+    const said = typeof resp.error === "string" ? resp.error.trim() : "";
+    if (!said) throw new ShareBusyError(`115 的分享接口出错了，没说原因${errno !== undefined ? `（errno ${errno}）` : ""}`, errno);
+    if (SHARE_BUSY.test(said)) throw new ShareBusyError(said, errno);
+    throw new ShareApiError(said, errno);
+  }
+  return resp;
+}
+
+/** 获取分享首页数据（快照，含 share_info 等） */
+export async function getShareData(
+  accountInfo: AccountInfo,
+  shareCode: string,
+  receiveCode = "",
+  opts?: { userAgent?: string }
+): Promise<Record<string, unknown>> {
+  const resp = await shareSnap(
+    accountInfo,
+    { share_code: shareCode, receive_code: receiveCode, limit: 1 },
+    opts
+  );
+  checkShareResponse(resp as { state?: boolean; errno?: number });
+  const data = (resp as { data?: Record<string, unknown> }).data;
+  if (!data) throw new Error("share_snap returned no data");
+  return data;
+}
+
+/** 列分享目录（分页），返回标准化后的列表及总数 */
+export async function getShareDirList(
+  accountInfo: AccountInfo,
+  shareCode: string,
+  receiveCode: string,
+  cid: number | string,
+  opts?: { limit?: number; offset?: number; userAgent?: string }
+): Promise<{ list: ShareAttr[]; count: number; title?: string }> {
+  const limit = opts?.limit ?? 32;
+  const offset = opts?.offset ?? 0;
+  const resp = await shareSnap(
+    accountInfo,
+    { share_code: shareCode, receive_code: receiveCode, cid: String(cid), limit, offset },
+    { userAgent: opts?.userAgent }
+  );
+  checkShareResponse(resp as { state?: boolean; errno?: number });
+  const raw = resp as { list?: unknown[]; count?: number; data?: { list?: unknown[]; count?: number } };
+  const rawList = raw.list ?? raw.data?.list ?? [];
+  const rawCount = raw.count ?? raw.data?.count;
+  const list = rawList.map((item) => normalizeShareAttr(item as Record<string, unknown>));
+  const count = typeof rawCount === "number" ? rawCount : list.length;
+  const title = shareTitleOf((raw.data ?? raw) as Record<string, unknown>);
+  return { list, count, ...(title ? { title } : {}) };
+}
+
+/** snap 响应里的分享标题（shareinfo 里）；没有就 undefined，不拿分享码顶替 */
+export function shareTitleOf(data: Record<string, unknown>): string | undefined {
+  const info = (data.shareinfo ?? data.share_info) as Record<string, unknown> | undefined;
+  const title = info ? String(info.share_title ?? info.share_name ?? info.name ?? info.title ?? "").trim() : "";
+  return title || undefined;
+}
+
+/**
+ * 按影库 sharePath 在分享侧逐级列目录，得到用于 receive 的 file_id（无 shareRootCid 时的兜底）。
+ */
+export async function resolveLibraryEntryShareReceiveIds(
+  accountInfo: AccountInfo,
+  shareCode: string,
+  receiveCode: string,
+  sharePath: string,
+  rawName: string,
+  opts?: { userAgent?: string }
+): Promise<Array<number | string>> {
+  const trimmed = (sharePath || "").replace(/^\/+/, "");
+  const segments = trimmed.split("/").filter(Boolean);
+  let cid: number | string = 0;
+
+  const listOne = (parent: number | string) =>
+    getShareDirList(accountInfo, shareCode, receiveCode, parent, {
+      limit: 1000,
+      offset: 0,
+      userAgent: opts?.userAgent,
+    });
+
+  if (segments.length === 0) {
+    const { list } = await listOne(0);
+    const hit = list.find((it) => it.is_dir && it.name === rawName);
+    if (!hit) {
+      throw new Error(`在分享根目录未找到「${rawName}」，请检查提取码或分享是否仍有效`);
+    }
+    return [hit.id];
+  }
+
+  for (const seg of segments) {
+    const { list } = await listOne(cid);
+    const hit = list.find((it) => it.is_dir && it.name === seg);
+    if (!hit) {
+      throw new Error(`在分享中未找到路径段「${seg}」`);
+    }
+    cid = hit.id;
+  }
+  return [cid];
+}
+
+/** 获取分享内文件/目录的下载链接（仅文件有直链） */
+export async function getShareDownloadUrl(
+  accountInfo: AccountInfo,
+  shareCode: string,
+  receiveCode: string,
+  fileId: number | string,
+  opts?: { userAgent?: string }
+): Promise<string> {
+  const resp = await shareDownloadUrl(accountInfo, shareCode, receiveCode, fileId, opts);
+  checkShareResponse(resp as { state?: boolean; errno?: number });
+  const url = (resp as { url?: string }).url ?? (resp as { data?: { url?: string } }).data?.url;
+  if (!url) throw new Error("share_download_url returned no url");
+  return url;
+}
+
+/** 转存分享文件/目录到我的网盘 */
+/** 同一个 id 只转存一次：弹框里重复勾选、API 调用方重复传，115 都会照单再复制一份 */
+export function uniqueFileIds(fileIds: number | string | (number | string)[]): (number | string)[] {
+  const seen = new Set<string>();
+  const out: (number | string)[] = [];
+  for (const id of Array.isArray(fileIds) ? fileIds : [fileIds]) {
+    const key = String(id).trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(id);
+  }
+  return out;
+}
+
+export async function receiveToMyDrive(
+  accountInfo: AccountInfo,
+  shareCode: string,
+  receiveCode: string,
+  fileIds: number | string | (number | string)[],
+  toPid: number | string,
+  opts?: { userAgent?: string }
+): Promise<Record<string, unknown>> {
+  const resp = await shareReceive(accountInfo, shareCode, receiveCode, uniqueFileIds(fileIds), String(toPid), opts);
+  checkShareResponse(resp as { state?: boolean; errno?: number });
+  return resp as Record<string, unknown>;
+}

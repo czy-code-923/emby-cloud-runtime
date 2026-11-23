@@ -14,3 +14,5 @@ node_modules/
 .validation/
 images.lock.yaml
 docs/runtime-status.json
+dist/
+.emby-cloud.json
