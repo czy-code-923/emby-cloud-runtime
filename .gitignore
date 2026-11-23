@@ -13,3 +13,4 @@ node_modules/
 .next/
 .validation/
 images.lock.yaml
+docs/runtime-status.json

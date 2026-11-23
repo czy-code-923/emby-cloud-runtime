@@ -24,4 +24,4 @@
 - 不启用自动升级。升级前备份、核对兼容性；禁止通过旧数据库覆盖方式回滚新业务数据。
 - 1 核 2GB 只适合小规模验证；网盘 profile 启用前重新测量内存。无域名/网盘授权时不能声称真实播放或 302 已验收。
 
-完整范围与未实现内容见 [差距清单](docs/gaps.md)，实机证据见 [验证记录](docs/verification.md)。
+访问、配置与备份操作见 [使用说明](docs/operations.md)，部署来源见 [版本清单](docs/source-manifest.md)。完整范围与未实现内容见 [差距清单](docs/gaps.md)，实机证据见 [验证记录](docs/verification.md)。
