@@ -1,6 +1,6 @@
 # Emby Cloud Runtime
 
-根据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 制作的分阶段部署仓库。当前版本 **0.1.0-alpha.2：隔离管理基础版**。
+根据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 制作的分阶段部署仓库。当前版本 **0.1.0-alpha.3：隔离管理基础版**。
 
 **这是基础服务部署版本，不是方案全部功能的完成声明。** 账户与管理使用固定版本 Twilight；媒体服务使用 Emby；网盘工具按需启用。域名、Telegram、网盘凭据在首次登录后配置。签到/自动清退/公开注册/销售默认关闭，v8.1 定制保号规则尚未开发和生产验收，不用上游近似规则代替。
 
