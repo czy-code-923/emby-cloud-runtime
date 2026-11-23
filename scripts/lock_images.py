@@ -1,6 +1,6 @@
 import json, pathlib, subprocess
-services=['postgres','backend','webui','gateway','emby']
 c=json.loads(subprocess.check_output(['docker','compose','config','--format','json']))
+services=list(c['services'])
 lines=['# Exact pulled image digests; generated locally.','services:']
 for name in services:
     image=c['services'][name]['image']

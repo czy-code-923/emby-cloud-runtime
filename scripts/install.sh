@@ -29,6 +29,16 @@ chown 10002:10002 runtime/emby
 chmod 755 runtime/media
 docker compose config --quiet
 version=$(cat VERSION)
+python3 - "$version" <<'PY'
+from pathlib import Path
+import sys
+p=Path('.env'); lines=p.read_text().splitlines()
+images={'BACKEND_IMAGE':'emby-cloud-backend:','WEBUI_IMAGE':'emby-cloud-webui:'}
+for i,line in enumerate(lines):
+    key,sep,value=line.partition('=')
+    if key in images and value.startswith(images[key]): lines[i]=key+'='+images[key]+sys.argv[1]
+p.write_text('\n'.join(lines)+'\n')
+PY
 release="https://github.com/czy-code-923/emby-cloud-runtime/releases/download/v$version"
 mkdir -p .validation
 curl --fail --location --retry 3 "$release/SHA256SUMS" -o .validation/SHA256SUMS
@@ -39,7 +49,8 @@ for component in backend webui; do
     gzip -dc ".validation/$asset" | docker load
     rm -- ".validation/$asset"
 done
-docker compose pull postgres gateway emby
+mapfile -t registry_services < <(docker compose config --services | grep -vE '^(backend|webui)$')
+docker compose pull "${registry_services[@]}"
 # Pin the exact downloaded images before starting. No floating tag is used for later restarts.
 python3 scripts/lock_images.py
 docker compose -f compose.yaml -f images.lock.yaml up -d --wait --wait-timeout 240
