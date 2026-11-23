@@ -8,7 +8,8 @@ import "net/http"
 // this collection as it grows.
 func (a *App) registerV2Routes() {
 	a.add(http.MethodGet, "/api/v2/admin/deployment/status", AuthAdmin, a.handleDeploymentUpdate)
-	a.add(http.MethodPost, "/api/v2/admin/deployment/:operation", AuthAdmin, a.handleDeploymentUpdate)
+	a.add(http.MethodPost, "/api/v2/admin/deployment/check", AuthAdmin, a.handleDeploymentCheck)
+	a.add(http.MethodPost, "/api/v2/admin/deployment/apply", AuthAdmin, a.handleDeploymentApply)
 	a.add(http.MethodGet, "/api/v2/system/health", AuthPublic, a.handleV2Health)
 	a.add(http.MethodGet, "/api/v2/system/capabilities", AuthPublic, a.handleV2Capabilities)
 	a.add(http.MethodGet, "/api/v2/openapi.json", AuthPublic, a.handleV2OpenAPI)

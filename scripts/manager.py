@@ -120,6 +120,7 @@ class Manager:
         self.state.mkdir(parents=True, exist_ok=True)
         self.status_file = self.state / 'status.json'
         self.latest = None
+        self.checked_at = 0.0
         self.guard = threading.Lock()
 
     def command(self, args, cwd=None, env=None, timeout=1800):
@@ -143,12 +144,21 @@ class Manager:
         previous.update(fields, phase=phase, updated_at=int(time.time()))
         write_json(self.status_file, previous)
 
+    def failure_message(self, error):
+        with contextlib.suppress(OSError):
+            with (self.state/'operations.log').open('a') as log:
+                log.write(type(error).__name__+': '+str(error)+'\n')
+        return 'Upgrade could not finish; inspect the host upgrade log for details'
+
     def check(self):
+        if self.latest is not None and time.monotonic() - self.checked_at < 60:
+            return self.status()
         release = release_info()
         current = self.status()['installed_version']
         self.latest = {'tag': release['tag_name'], 'version': release['tag_name'].lstrip('v'),
                        'url': release['html_url'], 'published_at': release['published_at'],
                        'available': current is None or version_tuple(release['tag_name']) > version_tuple(current.split('-')[0])}
+        self.checked_at = time.monotonic()
         return self.status()
 
     def validate_root(self):
@@ -183,7 +193,7 @@ class Manager:
                           '/bin/systemctl','try-restart','emby-cloud-updater.service'],timeout=30)
         except Exception as exc:
             phase=read_json(self.status_file,{}).get('phase')
-            self.progress(phase if phase in {'rolled_back','recovery_required'} else 'failed', error=str(exc))
+            self.progress(phase if phase in {'rolled_back','recovery_required'} else 'failed', error=self.failure_message(exc))
 
     def install(self, tag=None):
         self.validate_root()
@@ -344,6 +354,8 @@ class Manager:
         socketdir.chmod(0o750)
         for name in ['emby-cloud-updater.service','emby-cloud-backup.service','emby-cloud-backup.timer']:
             shutil.copy2(self.root/'deploy'/name, Path('/etc/systemd/system')/name)
+        shutil.copy2(self.root/'deploy/emby-cloud-tmpfiles.conf', '/etc/tmpfiles.d/emby-cloud.conf')
+        self.command(['systemd-tmpfiles','--create','/etc/tmpfiles.d/emby-cloud.conf'])
         self.command(['systemctl','daemon-reload'])
         self.command(['systemctl','enable','--now','emby-cloud-updater.service','emby-cloud-backup.timer'])
 
@@ -376,6 +388,7 @@ class Manager:
                 self.command(self.dc('--profile','cloud','--profile','source','down','--remove-orphans'))
             for name in ['emby-cloud-updater.service','emby-cloud-backup.service','emby-cloud-backup.timer']:
                 (Path('/etc/systemd/system')/name).unlink(missing_ok=True)
+            Path('/etc/tmpfiles.d/emby-cloud.conf').unlink(missing_ok=True)
             self.command(['systemctl','daemon-reload'])
             helper=Path('/usr/local/lib/emby-cloud/manager.py')
             helper.unlink(missing_ok=True)
@@ -463,7 +476,7 @@ def main():
             manager.install(args.version)
         except Exception as error:
             if read_json(manager.status_file,{}).get('phase') not in {'rolled_back','recovery_required'}:
-                manager.progress('failed',error=str(error))
+                manager.progress('failed',error=manager.failure_message(error))
             raise
         print('Ready: forward SSH ports 13000 / 13001 / 18096 to localhost. Complete Owner setup and MFA in the panel.')
         manager.command(['systemctl','try-restart','emby-cloud-updater.service'],timeout=60)

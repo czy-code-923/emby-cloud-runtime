@@ -11,6 +11,7 @@ Restart=on-failure
 RestartSec=5
 RuntimeDirectory=emby-cloud-updater
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

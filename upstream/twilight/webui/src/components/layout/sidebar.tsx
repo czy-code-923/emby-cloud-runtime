@@ -94,7 +94,7 @@ export const adminNavItems: SidebarNavItem[] = [
   { href: "/admin/violations", labelKey: "navigation.violations", icon: ShieldAlert, category: "security" },
 
   { href: "/admin/config", labelKey: "navigation.configAdmin", icon: FileCode, category: "system" },
-  { href: "/admin/updates", label: "版本与升级", icon: Download, category: "system" },
+  { href: "/admin/updates", labelKey: "deploymentUpdate.title", icon: Download, category: "system" },
   { href: "/admin/database", labelKey: "navigation.databaseBackup", icon: Database, category: "system" },
   { href: "/admin/scheduler", labelKey: "navigation.scheduler", icon: TimerReset, category: "system" },
   { href: "/admin/logs", labelKey: "navigation.runtimeLogs", icon: ScrollText, category: "system" },

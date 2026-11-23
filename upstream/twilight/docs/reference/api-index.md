@@ -1,5 +1,9 @@
 # API 路由索引
 
+## Emby Cloud 发行版新增版本接口
+
+详见 [正式版本升级](../features/deployment-updates.md)：`GET /api/v2/admin/deployment/status`、`POST /api/v2/admin/deployment/check`、`POST /api/v2/admin/deployment/apply`，均需管理员鉴权；应用版本另需当前密码复核、显式WebUI意图与审计。
+
 本文是 Twilight 后端接口的速查索引，覆盖 `/api/v1` 与 `/api/v2` 两套路由，用于快速核对每条路由的请求方法、路径、鉴权级别和所属模块。本文严格依据 `internal/api/routes.go`（v1）与 `internal/api/routes_v2.go`（v2）中 `a.add(method, path, authLevel, handler)` 的真实注册逐条整理；详细的请求/响应示例见 [后端 API 详参](../reference/backend-api.md)，外部 API Key 接入说明见 [API Key 外部接入](../reference/api-key.md)。
 
 > 前端默认 API 版本是 **v2**（`webui/src/lib/api-request.ts` 的 `DEFAULT_API_VERSION`，仅在 `NEXT_PUBLIC_USE_V1_COMPAT=true` 时回退 v1）。新增接口请优先注册 v2 并在本文登记——`scripts/check_docs_drift.go` 会同时校验两套路由表，未在 `docs/*.md` 出现过的端点会让 CI 失败。

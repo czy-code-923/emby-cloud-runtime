@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from unittest.mock import patch
@@ -57,6 +58,14 @@ with patch.object(m,'release_info',side_effect=lambda *_args:dict(release)),patc
     assert api('/api/v2/auth/me')['data']['username']=='ci-owner'
     # Check the actual container-to-host Unix socket route.
     assert api('/api/v2/admin/deployment/status')['data']['installed_version']==base
+    manager.command(['systemctl','try-restart','emby-cloud-updater.service'])
+    for attempt in range(20):
+        try:
+            assert api('/api/v2/admin/deployment/status')['data']['installed_version']==base
+            break
+        except (urllib.error.URLError,AssertionError):
+            if attempt==19:raise
+            time.sleep(1)
     env_before=(m.ROOT/'.env').read_bytes()
     sentinel=m.ROOT/'runtime/media/movies/ci-preserve.txt';sentinel.write_text('keep media and configuration')
     # Exercise adoption of an early alpha deployment, including its older lock behavior.

@@ -1,6 +1,6 @@
 # Emby Cloud Runtime
 
-**v0.2.1：全量源码、正式安装包、一键安装/卸载和面板升级。**
+**v0.2.2：全量源码、正式安装包、一键安装/卸载和面板升级。**
 
 当前程序提供独立管理后台、Emby、OpenStrm、PostgreSQL、入口隔离、加密备份和发布升级。依据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 持续开发；该方案中的定制保号、交易和24模块总控尚未全部实现，准确范围见 [差距清单](docs/gaps.md)。
 

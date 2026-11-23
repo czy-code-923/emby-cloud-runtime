@@ -3533,5 +3533,41 @@
     "adminReady": "双重验证加密密钥已配置，可开放新启用。",
     "adminNotReady": "双重验证加密密钥未就绪：请在服务器配置文件设置 Security.two_factor_key，或设置 TWILIGHT_TWO_FACTOR_KEY 环境变量并重启 API，再开放新启用。",
     "adminUnknown": "暂时无法确认双重验证配置状态，请刷新页面重试。"
+  },
+  "deploymentUpdate": {
+    "title": "版本与升级",
+    "description": "检查正式发布的最新版本，保留现有账号、配置与媒体数据。",
+    "current": "当前版本",
+    "latest": "最新正式版本",
+    "loading": "读取中",
+    "unchecked": "尚未检查",
+    "check": "检查最新版本",
+    "apply": "一键拉取并升级",
+    "upToDate": "当前已是最新正式版本",
+    "source": "程序源",
+    "status": "升级状态",
+    "target": "目标版本",
+    "confirmTitle": "升级到 {version}",
+    "confirmHint": "升级前自动创建加密备份，期间会短暂停止播放与管理服务。失败时恢复上一版本程序与镜像，保留当前数据库。",
+    "password": "管理员当前密码",
+    "confirm": "确认升级",
+    "cancel": "取消",
+    "unavailable": "暂时无法连接升级执行器",
+    "reconnecting": "升级期间服务正在重启，页面会自动重新连接",
+    "failed": "操作失败，请稍后重试",
+    "phase": {
+      "idle": "尚未执行升级",
+      "queued": "升级已排队",
+      "download": "正在下载并校验发布包",
+      "backup": "正在备份并验证数据库",
+      "applying": "正在应用程序与镜像",
+      "checking": "正在检查服务健康",
+      "succeeded": "升级完成",
+      "failed": "升级失败",
+      "rollback": "正在恢复上一版本程序",
+      "rolled_back": "已恢复上一版本程序",
+      "recovery_required": "需要人工检查恢复",
+      "interrupted": "上次升级被中断"
+    }
   }
 }

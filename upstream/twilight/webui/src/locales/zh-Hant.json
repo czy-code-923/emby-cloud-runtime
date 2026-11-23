@@ -3549,5 +3549,41 @@
     "adminReady": "雙重驗證加密密鑰已設定，可開放新啟用。",
     "adminNotReady": "雙重驗證加密金鑰尚未就緒：請在伺服器設定檔設定 Security.two_factor_key，或設定 TWILIGHT_TWO_FACTOR_KEY 環境變數並重啟 API，再開放新啟用。",
     "adminUnknown": "暫時無法確認雙重驗證設定狀態，請重新整理頁面重試。"
+  },
+  "deploymentUpdate": {
+    "title": "版本與升級",
+    "description": "檢查正式發布的最新版本，保留現有帳號、設定與媒體資料。",
+    "current": "目前版本",
+    "latest": "最新正式版本",
+    "loading": "讀取中",
+    "unchecked": "尚未檢查",
+    "check": "檢查最新版本",
+    "apply": "一鍵下載並升級",
+    "upToDate": "目前已是最新正式版本",
+    "source": "程式來源",
+    "status": "升級狀態",
+    "target": "目標版本",
+    "confirmTitle": "升級至 {version}",
+    "confirmHint": "升級前自動建立加密備份，期間會短暫停止播放與管理服務。檢查失敗時恢復上一版本程式與映像，保留目前資料庫。",
+    "password": "管理員目前密碼",
+    "confirm": "確認升級",
+    "cancel": "取消",
+    "unavailable": "暫時無法連接升級服務",
+    "reconnecting": "升級期間服務正在重新啟動，頁面會自動重新連線。",
+    "failed": "操作失敗，請稍後重試",
+    "phase": {
+      "idle": "尚未執行升級",
+      "queued": "升級已排隊",
+      "download": "正在下載並驗證發布套件",
+      "backup": "正在備份並驗證資料庫",
+      "applying": "正在套用程式與映像",
+      "checking": "正在檢查服務狀態",
+      "succeeded": "升級完成",
+      "failed": "升級失敗",
+      "rollback": "正在恢復上一版本程式",
+      "rolled_back": "已恢復上一版本程式",
+      "recovery_required": "需要人工檢查恢復",
+      "interrupted": "上次升級已中斷"
+    }
   }
 }

@@ -3884,6 +3884,25 @@ class ApiClient {
 
     return { success: false, message: response.message, error_code: response.error_code } as ApiResponse<{ old_name: string; new_name: string; types: string[] }>;
   }
+
+  async deploymentStatus(signal?: AbortSignal) {
+    return this.request<DeploymentUpdateState>("/admin/deployment/status", { signal, cache: "no-store" }, { apiVersion: "v2", cacheRead: false, dedupe: false });
+  }
+
+  async deploymentCheck(signal?: AbortSignal) {
+    return this.request<DeploymentUpdateState>("/admin/deployment/check", { method: "POST", signal, cache: "no-store", headers: { "X-Twilight-Client": "webui", "X-Twilight-Intent": "deploy-release" }, body: "{}" }, { apiVersion: "v2", cacheRead: false, dedupe: false });
+  }
+
+  async deploymentApply(tag: string, expected_version: string, password: string, signal?: AbortSignal) {
+    return this.request<DeploymentUpdateState>("/admin/deployment/apply", { method: "POST", signal, cache: "no-store", headers: { "X-Twilight-Client": "webui", "X-Twilight-Intent": "deploy-release" }, body: JSON.stringify({ tag, expected_version, password }) }, { apiVersion: "v2", cacheRead: false, dedupe: false });
+  }
+}
+
+export interface DeploymentUpdateState {
+  installed_version: string | null;
+  source_repo: string;
+  latest?: { tag: string; version: string; available: boolean; url: string } | null;
+  job: { phase: string; target?: string; message?: string; error?: string; updated_at?: number };
 }
 
 export const api = new ApiClient();

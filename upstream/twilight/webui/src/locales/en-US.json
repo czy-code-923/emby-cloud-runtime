@@ -3549,5 +3549,41 @@
     "adminReady": "The two-factor encryption key is configured. Enrollment can be opened.",
     "adminNotReady": "Two-factor encryption is not ready. Set Security.two_factor_key in the server configuration, or set TWILIGHT_TWO_FACTOR_KEY in the environment and restart the API before opening enrollment.",
     "adminUnknown": "Two-factor readiness could not be confirmed. Refresh this page to retry."
+  },
+  "deploymentUpdate": {
+    "title": "Versions and upgrades",
+    "description": "Check published stable releases while preserving accounts, configuration and media data.",
+    "current": "Installed version",
+    "latest": "Latest stable release",
+    "loading": "Loading",
+    "unchecked": "Not checked",
+    "check": "Check for updates",
+    "apply": "Download and upgrade",
+    "upToDate": "The latest stable version is installed",
+    "source": "Source repository",
+    "status": "Upgrade status",
+    "target": "Target version",
+    "confirmTitle": "Upgrade to {version}",
+    "confirmHint": "An encrypted backup is created first. Playback and administration pause briefly. If checks fail, the previous program and images are restored while the current database is preserved.",
+    "password": "Current administrator password",
+    "confirm": "Confirm upgrade",
+    "cancel": "Cancel",
+    "unavailable": "The update service is temporarily unavailable",
+    "reconnecting": "Services are restarting during the upgrade. This page will reconnect automatically.",
+    "failed": "The operation failed. Please try again.",
+    "phase": {
+      "idle": "No upgrade has run",
+      "queued": "Upgrade queued",
+      "download": "Downloading and verifying release assets",
+      "backup": "Backing up and verifying the database",
+      "applying": "Applying program and images",
+      "checking": "Checking service health",
+      "succeeded": "Upgrade completed",
+      "failed": "Upgrade failed",
+      "rollback": "Restoring the previous program",
+      "rolled_back": "Previous program restored",
+      "recovery_required": "Manual recovery check required",
+      "interrupted": "The previous upgrade was interrupted"
+    }
   }
 }
