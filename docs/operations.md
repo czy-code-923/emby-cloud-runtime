@@ -40,3 +40,8 @@ cd /srv/emby-cloud
 cp deploy/emby-cloud-tmpfiles.conf /etc/tmpfiles.d/emby-cloud.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/emby-cloud.conf
 ```
+
+
+# 站点、卡码与Telegram入口
+
+系统运维→站点与入口可记录网站HTTPS域名及Emby播放地址。仅记录地址，不会自动发布DNS/证书/反代；继续保留SSH救援通道，按页面步骤同步白名单和Cookie后验证。服务Bot在Telegram管理配置，人的TG身份在个人设置绑定，指令管理复用同一Bot；OpenStrm不要开启同Token轮询。卡码管理负责发卡与审查邀请码记录，个人邀请中心负责本人名下邀请，邀请系统管理负责全站历史关系维护。完整审核见panel-audit-2026-11-24.md。
