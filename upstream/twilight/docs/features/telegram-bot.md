@@ -690,3 +690,8 @@ Web 解绑、管理员解绑和删除账号会同时撤销该用户的短期 Tel
 ```
 
 匹配到多个用户时，Bot 返回候选按钮。每次点击候选或面板操作都会重新验证操作者的管理员身份，并校验候选 UID 仍属于当前搜索面板；候选过期、账号删除或权限撤销后不会继续执行操作。回复群成员消息时仍可省略关键词，Bot 会按回复消息中的 Telegram ID 查找绑定账号。
+
+
+## Runtime v0.3.0配置入口
+
+服务Bot收件开关为`Global.telegram_mode`，强制身份绑定为`Global.force_bind_telegram`，Token为`Telegram.bot_token`。基础页面和高级schema共用一份配置；个人设置只绑定人的身份，指令页管理同一Bot的指令。OpenStrm不同时轮询该Token。测试按钮会发送消息，应由管理员明确点击。

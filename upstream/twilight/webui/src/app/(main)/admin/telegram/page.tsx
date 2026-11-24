@@ -41,32 +41,12 @@ type BotRuntime = {
 };
 
 const TELEGRAM_BASE_FIELDS = [
-  "enable_telegram",
-  "force_bind_telegram",
-  "telegram_bot_token",
-  "telegram_api_url",
-  "admin_id",
-  "group_id",
-  "channel_id",
-  "telegram_force_subscribe",
-  "telegram_force_bind_group",
-  "telegram_force_bind_channel",
-  "telegram_require_membership",
-  "telegram_group_check_concurrency",
-  "telegram_group_action_concurrency",
-  "telegram_ban_on_leave",
-  "telegram_auto_enable_rejoined",
-  "telegram_enable_panel",
-  "bot_start_text",
-  "bot_group_start_text",
-  "bot_start_title",
-  "bot_start_intro",
-  "bot_bind_prompt_text",
-  "bot_help_text",
-  "bot_admin_help_text",
-  "bot_help_header",
-  "bot_help_footer",
-  "bot_about",
+  "bot_token", "telegram_api_url", "login_enabled", "admin_id", "group_id", "channel_id",
+  "force_subscribe", "force_bind_group", "force_bind_channel", "require_group_membership",
+  "group_check_concurrency", "group_action_concurrency", "membership_breaker_percent", "membership_breaker_max",
+  "ban_on_leave", "auto_enable_rejoined", "enable_tg_panel", "parse_mode",
+  "bot_start_text", "bot_group_start_text", "bot_start_title", "bot_start_intro", "bot_bind_prompt_text",
+  "bot_help_text", "bot_admin_help_text", "bot_help_header", "bot_help_footer", "bot_about",
 ] as const;
 
 export default function AdminTelegramPage() {
@@ -248,8 +228,8 @@ export default function AdminTelegramPage() {
       </Card>
 
       <AdminConfigSections
-        sectionKeys={["Telegram"]}
-        sectionFieldKeys={{ Telegram: [...TELEGRAM_BASE_FIELDS] }}
+        sectionKeys={["Global", "Telegram"]}
+        sectionFieldKeys={{ Global: ["telegram_mode", "force_bind_telegram"], Telegram: [...TELEGRAM_BASE_FIELDS] }}
         title={t("adminTelegram.configTitle")}
         description={t("adminTelegram.configDescription")}
         notice={t("adminTelegram.configNotice")}
