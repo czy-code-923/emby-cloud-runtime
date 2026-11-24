@@ -91,6 +91,7 @@ const DefaultLoginNotifyEmailBodyTemplate = `你的账号 {username} 于 {time} 
 
 type Config struct {
 	AppName                       string
+	PublicBaseURL                 string
 	Version                       string
 	Host                          string
 	Port                          int
@@ -409,6 +410,7 @@ func loadConfig(path string, overrides bool) (Config, error) {
 
 	}
 	cfg.AppName = reader.stringValue(cfg.AppName, "Global.server_name", "server_name")
+	cfg.PublicBaseURL = reader.stringValue(cfg.PublicBaseURL, "Global.public_base_url")
 	cfg.ServerIcon = reader.stringValue(cfg.ServerIcon, "Global.server_icon", "server_icon")
 	cfg.RedisURL = reader.stringValue(cfg.RedisURL, "Global.redis_url", "redis_url")
 	cfg.LogLevel = normalizeLogLevel(reader.stringValue(cfg.LogLevel, "Global.log_level", "log_level"))
@@ -674,6 +676,11 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	if cfg.UploadDir == "" {
 		cfg.UploadDir = "uploads"
 	}
+	publicURL, err := NormalizePublicBaseURL(cfg.PublicBaseURL)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PublicBaseURL = publicURL
 	return cfg, nil
 }
 

@@ -1040,6 +1040,7 @@ func configSectionDefs() []configSectionDef {
 	selectRegcodeDecoyAction := regcodeDecoyActionOptions()
 	return []configSectionDef{
 		{Key: "Global", Title: "全局", Description: "基础运行参数", Category: "runtime", Collapsed: true, Fields: []configFieldDef{
+			{Key: "public_base_url", Label: "网站公开域名", Type: "string", Description: "可选，填写 https://admin.example.com；仅保存网站入口，不自动修改DNS、证书、端口或可信代理。仅通过SSH/VPN管理时可留空。"},
 			{Key: "server_name", Label: "服务器名称", Type: "string", Description: "前端展示的站点或服务器名称"},
 			{Key: "server_icon", Label: "服务器图标", Type: "string", Description: "HTTPS 图片 URL 或本地图片路径；留空使用内置图标"},
 			{Key: "auth_background_url", Label: "认证页背景图", Type: "string", Description: "内置路径 /system/auth-background；由上传接口自动写入，留空使用默认渐变背景"},
@@ -1048,7 +1049,7 @@ func configSectionDefs() []configSectionDef {
 			{Key: "runtime_log_limit", Label: "实时日志保留行数", Type: "int", Description: "后台实时日志缓冲区行数，热重载生效"},
 			{Key: "runtime_memory_limit_mb", Label: "运行时内存目标", Type: "int", Description: "Go 运行时内存软上限，单位 MiB；0 表示不限制，热重载生效"},
 			{Key: "redis_url", Label: "Redis URL", Type: "secret", Description: "会话和限流 Redis，留空使用进程内存"},
-			{Key: "telegram_mode", Label: "启用 Telegram", Type: "bool", Description: "启用 Bot 和 Telegram 绑定能力"},
+			{Key: "telegram_mode", Label: "启动 Telegram Bot 收件", Type: "bool", Description: "控制唯一Bot轮询进程；账号绑定还需已配置Token，扫码登录和强制绑定由独立开关控制"},
 			{Key: "force_bind_telegram", Label: "强制绑定 Telegram", Type: "bool", Description: "登录或注册流程要求绑定 Telegram"},
 			{Key: "tmdb_api_key", Label: "TMDB API Key", Type: "secret", Description: "媒体搜索使用的 TMDB Key"},
 			{Key: "tmdb_api_url", Label: "TMDB API URL", Type: "string", Description: "TMDB API 基础地址"},
@@ -1306,7 +1307,7 @@ func configSectionDefs() []configSectionDef {
 func configValues(cfg config.Config) map[string]map[string]any {
 	return map[string]map[string]any{
 		"Global": {
-			"server_name": cfg.AppName, "server_icon": cfg.ServerIcon, "auth_background_url": cfg.AuthBackgroundURL, "databases_dir": cfg.DatabaseDir, "redis_url": cfg.RedisURL, "telegram_mode": cfg.TelegramMode, "force_bind_telegram": cfg.ForceBindTelegram,
+			"server_name": cfg.AppName, "public_base_url": cfg.PublicBaseURL, "server_icon": cfg.ServerIcon, "auth_background_url": cfg.AuthBackgroundURL, "databases_dir": cfg.DatabaseDir, "redis_url": cfg.RedisURL, "telegram_mode": cfg.TelegramMode, "force_bind_telegram": cfg.ForceBindTelegram,
 			"log_level": cfg.LogLevel, "runtime_log_limit": cfg.RuntimeLogLimit, "runtime_memory_limit_mb": cfg.RuntimeMemoryLimitMB,
 			"tmdb_api_key": cfg.TMDBAPIKey, "tmdb_api_url": cfg.TMDBAPIURL, "tmdb_image_url": cfg.TMDBImageURL, "bangumi_token": cfg.BangumiToken, "bangumi_api_url": cfg.BangumiAPIURL,
 			"bangumi_app_id": cfg.BangumiAppID,

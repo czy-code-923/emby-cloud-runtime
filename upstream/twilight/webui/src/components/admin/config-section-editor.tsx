@@ -269,6 +269,7 @@ export function AdminConfigSections({
   const load = useCallback(async (signal?: AbortSignal) => {
     const res = await api.getConfigSchema(signal);
     if (!res.success || !res.data) throw new Error(res.message || t("adminConfig.sectionEditor.loadFailed"));
+    if (signal?.aborted) return false;
     const nextValues: Record<string, Record<string, unknown>> = {};
     for (const section of res.data.sections) {
       if (!stableSectionKeys.includes(section.key)) continue;

@@ -394,3 +394,8 @@ API 的手动触发和自动到期检查统一写入 `twilight_job_runs`；只�
 ## 双重验证
 
 验证器 App、一次性备用码、后台开关、密钥部署、API 契约与恢复操作见 [双重验证（2FA）](../features/two-factor.md)。密码与 Telegram 扫码登录均接入第二步；旧客户端收到 `two_factor_required` 时不能把它当成登录成功。
+
+
+## Runtime网站域名记录
+
+`Global.public_base_url`为可选HTTPS域名Origin，经后端校验并通过`/api/v2/system/info.public_base_url`提供公开入口元数据。独立页面`/admin/entries`复用现有schema保存、版本冲突和审计机制。保存不修改DNS、证书、监听端口、CORS或可信代理；SSH/VPN管理可留空。

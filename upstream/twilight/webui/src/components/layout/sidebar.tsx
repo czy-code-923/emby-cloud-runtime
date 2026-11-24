@@ -93,6 +93,7 @@ export const adminNavItems: SidebarNavItem[] = [
   { href: "/admin/audit-logs", labelKey: "navigation.auditLogs", icon: ClipboardList, category: "security" },
   { href: "/admin/violations", labelKey: "navigation.violations", icon: ShieldAlert, category: "security" },
 
+  { href: "/admin/entries", labelKey: "entrySettings.title", icon: Network, category: "system" },
   { href: "/admin/config", labelKey: "navigation.configAdmin", icon: FileCode, category: "system" },
   { href: "/admin/updates", labelKey: "deploymentUpdate.title", icon: Download, category: "system" },
   { href: "/admin/database", labelKey: "navigation.databaseBackup", icon: Database, category: "system" },

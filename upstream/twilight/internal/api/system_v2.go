@@ -47,6 +47,7 @@ func (a *App) handleV2SystemInfo(w http.ResponseWriter, _ *http.Request, _ Param
 	}
 	ok(w, "OK", map[string]any{
 		"name":                cfg.AppName,
+		"public_base_url":     cfg.PublicBaseURL,
 		"icon":                a.publicServerIconURL(),
 		"auth_background_url": publicAuthBackgroundURL(cfg.AuthBackgroundURL),
 		"version":             cfg.Version,

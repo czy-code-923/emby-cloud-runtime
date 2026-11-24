@@ -48,7 +48,11 @@ func fillDistinctConfigValues(cfg *config.Config) {
 		seed := "twilight-coverage-" + strings.ToLower(field.Name)
 		switch target.Kind() {
 		case reflect.String:
-			target.SetString(seed)
+			if field.Name == "PublicBaseURL" {
+				target.SetString("https://admin.example.com")
+			} else {
+				target.SetString(seed)
+			}
 		case reflect.Bool:
 			target.SetBool(true)
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
