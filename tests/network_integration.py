@@ -32,10 +32,10 @@ with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
     command('openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1',
             '-subj','/CN=Disposable CI Root','-keyout',str(root/'ca.key'),'-out',str(root/'ca.pem'),
-            '-addext','basicConstraints=critical,CA:TRUE')
+            '-addext','basicConstraints=critical,CA:TRUE','-addext','keyUsage=critical,keyCertSign,cRLSign')
     command('openssl','req','-newkey','rsa:2048','-nodes','-subj','/CN=jw.example.test',
             '-keyout',str(root/'key.pem'),'-out',str(root/'request.pem'))
-    (root/'extensions').write_text('subjectAltName=DNS:jw.example.test,DNS:shop.example.test\nextendedKeyUsage=serverAuth\n')
+    (root/'extensions').write_text('subjectAltName=DNS:jw.example.test,DNS:shop.example.test\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n')
     command('openssl','x509','-req','-in',str(root/'request.pem'),'-CA',str(root/'ca.pem'),
             '-CAkey',str(root/'ca.key'),'-CAcreateserial','-days','1','-out',str(root/'cert.pem'),
             '-extfile',str(root/'extensions'))

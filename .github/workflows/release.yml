@@ -63,6 +63,7 @@ jobs:
           python3 scripts/check-frontend-v2-coverage.py
           go test -p 1 ./internal/config ./internal/security ./internal/store ./internal/api -run 'Test.*(Setup|Login|Session|Config|TwoFactor|Register|Password|DeploymentUpdate|Invite|RegCode|Regcode|PublicBaseURL|Jianwei|MiniApp)' -count=1 -timeout=25m
   images:
+    needs: [verify]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
