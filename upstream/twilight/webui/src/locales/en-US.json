@@ -356,7 +356,7 @@
     "settings": "Settings",
     "users": "Users",
     "adminAnnouncements": "Announcements",
-    "regcodes": "Registration Codes",
+    "regcodes": "Cards and codes",
     "inviteForest": "Invite System Admin",
     "requestReview": "Request Review",
     "violations": "Violation Audit",
@@ -897,7 +897,7 @@
     "systemNotOpen": "Invite system is not open",
     "systemNotOpenDescription": "New invite codes cannot be created. If you have direct children, refresh to keep creating dedicated renewal codes for them.",
     "title": "Invite Center",
-    "description": "Create invite codes for new users to register Emby. Once they register, they join your invite tree.",
+    "description": "Your invitation quota, codes and direct invitees. Global code issuance and relationship maintenance are administrator functions.",
     "generateInvite": "Create invite code",
     "closedBanner": "The invite system is closed. New invite codes cannot be created.",
     "closedBannerDescription": "You can still create dedicated renewal codes for direct children. Children whose Emby has expired, or whose Web account is disabled but still has Emby bound, can have Emby deleted and be detached.",
@@ -966,7 +966,7 @@
   },
   "adminInvite": {
     "title": "Invite System Admin",
-    "description": "Manage invite relationships, root-user filters, direct/total child counts, and scoped cascade actions. Enable, disable, and delete actions confirm the affected scope first.",
+    "description": "Maintain global invite relationships. New invitations and registration cards are issued in Invite Center and Cards respectively; detaching a relation does not issue entitlement.",
     "configTitle": "Invite system configuration",
     "configDescription": "Maintain invite settings directly in config.toml without creating a duplicate configuration source.",
     "configNotice": "The folded registration/invite entry in Configuration is kept for compatibility; use Invite System Admin for invite settings.",
@@ -2207,7 +2207,7 @@
   "adminTelegram": {
     "title": "Telegram Admin",
     "description": "Maintain the bot, group/channel checks, panel text, and rebind review entry in one place.",
-    "testBot": "Test bot",
+    "testBot": "Test and send a message",
     "testSuccess": "Telegram test completed",
     "testFailed": "Telegram test failed",
     "botTestTitle": "Bot connectivity and delivery test",
@@ -2236,7 +2236,7 @@
     "rosterDescription": "View group audits, rejoin recovery, and unbound-user kick jobs.",
     "openCommandManager": "Manage bot commands",
     "configTitle": "Telegram configuration",
-    "configDescription": "Edit the [Telegram] section in config.toml directly without creating a second configuration source.",
+    "configDescription": "One shared Bot configuration. Personal Settings binds a user identity; this page configures the service Bot; Commands manages replies. The advanced configuration page edits the same values.",
     "configNotice": "The legacy folded Telegram entry remains in Configuration for compatibility; maintain it here going forward."
   },
   "adminTelegramCommands": {
@@ -2705,8 +2705,8 @@
   },
   "adminRegcodes": {
     "perPage": "Per Page",
-    "pageTitle": "Card Code Management",
-    "pageSubtitle": "Manage registration, renewal, whitelist and invite codes",
+    "pageTitle": "Cards and codes",
+    "pageSubtitle": "Issue registration, renewal and whitelist cards; review invite-code records. Personal invitations belong to Invite Center, and global relationships to Invite Management.",
     "tabRegcodes": "Reg Codes",
     "tabInviteCodes": "Invite Codes",
     "generateCard": "Generate Codes",
@@ -3585,5 +3585,17 @@
       "recovery_required": "Manual recovery check required",
       "interrupted": "The previous upgrade was interrupted"
     }
+  },
+  "entrySettings": {
+    "title": "Site and entry points",
+    "description": "The panel works through SSH/VPN without a public domain. Configure a domain only when publishing a website.",
+    "manualTitle": "Manual domain setup",
+    "manualSteps": "1. Point DNS to the intended proxy. 2. Configure HTTPS and proxy to the loopback panel. 3. Match the gateway Origin/Host allowlist, trusted proxy and secure-cookie settings. 4. Verify real access before distributing the address.",
+    "isolation": "Website and Emby playback addresses serve different purposes. Keep admin access private where possible. One Bot token has one receiver; OpenStrm polling stays off.",
+    "siteTitle": "Website domain",
+    "siteDescription": "Optional HTTPS domain origin, without paths or credentials. Leave empty for SSH/VPN-only access.",
+    "savedOnly": "Saving records the address only. It does not publish DNS, obtain a certificate, open ports or verify reachability.",
+    "playTitle": "Emby playback addresses",
+    "playDescription": "These addresses appear in client connection lines. Keep the internal Emby API URL unchanged."
   }
 }

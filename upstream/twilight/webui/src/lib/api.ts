@@ -3289,6 +3289,10 @@ class ApiClient {
   }
 
   // ==================== 邀请树 ====================
+  async getInviteSummary(signal?: AbortSignal) {
+    return this.request<{ config: InviteConfig; invite: InviteMyStatus }>("/invite/summary", { cache: "no-store", signal }, { cacheRead: false, dedupe: false, apiVersion: "v2" });
+  }
+
   async getInviteConfig() {
     return this.request<InviteConfig>("/invite/config", { cache: "no-store" }, { cacheRead: false, dedupe: false });
   }
@@ -3358,9 +3362,14 @@ class ApiClient {
   }
 
   // 管理员：邀请森林
-  async adminGetInviteTree(signal?: AbortSignal) {
+  async adminGetInviteTree(signal?: AbortSignal, params: { page?: number; search?: string; root?: number | "all"; collapsed?: number[]; selected?: number | null } = {}) {
+    const query = new URLSearchParams({ page: String(params.page || 1), per_page: "100" });
+    if (params.search) query.set("search", params.search);
+    if (params.root && params.root !== "all") query.set("root", String(params.root));
+    if (params.collapsed?.length) query.set("collapsed", params.collapsed.slice(0, 200).join(","));
+    if (params.selected) query.set("selected", String(params.selected));
     const res = await this.request<{ item?: InviteForest } & InviteForest>(
-      "/admin/invite/tree", { cache: "no-store", signal }, { cacheRead: false, dedupe: false });
+      `/admin/invite/tree?${query}`, { cache: "no-store", signal }, { cacheRead: false, dedupe: false, apiVersion: "v2" });
     // V2 把单个资源收在 item 里，页面直接消费森林对象。
     if (res.success && res.data?.item) {
       return { success: true, message: res.message, data: res.data.item } as ApiResponse<InviteForest>;

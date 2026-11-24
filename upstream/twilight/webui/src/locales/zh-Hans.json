@@ -74,7 +74,7 @@
     "settings": "个人设置",
     "users": "用户管理",
     "adminAnnouncements": "公告管理",
-    "regcodes": "注册码",
+    "regcodes": "卡码管理",
     "inviteForest": "邀请系统管理",
     "requestReview": "求片审核",
     "violations": "违规审计",
@@ -567,5 +567,31 @@
       "recovery_required": "需要人工检查恢复",
       "interrupted": "上次升级被中断"
     }
+  },
+  "entrySettings": {
+    "title": "站点与入口",
+    "description": "通过 SSH/VPN 管理无需公开域名；需要对外提供网站时，再手动配置域名和入口。",
+    "manualTitle": "手动配置域名",
+    "manualSteps": "① 将域名 DNS 指向计划使用的反向代理；② 配置 HTTPS 证书并反代到本机面板；③ 同步入口 Origin/Host 白名单、可信代理和安全 Cookie 设置；④ 验证实际访问成功后再分发地址。",
+    "isolation": "网站入口与 Emby 播放线路用途不同。管理入口优先保留 SSH/VPN 隔离。同一个 Bot Token 只交给一个收件进程，OpenStrm 的 Bot 轮询保持关闭。",
+    "siteTitle": "网站域名",
+    "siteDescription": "可选，仅填 HTTPS 域名地址，不含路径或账号密码。仅通过 SSH/VPN 访问时留空。",
+    "savedOnly": "保存仅记录地址，不会修改 DNS、申请证书、开放端口或证明域名已经可用。",
+    "playTitle": "Emby 播放地址",
+    "playDescription": "这里配置客户端看到的播放线路；后端内部访问 Emby 的 API 地址仍在 Emby 管理中配置。"
+  },
+  "adminRegcodes": {
+    "pageTitle": "卡码管理",
+    "pageSubtitle": "发放注册、续期和白名单卡，审查邀请码记录。个人邀请与额度在邀请中心，全站关系维护在邀请系统管理。"
+  },
+  "invite": {
+    "description": "管理本人邀请额度、邀请码与直属受邀用户；全站发卡和关系维护由管理员分别处理。"
+  },
+  "adminInvite": {
+    "description": "维护全站邀请关系。新邀请在邀请中心发放，注册与续期卡在卡码管理发放；断开关系本身不会发放权益。"
+  },
+  "adminTelegram": {
+    "configDescription": "全站共用一个 Bot 配置。个人设置绑定用户身份，本页配置服务机器人，指令管理维护回复；高级配置编辑的是同一份数据。",
+    "testBot": "测试并发送消息"
   }
 }

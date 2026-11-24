@@ -356,7 +356,7 @@
     "settings": "個人設定",
     "users": "使用者管理",
     "adminAnnouncements": "公告管理",
-    "regcodes": "註冊碼",
+    "regcodes": "卡碼管理",
     "inviteForest": "邀請系統管理",
     "requestReview": "求片審核",
     "violations": "違規審計",
@@ -897,7 +897,7 @@
     "systemNotOpen": "邀請系統未開啟",
     "systemNotOpenDescription": "不能生成新的邀請碼；如果你已有直屬下級，可重新整理後繼續為下級生成專屬續期碼。",
     "title": "邀請中心",
-    "description": "生成邀請碼邀請新使用者註冊 Emby；下級註冊成功後會與你建立樹狀關係。",
+    "description": "管理本人邀请额度、邀请码与直属受邀用户；全站发卡和关系维护由管理员分别处理。",
     "generateInvite": "生成邀請碼",
     "closedBanner": "邀請系統已關閉，不能生成新的邀請碼。",
     "closedBannerDescription": "已有直屬下級仍可生成專屬續期碼；Emby 已到期或 Web 已禁用且仍綁定 Emby 的下級，可刪除 Emby 並斷開關係。",
@@ -966,7 +966,7 @@
   },
   "adminInvite": {
     "title": "邀請系統管理",
-    "description": "集中管理邀請關係、根使用者篩選、直屬/總下級統計和級聯操作；停用、啟用或刪除前會確認影響範圍。",
+    "description": "维护全站邀请关系。新邀请在邀请中心发放，注册与续期卡在卡码管理发放；断开关系本身不会发放权益。",
     "configTitle": "邀請系統配置",
     "configDescription": "直接維護 config.toml 中的邀請配置，避免產生重複配置來源。",
     "configNotice": "配置管理中的註冊/邀請入口僅作相容保留；建議在邀請系統管理中維護邀請配置。",
@@ -2207,7 +2207,7 @@
   "adminTelegram": {
     "title": "Telegram 管理",
     "description": "集中維護 Bot、群組/頻道校驗、面板文案和換綁審核入口。",
-    "testBot": "測試 Bot",
+    "testBot": "测试并发送消息",
     "testSuccess": "Telegram 測試完成",
     "testFailed": "Telegram 測試失敗",
     "botTestTitle": "Bot 連通性與投遞測試",
@@ -2236,7 +2236,7 @@
     "rosterDescription": "查看群組巡檢、回群恢復和踢出未綁定使用者任務。",
     "openCommandManager": "管理 Bot 指令",
     "configTitle": "Telegram 配置",
-    "configDescription": "這裡直接編輯 config.toml 中的 [Telegram] 配置，不建立第二套配置來源。",
+    "configDescription": "全站共用一个 Bot 配置。个人设置绑定用户身份，本页配置服务机器人，指令管理维护回复；高级配置编辑的是同一份数据。",
     "configNotice": "配置管理中的 Telegram 折疊入口仍保留相容；建議後續在 Telegram 管理維護。"
   },
   "adminTelegramCommands": {
@@ -2705,8 +2705,8 @@
   },
   "adminRegcodes": {
     "perPage": "每頁",
-    "pageTitle": "卡碼管理",
-    "pageSubtitle": "管理註冊碼、續期碼、白名單碼和邀請碼",
+    "pageTitle": "卡码管理",
+    "pageSubtitle": "发放注册、续期和白名单卡，审查邀请码记录。个人邀请与额度在邀请中心，全站关系维护在邀请系统管理。",
     "tabRegcodes": "註冊碼",
     "tabInviteCodes": "邀請碼",
     "generateCard": "生成卡碼",
@@ -3585,5 +3585,17 @@
       "recovery_required": "需要人工檢查恢復",
       "interrupted": "上次升級已中斷"
     }
+  },
+  "entrySettings": {
+    "title": "站點與入口",
+    "description": "通过 SSH/VPN 管理无需公开域名；需要对外提供网站时，再手动配置域名和入口。",
+    "manualTitle": "手动配置域名",
+    "manualSteps": "① 将域名 DNS 指向计划使用的反向代理；② 配置 HTTPS 证书并反代到本机面板；③ 同步入口 Origin/Host 白名单、可信代理和安全 Cookie 设置；④ 验证实际访问成功后再分发地址。",
+    "isolation": "网站入口与 Emby 播放线路用途不同。管理入口优先保留 SSH/VPN 隔离。同一个 Bot Token 只交给一个收件进程，OpenStrm 的 Bot 轮询保持关闭。",
+    "siteTitle": "网站域名",
+    "siteDescription": "可选，仅填 HTTPS 域名地址，不含路径或账号密码。仅通过 SSH/VPN 访问时留空。",
+    "savedOnly": "保存仅记录地址，不会修改 DNS、申请证书、开放端口或证明域名已经可用。",
+    "playTitle": "Emby 播放地址",
+    "playDescription": "这里配置客户端看到的播放线路；后端内部访问 Emby 的 API 地址仍在 Emby 管理中配置。"
   }
 }

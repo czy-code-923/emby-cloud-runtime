@@ -31,6 +31,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm-dialog";
+import { useAsyncResource } from "@/hooks/use-async-resource";
 import { useToast } from "@/hooks/use-toast";
 import { api, type InviteCodeItem, type InviteConfig, type InviteMyStatus, type InviteTreeNode } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
@@ -102,8 +103,6 @@ function InviteCenterContent() {
   const [config, setConfig] = useState<InviteConfig | null>(null);
   const [status, setStatus] = useState<InviteMyStatus | null>(null);
   const [codes, setCodes] = useState<InviteCodeItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -120,28 +119,17 @@ function InviteCenterContent() {
   const [generatedRenewCode, setGeneratedRenewCode] = useState<null | { code: string; target_username: string; days: number; validity_hours: number }>(null);
   const [detachingChildUid, setDetachingChildUid] = useState<number | null>(null);
 
-  const reload = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const cfg = await api.getInviteConfig();
-      if (cfg.success && cfg.data) setConfig(cfg.data);
-      const [me, list] = await Promise.all([
-        api.getMyInviteStatus().catch(() => null),
-        api.getMyInviteCodes().catch(() => null),
-      ]);
-      if (me?.success && me.data) setStatus(me.data);
-      if (list?.success && list.data) setCodes(list.data.codes || []);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t("invite.loadFailed"));
-    } finally {
-      setLoading(false);
+  const load = useCallback(async (signal?: AbortSignal) => {
+    const res = await api.getInviteSummary(signal);
+    if (!res.success || !res.data) throw new Error(res.message || t("invite.loadFailed"));
+    if (!signal?.aborted) {
+      setConfig(res.data.config);
+      setStatus(res.data.invite);
+      setCodes(res.data.invite.codes || []);
     }
+    return res.data;
   }, [t]);
-
-  useEffect(() => {
-    void reload();
-  }, [reload]);
+  const { isLoading: loading, error, execute: reload } = useAsyncResource(load, { immediate: true, throwOnError: false });
 
   const maxCodeDays = status?.max_code_days ?? 0;
   const inviteTree = status?.tree && !Array.isArray(status.tree) && status.tree.self ? status.tree : null;

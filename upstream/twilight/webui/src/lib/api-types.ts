@@ -14,6 +14,7 @@ export interface ApiResponse<T = unknown> {
 }
 
 export interface SystemInfo {
+  public_base_url?: string;
   name: string;
   icon: string;
   server_icon?: string;
@@ -1374,6 +1375,8 @@ export interface InviteMyStatus {
   invite_block_reason?: string;
   max_code_days?: number;
   max_code_days_reason?: string;
+  codes: InviteCodeItem[];
+  total: number;
 }
 
 export interface InviteForestNode {
@@ -1394,17 +1397,27 @@ export interface InviteForestEdge {
   child: number;
 }
 
+export interface InviteAdminRow extends InviteForestNode {
+  emby_bound: boolean;
+  depth: number;
+  root_uid: number;
+  direct_children: number;
+  descendants: number;
+  collapsed: boolean;
+}
+
 export interface InviteForest {
-  nodes: InviteForestNode[];
-  edges: InviteForestEdge[];
-  roots: number[];
+  rows: InviteAdminRow[];
+  selected: InviteAdminRow | null;
+  roots: Array<{ uid: number; username: string }>;
+  total_rows: number;
+  total_nodes: number;
+  total_relations: number;
   max_depth: number;
-  config: {
-    enabled: boolean;
-    max_depth: number;
-    invite_limit: number;
-    require_emby: boolean;
-  };
+  page: number;
+  pages: number;
+  per_page: number;
+  config: InviteConfig;
 }
 
 // ==================== 签到 / 积分 ====================

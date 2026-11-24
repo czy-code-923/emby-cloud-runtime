@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   Ban,
   CheckSquare2,
+  ChevronLeft,
   ChevronDown,
   ChevronRight,
   GitBranch,
@@ -31,18 +32,18 @@ import { Input } from "@/components/ui/input";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { AdminConfigSections } from "@/components/admin/config-section-editor";
 import { AdminTable } from "@/components/admin/admin-table";
+import { useAsyncResource } from "@/hooks/use-async-resource";
 import { useToast } from "@/hooks/use-toast";
-import { api, type InviteForest, type InviteForestNode } from "@/lib/api";
+import { api, type InviteForest, type InviteAdminRow } from "@/lib/api";
 import { useI18n, type MessageKey } from "@/lib/i18n";
 
 interface TreeRow {
-  node: InviteForestNode;
+  node: InviteAdminRow;
   depth: number;
   root: number;
   childCount: number;
+  descendants: number;
 }
-
-const ROW_BATCH_SIZE = 300;
 
 interface DepthPromptState {
   title: string;
@@ -52,48 +53,6 @@ interface DepthPromptState {
   min?: number;
   max?: number;
   resolve: (value: string | null) => void;
-}
-
-function buildMaps(forest: InviteForest) {
-  const nodeByUid = new Map<number, InviteForestNode>();
-  const children = new Map<number, number[]>();
-  const parent = new Map<number, number>();
-  for (const node of forest.nodes) nodeByUid.set(node.uid, node);
-  for (const edge of forest.edges) {
-    if (!children.has(edge.parent)) children.set(edge.parent, []);
-    children.get(edge.parent)!.push(edge.child);
-    parent.set(edge.child, edge.parent);
-  }
-  for (const ids of children.values()) ids.sort((a, b) => a - b);
-
-  // 预计算每个节点的根（rootOf）与子树规模（descendants）：从各 root 做一次
-  // DFS，整体 O(n)。这样渲染时每行用 O(1) 查表，取代旧版「每行 findRoot(O 深度)
-  // + subtreeSize(O 子树)」造成的 O(n²) 重复计算。带 visited 防御环 / 重复入栈。
-  const rootOf = new Map<number, number>();
-  const descendants = new Map<number, number>();
-  for (const root of forest.roots) {
-    if (rootOf.has(root)) continue;
-    const order: number[] = [];
-    const stack = [root];
-    rootOf.set(root, root);
-    while (stack.length) {
-      const uid = stack.pop()!;
-      order.push(uid);
-      for (const child of children.get(uid) || []) {
-        if (rootOf.has(child)) continue;
-        rootOf.set(child, root);
-        stack.push(child);
-      }
-    }
-    // 叶子优先回溯累加：descendants(uid) = Σ(1 + descendants(child))。
-    for (let i = order.length - 1; i >= 0; i--) {
-      const uid = order[i];
-      let total = 0;
-      for (const child of children.get(uid) || []) total += 1 + (descendants.get(child) || 0);
-      descendants.set(uid, total);
-    }
-  }
-  return { nodeByUid, children, parent, rootOf, descendants };
 }
 
 function roleLabelKey(role: number): MessageKey {
@@ -112,135 +71,31 @@ export default function AdminInviteTreePage() {
   const { confirm } = useConfirm();
   const { locale, t } = useI18n();
   const [forest, setForest] = useState<InviteForest | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [rootFilter, setRootFilter] = useState<number | "all">("all");
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   const [selectedUid, setSelectedUid] = useState<number | null>(null);
   const [selectedUids, setSelectedUids] = useState<Set<number>>(new Set());
-  const [rowLimit, setRowLimit] = useState(ROW_BATCH_SIZE);
+  const [page, setPage] = useState(1);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [depthPrompt, setDepthPrompt] = useState<DepthPromptState | null>(null);
-  const reloadAbortRef = useRef<AbortController | null>(null);
-  const reloadSequenceRef = useRef(0);
-
-  const reload = useCallback(async () => {
-    reloadAbortRef.current?.abort();
-    const controller = new AbortController();
-    reloadAbortRef.current = controller;
-    const sequence = ++reloadSequenceRef.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.adminGetInviteTree(controller.signal);
-      if (controller.signal.aborted || sequence !== reloadSequenceRef.current) return;
-      if (res.success && res.data) {
-        setForest(res.data);
-      } else {
-        throw new Error(res.message || t("adminInvite.loadFailed"));
-      }
-    } catch (err) {
-      if (controller.signal.aborted || sequence !== reloadSequenceRef.current) return;
-      setError(err instanceof Error ? err.message : t("adminInvite.loadFailed"));
-    } finally {
-      if (sequence === reloadSequenceRef.current) setLoading(false);
-      if (reloadAbortRef.current === controller) reloadAbortRef.current = null;
-    }
-  }, [t]);
-
-  useEffect(() => {
-    void reload();
-    return () => reloadAbortRef.current?.abort();
-  }, [reload]);
-
-  const maps = useMemo(() => (forest ? buildMaps(forest) : null), [forest]);
-  const rootOptions = useMemo(() => {
-    if (!forest || !maps) return [];
-    return forest.roots
-      .filter((uid) => maps.nodeByUid.has(uid))
-      .sort((a, b) => a - b)
-      .map((uid) => ({ uid, node: maps.nodeByUid.get(uid)! }));
-  }, [forest, maps]);
-
-  const includedBySearch = useMemo(() => {
-    const set = new Set<number>();
-    const q = deferredQuery.trim().toLowerCase();
-    if (!q || !forest || !maps) return set;
-    for (const node of forest.nodes) {
-      const matched =
-        node.username.toLowerCase().includes(q) ||
-        String(node.uid).includes(q) ||
-        String(node.telegram_id || "").includes(q);
-      if (!matched) continue;
-      let current: number | undefined = node.uid;
-      while (current && !set.has(current)) {
-        set.add(current);
-        current = maps.parent.get(current);
-      }
-    }
-    return set;
-  }, [deferredQuery, forest, maps]);
-
-  const allRows = useMemo(() => {
-    if (!forest || !maps) return [];
-    const q = deferredQuery.trim();
-    const out: TreeRow[] = [];
-    const roots = rootFilter === "all" ? forest.roots : [rootFilter];
-    for (const root of roots) {
-      const stack: Array<{ uid: number; depth: number }> = [{ uid: root, depth: 0 }];
-      while (stack.length) {
-        const item = stack.pop()!;
-        const node = maps.nodeByUid.get(item.uid);
-        if (!node) continue;
-        if (!q || includedBySearch.has(item.uid)) {
-          out.push({
-            node,
-            depth: item.depth,
-            root: maps.rootOf.get(item.uid) ?? item.uid,
-            childCount: maps.children.get(item.uid)?.length || 0,
-          });
-        }
-        if (!collapsed.has(item.uid)) {
-          const childIds = maps.children.get(item.uid) || [];
-          for (let index = childIds.length - 1; index >= 0; index--) {
-            stack.push({ uid: childIds[index], depth: item.depth + 1 });
-          }
-        }
-      }
-    }
-    return out;
-  }, [collapsed, deferredQuery, forest, includedBySearch, maps, rootFilter]);
-
-  const rows = useMemo(() => allRows.slice(0, rowLimit), [allRows, rowLimit]);
-  const hasMoreRows = rows.length < allRows.length;
-
-  useEffect(() => {
-    setRowLimit(ROW_BATCH_SIZE);
-  }, [deferredQuery, rootFilter]);
-
-  const selected = selectedUid && maps?.nodeByUid.get(selectedUid) ? maps.nodeByUid.get(selectedUid)! : null;
+  const params = useMemo(() => ({ page, search: deferredQuery.trim(), root: rootFilter, collapsed: [...collapsed], selected: selectedUid }), [page, deferredQuery, rootFilter, collapsed, selectedUid]);
+  const load = useCallback(async (signal?: AbortSignal) => {
+    const res = await api.adminGetInviteTree(signal, params);
+    if (!res.success || !res.data) throw new Error(res.message || t("adminInvite.loadFailed"));
+    if (!signal?.aborted) setForest(res.data);
+    return res.data;
+  }, [params, t]);
+  const { isLoading: loading, error, execute: reload } = useAsyncResource(load, { immediate: true, throwOnError: false });
+  const rootOptions = forest?.roots || [];
+  const rows = useMemo<TreeRow[]>(() => (forest?.rows || []).map((row) => ({ node: row, depth: row.depth, root: row.root_uid, childCount: row.direct_children, descendants: row.descendants })), [forest]);
+  const selected = (forest?.selected?.uid === selectedUid ? forest.selected : rows.find((row) => row.node.uid === selectedUid)?.node) || null;
   const visibleUids = useMemo(() => rows.map((row) => row.node.uid), [rows]);
   const allVisibleSelected = visibleUids.length > 0 && visibleUids.every((uid) => selectedUids.has(uid));
   const someVisibleSelected = visibleUids.some((uid) => selectedUids.has(uid));
   const selectedCount = selectedUids.size;
-
-  useEffect(() => {
-    if (forest && rootFilter !== "all" && !forest.roots.includes(rootFilter)) setRootFilter("all");
-  }, [forest, rootFilter]);
-
-  useEffect(() => {
-    if (selectedUid && maps && !maps.nodeByUid.has(selectedUid)) setSelectedUid(null);
-  }, [maps, selectedUid]);
-
-  useEffect(() => {
-    const visible = new Set(visibleUids);
-    setSelectedUids((prev) => {
-      const next = new Set([...prev].filter((uid) => visible.has(uid)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [visibleUids]);
+  useEffect(() => { setSelectedUids(new Set()); }, [params]);
 
   const requestDepth = useCallback((title: string, description: string, confirmLabel: string, min = 0) => {
     return new Promise<string | null>((resolve) => {
@@ -549,6 +404,7 @@ export default function AdminInviteTreePage() {
   };
 
   const toggleCollapse = (uid: number) => {
+    setPage(1);
     setCollapsed((prev) => {
       const next = new Set(prev);
       if (next.has(uid)) next.delete(uid);
@@ -570,11 +426,11 @@ export default function AdminInviteTreePage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" onClick={() => void reload()} disabled={loading}>
+          <Button variant="outline" size="sm" onClick={() => void reload()} disabled={loading || Boolean(busyAction)}>
             {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
             {t("common.refresh")}
           </Button>
-          <Button variant="destructive" size="sm" onClick={() => void handleAllQuickMaintenance()} disabled={loading || Boolean(busyAction) || !forest || forest.edges.length === 0}>
+          <Button variant="destructive" size="sm" onClick={() => void handleAllQuickMaintenance()} disabled={loading || (Boolean(busyAction) || loading) || !forest || forest.total_relations === 0}>
             <Ban className="mr-2 h-4 w-4" />
             {t("adminInvite.quickAll")}
           </Button>
@@ -586,24 +442,26 @@ export default function AdminInviteTreePage() {
           <div className="grid gap-2 sm:grid-cols-[minmax(220px,1fr)_220px]">
             <div className="relative">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("adminInvite.searchPlaceholder")} className="pl-9" />
+              <Input disabled={Boolean(busyAction)} value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder={t("adminInvite.searchPlaceholder")} className="pl-9" />
             </div>
             <select
               value={rootFilter}
-              onChange={(event) => setRootFilter(event.target.value === "all" ? "all" : Number(event.target.value))}
+              disabled={Boolean(busyAction)}
+              aria-label={t("adminInvite.allRoots")}
+              onChange={(event) => { setRootFilter(event.target.value === "all" ? "all" : Number(event.target.value)); setPage(1); }}
               className="h-10 rounded-md border bg-background px-3 text-sm"
             >
               <option value="all">{t("adminInvite.allRoots")}</option>
-              {rootOptions.map(({ uid, node }) => (
+              {rootOptions.map(({ uid, username }) => (
                 <option key={uid} value={uid}>
-                  #{uid} {node.username}
+                  #{uid} {username}
                 </option>
               ))}
             </select>
           </div>
           <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
-            <Badge variant="outline">{t("adminInvite.usersCount", { count: forest?.nodes.length ?? 0 })}</Badge>
-            <Badge variant="outline">{t("adminInvite.relationsCount", { count: forest?.edges.length ?? 0 })}</Badge>
+            <Badge variant="outline">{t("adminInvite.usersCount", { count: forest?.total_nodes ?? 0 })}</Badge>
+            <Badge variant="outline">{t("adminInvite.relationsCount", { count: forest?.total_relations ?? 0 })}</Badge>
             <Badge variant="outline">{t("adminInvite.rootsCount", { count: forest?.roots.length ?? 0 })}</Badge>
           </div>
         </CardContent>
@@ -625,19 +483,19 @@ export default function AdminInviteTreePage() {
                 <Square className="mr-2 h-4 w-4" />
                 {t("adminInvite.clearSelection")}
               </Button>
-              <Button variant="outline" size="sm" onClick={() => void handleBulkDetach(false)} disabled={Boolean(busyAction)}>
+              <Button variant="outline" size="sm" onClick={() => void handleBulkDetach(false)} disabled={(Boolean(busyAction) || loading)}>
                 <Ban className="mr-2 h-4 w-4" />
                 {t("adminInvite.bulkDetach")}
               </Button>
-              <Button variant="outline" size="sm" onClick={() => void handleSelectedQuickMaintenance()} disabled={Boolean(busyAction)}>
+              <Button variant="outline" size="sm" onClick={() => void handleSelectedQuickMaintenance()} disabled={(Boolean(busyAction) || loading)}>
                 <ShieldCheck className="mr-2 h-4 w-4" />
                 {t("adminInvite.quickSelected")}
               </Button>
-              <Button variant="outline" size="sm" onClick={() => void handleBulkDetach(true, true)} disabled={Boolean(busyAction)}>
+              <Button variant="outline" size="sm" onClick={() => void handleBulkDetach(true, true)} disabled={(Boolean(busyAction) || loading)}>
                 <Trash2 className="mr-2 h-4 w-4" />
                 {t("adminInvite.bulkDetachDisabledEmby")}
               </Button>
-              <Button variant="destructive" size="sm" onClick={() => void handleBulkDetach(true)} disabled={Boolean(busyAction)}>
+              <Button variant="destructive" size="sm" onClick={() => void handleBulkDetach(true)} disabled={(Boolean(busyAction) || loading)}>
                 <Trash2 className="mr-2 h-4 w-4" />
                 {t("adminInvite.bulkDetachDeleteEmby")}
               </Button>
@@ -657,7 +515,7 @@ export default function AdminInviteTreePage() {
         <div className="flex h-60 items-center justify-center">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
-      ) : !forest || forest.nodes.length === 0 ? (
+      ) : !forest || forest.total_nodes === 0 ? (
         <Card className="border-dashed">
           <CardContent className="space-y-2 p-10 text-center">
             <GitBranch className="mx-auto h-10 w-10 text-muted-foreground" />
@@ -675,7 +533,7 @@ export default function AdminInviteTreePage() {
               rowClassName={(row) => (selectedUid === row.node.uid ? "bg-primary/5" : "")}
               onRowContextMenu={(row, event) => {
                 event.preventDefault();
-                setSelectedUid(row.node.uid);
+                if (!busyAction && !loading) setSelectedUid(row.node.uid);
               }}
               empty={<div className="p-8 text-center text-sm text-muted-foreground">{t("adminInvite.noMatches")}</div>}
               columns={[
@@ -702,9 +560,9 @@ export default function AdminInviteTreePage() {
                   key: "user",
                   header: t("adminInvite.user"),
                   cell: ({ node, depth, root, childCount }) => (
-                    <div className="flex items-center gap-2" style={{ paddingLeft: depth * 18 }}>
+                    <div className="flex items-center gap-2" style={{ paddingLeft: Math.min(depth, 12) * 18 }}>
                       {childCount > 0 ? (
-                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => toggleCollapse(node.uid)}>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => toggleCollapse(node.uid)} disabled={Boolean(busyAction) || loading} aria-label={t("adminInvite.details")}>
                           {collapsed.has(node.uid) ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                         </Button>
                       ) : (
@@ -735,10 +593,10 @@ export default function AdminInviteTreePage() {
                   key: "emby",
                   header: "Emby",
                   cell: (row) => (
-                    <Badge variant={row.node.emby_disabled ? "destructive" : row.node.emby_id ? "outline" : "secondary"}>
+                    <Badge variant={row.node.emby_disabled ? "destructive" : row.node.emby_bound ? "outline" : "secondary"}>
                       {row.node.emby_disabled
                         ? t("adminInvite.embyDisabled")
-                        : row.node.emby_id
+                        : row.node.emby_bound
                           ? t("adminInvite.bound")
                           : t("adminInvite.unbound")}
                     </Badge>
@@ -751,7 +609,7 @@ export default function AdminInviteTreePage() {
                   cell: (row) =>
                     t("adminInvite.childSummary", {
                       direct: row.childCount,
-                      total: maps?.descendants.get(row.node.uid) ?? 0,
+                      total: row.descendants,
                     }),
                 },
                 {
@@ -760,39 +618,36 @@ export default function AdminInviteTreePage() {
                   className: "text-right",
                   headerClassName: "text-right",
                   cell: (row) => (
-                    <Button variant="outline" size="sm" onClick={() => setSelectedUid(row.node.uid)} disabled={Boolean(busyAction)}>
+                    <Button variant="outline" size="sm" onClick={() => setSelectedUid(row.node.uid)} disabled={(Boolean(busyAction) || loading)}>
                       {t("adminInvite.details")}
                     </Button>
                   ),
                 },
               ]}
             />
-            {allRows.length > 0 && (
-              <div className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-3 text-xs text-muted-foreground">
-                <span>{t("adminInvite.renderedRows", { shown: rows.length, total: allRows.length })}</span>
-                {hasMoreRows && (
-                  <Button variant="outline" size="sm" onClick={() => setRowLimit((current) => current + ROW_BATCH_SIZE)}>
-                    {t("adminInvite.loadMoreRows")}
-                  </Button>
-                )}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-3 text-xs text-muted-foreground">
+              <span>{t("adminInvite.renderedRows", { shown: rows.length, total: forest.total_rows })} · {forest.page}/{forest.pages}</span>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" disabled={loading || Boolean(busyAction) || forest.page <= 1} onClick={() => setPage(forest.page - 1)} aria-label={t("common.previousPage")}><ChevronLeft className="h-4 w-4" /></Button>
+                <Button variant="outline" size="sm" disabled={loading || Boolean(busyAction) || forest.page >= forest.pages} onClick={() => setPage(forest.page + 1)} aria-label={t("common.nextPage")}><ChevronRight className="h-4 w-4" /></Button>
               </div>
-            )}
+            </div>
           </CardContent>
         </Card>
       )}
 
-      <Dialog open={selected !== null} onOpenChange={(open) => { if (!open) setSelectedUid(null); }}>
+      <Dialog open={selected !== null} onOpenChange={(open) => { if (!open && !busyAction) setSelectedUid(null); }}>
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>{selected?.username}</DialogTitle>
             <DialogDescription>UID {selected?.uid}</DialogDescription>
           </DialogHeader>
-          {selected && maps && (
+          {selected && (
             <div className="space-y-3 text-sm">
               <div className="flex flex-wrap gap-2">
                 <Badge variant={selected.active ? "success" : "secondary"}>{selected.active ? t("adminInvite.enable") : t("adminInvite.disable")}</Badge>
-                <Badge variant={selected.emby_disabled ? "destructive" : selected.emby_id ? "outline" : "secondary"}>
-                  {selected.emby_disabled ? t("adminInvite.embyDisabled") : selected.emby_id ? t("adminInvite.boundEmby") : t("adminInvite.noEmby")}
+                <Badge variant={selected.emby_disabled ? "destructive" : selected.emby_bound ? "outline" : "secondary"}>
+                  {selected.emby_disabled ? t("adminInvite.embyDisabled") : selected.emby_bound ? t("adminInvite.boundEmby") : t("adminInvite.noEmby")}
                 </Badge>
                 {selected.is_root && <Badge>{t("adminInvite.root")}</Badge>}
               </div>
@@ -811,35 +666,35 @@ export default function AdminInviteTreePage() {
                 </div>
                 <div className="flex justify-between gap-3">
                   <dt className="text-muted-foreground">{t("adminInvite.root")}</dt>
-                  <dd>{maps.rootOf.get(selected.uid) ?? selected.uid}</dd>
+                  <dd>{selected.root_uid}</dd>
                 </div>
                 <div className="flex justify-between gap-3">
                   <dt className="text-muted-foreground">{t("adminInvite.subtree")}</dt>
-                  <dd>{t("adminInvite.subtreeChildren", { count: maps.descendants.get(selected.uid) ?? 0 })}</dd>
+                  <dd>{t("adminInvite.subtreeChildren", { count: selected.descendants })}</dd>
                 </div>
               </dl>
               <div className="grid gap-2 pt-2">
-                <Button variant="outline" size="sm" onClick={() => void handleDetach()} disabled={selected.is_root || Boolean(busyAction)}>
+                <Button variant="outline" size="sm" onClick={() => void handleDetach()} disabled={selected.is_root || (Boolean(busyAction) || loading)}>
                   <Ban className="mr-2 h-4 w-4" />
                   {selected.is_root ? t("adminInvite.alreadyRoot") : t("adminInvite.detach")}
                 </Button>
-                <Button variant="destructive" size="sm" onClick={() => void handleDetachAndDeleteEmby()} disabled={selected.role === 0 || Boolean(busyAction)}>
+                <Button variant="destructive" size="sm" onClick={() => void handleDetachAndDeleteEmby()} disabled={selected.role === 0 || (Boolean(busyAction) || loading)}>
                   <Trash2 className="mr-2 h-4 w-4" />
                   {t("adminInvite.detachDeleteEmby")}
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => void handleSubtreeQuickMaintenance()} disabled={(maps.descendants.get(selected.uid) ?? 0) === 0 || Boolean(busyAction)}>
+                <Button variant="outline" size="sm" onClick={() => void handleSubtreeQuickMaintenance()} disabled={(selected.descendants) === 0 || (Boolean(busyAction) || loading)}>
                   <ShieldCheck className="mr-2 h-4 w-4" />
                   {t("adminInvite.quickSubtree")}
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => void handleCascadeToggle(false)} disabled={Boolean(busyAction)}>
+                <Button variant="outline" size="sm" onClick={() => void handleCascadeToggle(false)} disabled={(Boolean(busyAction) || loading)}>
                   <Ban className="mr-2 h-4 w-4" />
                   {t("adminInvite.cascadeDisable")}
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => void handleCascadeToggle(true)} disabled={Boolean(busyAction)}>
+                <Button variant="outline" size="sm" onClick={() => void handleCascadeToggle(true)} disabled={(Boolean(busyAction) || loading)}>
                   <ShieldCheck className="mr-2 h-4 w-4" />
                   {t("adminInvite.cascadeEnable")}
                 </Button>
-                <Button variant="destructive" size="sm" onClick={() => void handleCascadeDelete()} disabled={Boolean(busyAction)}>
+                <Button variant="destructive" size="sm" onClick={() => void handleCascadeDelete()} disabled={(Boolean(busyAction) || loading)}>
                   <Trash2 className="mr-2 h-4 w-4" />
                   {t("adminInvite.cascadeDelete")}
                 </Button>

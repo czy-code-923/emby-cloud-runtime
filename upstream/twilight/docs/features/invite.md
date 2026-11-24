@@ -238,3 +238,8 @@ V2 管理资源：`GET /api/v2/admin/invite/tree` 返回 `data.item`，其中 `r
 | `INVITE_RENEW_USER_DISABLED` / `INVITE_RENEW_REQUIRES_EMBY` / `INVITE_RENEW_BAD_TARGET` / `INVITE_RENEW_NOT_DIRECT_CHILD` | 续期码相关校验失败。 |
 | `INVITE_DETACH_NOT_DIRECT_CHILD` / `INVITE_DETACH_NOT_EXPIRED` | 自助断开下级的前置校验失败。 |
 | `RATE_LIMITED` | 触发限速（生成 / 使用 / 公开校验）。 |
+
+
+## Runtime v0.3.0页面契约修复
+
+邀请管理使用V2分页树`item.rows/roots/selected`，每页100行，服务端搜索/折叠/详情，保留原维护鉴权与审计。个人邀请页使用一次可取消的`/api/v2/invite/summary`。卡码发放、本人邀请与全站关系维护各有独立职责，不新增权益来源。
