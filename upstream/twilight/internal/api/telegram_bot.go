@@ -328,6 +328,10 @@ func (a *App) handleTelegramUpdate(ctx context.Context, update *telegramUpdate) 
 				a.telegramConfirmLinkFromChat(ctx, chatID, fromID, username, args[0])
 				return
 			}
+			if a.cfg().TelegramAutoProvision && !message.From.IsBot && chatID == fromID {
+				a.telegramStartProfile(ctx, chatID, fromID, username)
+				return
+			}
 			_ = a.telegramSendMessage(ctx, chatID, a.telegramStartText())
 			return
 		}

@@ -1033,14 +1033,15 @@ var (
 )
 
 func configSectionDefs() []configSectionDef {
-	selectDriver := []map[string]any{{"label": "PostgreSQL（推荐）", "value": "postgres"}, {"label": "Go JSON 文件（兼容）", "value": "json"}}
+	selectDriver := []map[string]any{{"label": "PostgreSQL（运行数据库）", "value": "postgres"}}
 	selectUpdate := []map[string]any{{"label": "按间隔", "value": "interval"}, {"label": "每日固定时间", "value": "daily"}, {"label": "手动", "value": "manual"}}
 	selectRegCodeRandom := regCodeRandomAlgorithmOptions()
 	selectInviteCodeRandom := inviteCodeRandomAlgorithmOptions()
 	selectRegcodeDecoyAction := regcodeDecoyActionOptions()
 	return []configSectionDef{
 		{Key: "Global", Title: "全局", Description: "基础运行参数", Category: "runtime", Collapsed: true, Fields: []configFieldDef{
-			{Key: "public_base_url", Label: "网站公开域名", Type: "string", Description: "可选，填写 https://admin.example.com；仅保存网站入口，不自动修改DNS、证书、端口或可信代理。仅通过SSH/VPN管理时可留空。"},
+			{Key: "commerce_store_url", Label: "独立购买网站域名", Type: "string", Description: "例如 https://jwshop.iczy.top；与账户/Mini App域名分开，不在Telegram中分发。"},
+			{Key: "public_base_url", Label: "账户与Mini App域名", Type: "string", Description: "例如 https://account.example.com；保存期望地址后，在站点与入口单独申请证书并发布。管理后台继续通过SSH/VPN安全入口使用。"},
 			{Key: "server_name", Label: "服务器名称", Type: "string", Description: "前端展示的站点或服务器名称"},
 			{Key: "server_icon", Label: "服务器图标", Type: "string", Description: "HTTPS 图片 URL 或本地图片路径；留空使用内置图标"},
 			{Key: "auth_background_url", Label: "认证页背景图", Type: "string", Description: "内置路径 /system/auth-background；由上传接口自动写入，留空使用默认渐变背景"},
@@ -1058,9 +1059,9 @@ func configSectionDefs() []configSectionDef {
 			{Key: "bangumi_app_id", Label: "Bangumi App ID", Type: "string", Description: "Bangumi OAuth 应用的 Client ID（回调里校验 audience 用）"},
 			{Key: "bangumi_api_url", Label: "Bangumi API URL", Type: "string", Description: "Bangumi API 基础地址"},
 		}},
-		{Key: "Database", Title: "数据库", Description: "JSON/PostgreSQL 存储和备份配置", Category: "ops", Collapsed: true, Fields: []configFieldDef{
-			{Key: "driver", Label: "存储后端", Type: "select", Description: "可视化配置仅提供 PostgreSQL 与 Go JSON；SQLite 已禁用", Options: selectDriver},
-			{Key: "state_file", Label: "JSON 状态文件", Type: "string", Description: "Go JSON 状态文件路径，留空使用数据目录中的 twilight_go_state.json"},
+		{Key: "Database", Title: "数据库", Description: "PostgreSQL运行数据库与备份；JSON仅用于历史导入/导出", Category: "ops", Collapsed: true, Fields: []configFieldDef{
+			{Key: "driver", Label: "存储后端", Type: "select", Description: "运行数据库仅支持PostgreSQL；历史JSON请通过迁移导入，不可作为运行后端", Options: selectDriver},
+			{Key: "state_file", Label: "旧JSON导入文件（兼容）", Type: "string", Description: "Go JSON 状态文件路径，留空使用数据目录中的 twilight_go_state.json"},
 			{Key: "backup_dir", Label: "备份目录", Type: "string", Description: "数据库快照备份目录"},
 			{Key: "migration_panel_enabled", Label: "启用数据库迁移", Type: "bool", Description: "开启后显示数据库迁移面板并允许管理员调用迁移 API"},
 			{Key: "url", Label: "PostgreSQL URL", Type: "secret", Description: "完整 postgres:// 连接串，优先级高于分项配置"},
@@ -1088,6 +1089,8 @@ func configSectionDefs() []configSectionDef {
 			{Key: "playback_reporting_enabled", Label: "使用 Playback Reporting 净时长", Type: "bool", Description: "装了 Emby 的 Playback Reporting 插件时，用它的 PlayDuration − PauseDuration 作为播放时长（扣除暂停）；插件不可用会自动回退活动日志，无需手动关闭"},
 		}},
 		{Key: "Telegram", Title: "Telegram", Description: "Bot、订阅校验和群组管理\n推荐在 Telegram 管理页面操作 Bot 基础设置，高级参数在此调整", Category: "integration", Collapsed: true, Fields: []configFieldDef{
+			{Key: "auto_provision", Label: "启动时自动建立用户身份", Type: "bool", Description: "用户在Bot私聊/start时按Telegram ID幂等建立普通账户；不匹配同名网页用户、不授予管理员或免费Emby权限，仍受总用户上限控制"},
+			{Key: "mini_app_url", Label: "Mini App HTTPS地址", Type: "string", Description: "例如 https://account.example.com/miniapp；需先发布有效域名证书；与独立商店分离"},
 			{Key: "login_enabled", Label: "Telegram 扫码登录", Type: "bool", Description: "仅已绑定账号可登录，需要在 Bot 私聊确认；默认关闭"},
 			{Key: "telegram_api_url", Label: "Bot API URL", Type: "string", Description: "Telegram Bot API 基础地址"},
 			{Key: "bot_token", Label: "Bot Token", Type: "secret", Description: "Telegram Bot Token"},
@@ -1307,7 +1310,7 @@ func configSectionDefs() []configSectionDef {
 func configValues(cfg config.Config) map[string]map[string]any {
 	return map[string]map[string]any{
 		"Global": {
-			"server_name": cfg.AppName, "public_base_url": cfg.PublicBaseURL, "server_icon": cfg.ServerIcon, "auth_background_url": cfg.AuthBackgroundURL, "databases_dir": cfg.DatabaseDir, "redis_url": cfg.RedisURL, "telegram_mode": cfg.TelegramMode, "force_bind_telegram": cfg.ForceBindTelegram,
+			"server_name": cfg.AppName, "public_base_url": cfg.PublicBaseURL, "commerce_store_url": cfg.CommerceStoreURL, "server_icon": cfg.ServerIcon, "auth_background_url": cfg.AuthBackgroundURL, "databases_dir": cfg.DatabaseDir, "redis_url": cfg.RedisURL, "telegram_mode": cfg.TelegramMode, "force_bind_telegram": cfg.ForceBindTelegram,
 			"log_level": cfg.LogLevel, "runtime_log_limit": cfg.RuntimeLogLimit, "runtime_memory_limit_mb": cfg.RuntimeMemoryLimitMB,
 			"tmdb_api_key": cfg.TMDBAPIKey, "tmdb_api_url": cfg.TMDBAPIURL, "tmdb_image_url": cfg.TMDBImageURL, "bangumi_token": cfg.BangumiToken, "bangumi_api_url": cfg.BangumiAPIURL,
 			"bangumi_app_id": cfg.BangumiAppID,
@@ -1326,7 +1329,7 @@ func configValues(cfg config.Config) map[string]map[string]any {
 			"playback_reporting_enabled": cfg.PlaybackReportingEnabled,
 		},
 		"Telegram": {
-			"login_enabled":    cfg.TelegramLoginEnabled,
+			"auto_provision": cfg.TelegramAutoProvision, "mini_app_url": cfg.TelegramMiniAppURL, "login_enabled": cfg.TelegramLoginEnabled,
 			"telegram_api_url": cfg.TelegramAPIURL, "bot_token": cfg.TelegramBotToken, "admin_id": int64sToAny(cfg.TelegramAdminIDs), "group_id": cfg.TelegramGroupIDs,
 			"force_subscribe":  cfg.TelegramForceSubscribe,
 			"force_bind_group": cfg.TelegramForceBindGroup, "channel_id": cfg.TelegramChannelIDs, "force_bind_channel": cfg.TelegramForceBindChannel,

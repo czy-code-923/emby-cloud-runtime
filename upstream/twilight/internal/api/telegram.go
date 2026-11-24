@@ -134,7 +134,16 @@ func (a *App) telegramSanitizeError(err error) string {
 }
 
 func (a *App) telegramGetMe(ctx context.Context) (telegramUser, error) {
-	return telegramPostResult[telegramUser](a, ctx, "getMe", struct{}{}, 20*time.Second)
+	// Identity verification is read-only and remains available while polling is off.
+	endpoint, err := a.telegramEndpoint("getMe")
+	if err != nil {
+		return telegramUser{}, fmt.Errorf("%s", a.telegramSanitizeError(err))
+	}
+	me, err := telegramPostResultToEndpoint[telegramUser](ctx, endpoint, "getMe", struct{}{}, 20*time.Second)
+	if err != nil {
+		return telegramUser{}, fmt.Errorf("%s", a.telegramSanitizeError(err))
+	}
+	return me, nil
 }
 
 func (a *App) telegramGetChat(ctx context.Context, chatID any) (telegramChat, error) {

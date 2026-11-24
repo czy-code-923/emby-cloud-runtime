@@ -1,7 +1,9 @@
 setup_mode = true
 [Global]
-server_name = "Emby Cloud"
+server_name = "见微 Emby"
+server_icon = "/brand/jianwei-mark.svg"
 public_base_url = ""
+commerce_store_url = ""
 log_level = "info"
 runtime_log_limit = 300
 runtime_memory_limit_mb = 64
@@ -28,6 +30,8 @@ emby_token = ""
 emby_url_list = []
 emby_url_list_for_whitelist = []
 [Telegram]
+auto_provision = true
+mini_app_url = ""
 bot_token = ""
 login_enabled = false
 require_group_membership = false

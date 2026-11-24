@@ -51,8 +51,12 @@ const nextConfig = {
         headers: [...securityHeaders, ...imageCache],
       },
       {
-        source: '/:path*',
+        source: '/((?!miniapp$).*)',
         headers: securityHeaders,
+      },
+      {
+        source: '/miniapp',
+        headers: securityHeaders.filter((header) => header.key !== 'X-Frame-Options'),
       },
     ];
   },

@@ -1,0 +1,14 @@
+[Unit]
+Description=Jianwei Emby owned certificate renewal
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/emby-cloud/manager.py certificate-renew
+WorkingDirectory=/srv/emby-cloud
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=256M
+TasksMax=128

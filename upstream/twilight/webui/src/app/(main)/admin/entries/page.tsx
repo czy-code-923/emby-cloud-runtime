@@ -1,5 +1,6 @@
 "use client";
 
+import { CertificateManager } from "@/components/admin/certificate-manager";
 import Link from "next/link";
 import { AdminConfigSections } from "@/components/admin/config-section-editor";
 import { Card, CardContent } from "@/components/ui/card";
@@ -15,8 +16,9 @@ export default function EntrySettingsPage() {
    <p>{t("entrySettings.manualSteps")}</p>
    <p className="text-muted-foreground">{t("entrySettings.isolation")}</p>
   </CardContent></Card>
-  <AdminConfigSections sectionKeys={["Global"]} sectionFieldKeys={{Global:["public_base_url"]}} title={t("entrySettings.siteTitle")} description={t("entrySettings.siteDescription")} notice={t("entrySettings.savedOnly")} />
+  <AdminConfigSections sectionKeys={["Global"]} sectionFieldKeys={{Global:["public_base_url","commerce_store_url"]}} title={t("entrySettings.siteTitle")} description={t("entrySettings.siteDescription")} notice={t("entrySettings.savedOnly")} />
   <AdminConfigSections sectionKeys={["Emby"]} sectionFieldKeys={{Emby:["emby_public_url","emby_url_list","emby_whitelist_url","emby_url_list_for_whitelist"]}} title={t("entrySettings.playTitle")} description={t("entrySettings.playDescription")} />
+  <CertificateManager />
   <div className="flex flex-wrap gap-3"><Button asChild variant="outline"><Link href="/admin/telegram">{t("navigation.telegramAdmin")}</Link></Button><Button asChild variant="outline"><Link href="/admin/config">{t("navigation.configAdmin")}</Link></Button></div>
  </div>;
 }

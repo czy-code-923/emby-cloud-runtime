@@ -55,6 +55,7 @@ import type {
   InventoryCheckResult,
   InviteCodeItem,
   InviteConfig,
+  NetworkStatus,
   InviteForest,
   InviteForestEdge,
   InviteForestNode,
@@ -3289,6 +3290,31 @@ class ApiClient {
   }
 
   // ==================== 邀请树 ====================
+  async networkStatus(signal?: AbortSignal) {
+    return this.request<NetworkStatus>("/admin/network/status",{signal,cache:"no-store"},{cacheRead:false,dedupe:false});
+  }
+  async networkAction(operation: "configure"|"issue"|"renew"|"publish", payload: {password:string;profile:"account"|"shop";expected_revision:number;email?:string;cloudflare_token?:string;accept_terms?:boolean;staging?:boolean}) {
+    const options={headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"network-certificate"},body:JSON.stringify(payload)};
+    switch(operation){
+      case "configure":return this.request<NetworkStatus>("/admin/network/configure",{...options,method:"POST"});
+      case "issue":return this.request<NetworkStatus>("/admin/network/issue",{...options,method:"POST"});
+      case "renew":return this.request<NetworkStatus>("/admin/network/renew",{...options,method:"POST"});
+      case "publish":return this.request<NetworkStatus>("/admin/network/publish",{...options,method:"POST"});
+    }
+  }
+  async publishMiniApp(password:string) {
+    return this.request<{url:string}>("/admin/telegram/miniapp/publish",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"publish-miniapp"},body:JSON.stringify({password})});
+  }
+  async telegramIdentity(signal?: AbortSignal) {
+    return this.request<{bot:{username?:string;url?:string;configured:boolean;enabled:boolean;ok:boolean;error?:string};runtime:{polling?:boolean};auto_provision:boolean;mini_app_url:string}>("/admin/telegram/identity", {signal, cache:"no-store"}, {cacheRead:false,dedupe:false});
+  }
+  async miniSession(initData: string, requestId: string, signal?: AbortSignal) {
+    return this.request<{authenticated:boolean}>("/miniapp/session", {method:"POST",signal,body:JSON.stringify({init_data:initData,request_id:requestId})},{cacheRead:false,dedupe:false,apiVersion:"v2"});
+  }
+  async miniAccount(signal?: AbortSignal) {
+    return this.request<{uid:number;username:string;media_enabled:boolean;expired_at:number|null;points:number;signin_enabled:boolean;last_signin:string}>("/miniapp/account",{signal,cache:"no-store"},{cacheRead:false,dedupe:false,apiVersion:"v2"});
+  }
+
   async getInviteSummary(signal?: AbortSignal) {
     return this.request<{ config: InviteConfig; invite: InviteMyStatus }>("/invite/summary", { cache: "no-store", signal }, { cacheRead: false, dedupe: false, apiVersion: "v2" });
   }

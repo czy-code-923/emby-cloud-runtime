@@ -59,7 +59,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const siteIcon = pickEnv("SITE_ICON", "NEXT_PUBLIC_SITE_ICON") || SITE_ICON;
 
   const icons: Metadata["icons"] | undefined = siteIcon
-    ? { icon: siteIcon, shortcut: siteIcon, apple: siteIcon }
+    ? { icon: siteIcon, shortcut: siteIcon, apple: "/brand/jianwei-mark-256.png" }
     : undefined;
 
   return {
@@ -86,10 +86,7 @@ export default function RootLayout({
             <link rel="preconnect" href={apiOrigin} crossOrigin="anonymous" />
           </>
         ) : null}
-        <link rel="dns-prefetch" href="//image.tmdb.org" />
-        <link rel="preconnect" href="https://image.tmdb.org" crossOrigin="anonymous" />
-        <link rel="dns-prefetch" href="//api.bgm.tv" />
-        <link rel="preconnect" href="https://api.bgm.tv" crossOrigin="anonymous" />
+
       </head>
       <body
         className={`${GeistSans.variable} ${GeistMono.variable} font-sans antialiased`}

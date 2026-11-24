@@ -1,6 +1,6 @@
-# Emby Cloud Runtime
+# 见微 Emby · Emby Cloud Runtime
 
-**v0.3.0：全量源码、正式安装包、一键安装/卸载和面板升级。**
+**v0.4.0：全量源码、正式安装包、一键安装/卸载和面板升级。**
 
 当前程序提供独立管理后台、Emby、OpenStrm、PostgreSQL、入口隔离、加密备份和发布升级。依据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 持续开发；该方案中的定制保号、交易和24模块总控尚未全部实现，准确范围见 [差距清单](docs/gaps.md)。
 
@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/czy-code-923/emby-cloud-runtime/mai
 
 ## 后台与方案核对
 
-当前后台尚未实现v8.1全部业务。24模块状态、卡码/邀请/TG分工和域名配置边界见[2026-11-24核对报告](docs/panel-audit-2026-11-24.md)。网站域名可在“系统运维 → 站点与入口”手动记录，DNS/证书/反代仍需独立发布。
+当前后台尚未实现v8.1全部业务。24模块状态、卡码/邀请/TG分工和域名配置边界见[2026-11-24核对报告](docs/panel-audit-2026-11-24.md)。账户与购买网站域名可在“系统运维 → 站点与入口”修改，支持 Cloudflare DNS-01 证书申请、续期与独立的 HTTPS 发布。配置和生效状态分别显示；管理后台继续通过 SSH 安全入口使用。Mini App 菜单在账户入口发布后由 Telegram 管理页发布。
 
 ## 完整源码与完整版本
 

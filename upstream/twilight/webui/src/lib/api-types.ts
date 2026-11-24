@@ -1677,3 +1677,19 @@ export interface UserTicketListItem {
   resolved_at?: number;
   closed_at?: number;
 }
+
+export interface NetworkProfileStatus {
+ desired_origin?:string;
+ configured:boolean;
+ credential_saved:boolean;
+ desired:{revision?:number;domain?:string;email?:string;accept_terms?:boolean;staging?:boolean};
+ applied:{domain?:string;origin?:string;published_at?:number;admin_exposed?:boolean};
+ certificate?:{domain:string;expires_at:number;days_remaining:number;staging:boolean;issuer:string}|null;
+ active_certificate?:{domain:string;expires_at:number;days_remaining:number;staging:boolean;issuer:string}|null;
+}
+export interface NetworkStatus extends NetworkProfileStatus {
+ profiles:Record<"account"|"shop",NetworkProfileStatus>;
+ desired_origins:Record<"account"|"shop",string>;
+ job:{phase:string;operation?:string;profile?:string;error?:string;updated_at?:number};
+ automatic_renewal:{interval_hours:number;enabled:boolean;active:boolean};
+}

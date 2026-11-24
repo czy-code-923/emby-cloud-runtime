@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <title>见微 Emby · 微光镜头</title>
+  <defs>
+    <linearGradient id="jw" x1="20" y1="12" x2="112" y2="120" gradientUnits="userSpaceOnUse"><stop stop-color="#173f4a"/><stop offset="1" stop-color="#102532"/></linearGradient>
+    <linearGradient id="light" x1="30" y1="29" x2="99" y2="94" gradientUnits="userSpaceOnUse"><stop stop-color="#d6f7ed"/><stop offset="1" stop-color="#75cbb8"/></linearGradient>
+  </defs>
+  <rect x="2" y="2" width="124" height="124" rx="30" fill="url(#jw)"/>
+  <rect x="2.5" y="2.5" width="123" height="123" rx="29.5" stroke="#b6e4d8" stroke-opacity=".18"/>
+  <path d="M91 38a39 39 0 1 0 6 44" stroke="url(#light)" stroke-width="9" stroke-linecap="round"/>
+  <path d="m55 45 30 19-30 19V45Z" fill="url(#light)"/>
+  <path d="m96 22 3.7 10.3L110 36l-10.3 3.7L96 50l-3.7-10.3L82 36l10.3-3.7L96 22Z" fill="#e9ce91"/>
+</svg>

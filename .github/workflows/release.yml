@@ -49,13 +49,15 @@ jobs:
           done
           [[ "$code" == 403 ]]
           [[ $(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Origin: http://127.0.0.1:13000' http://127.0.0.1:13000/api/v2/auth/logout) != 403 ]]
+      - name: Verify actual TLS and public entrance isolation
+        run: python3 tests/network_integration.py
       - name: Core database, configuration and authentication tests
         working-directory: upstream/twilight
         run: |
           go mod verify
           go vet ./...
           python3 scripts/check-frontend-v2-coverage.py
-          go test -p 1 ./internal/config ./internal/security ./internal/store ./internal/api -run 'Test.*(Setup|Login|Session|Config|TwoFactor|Register|Password|DeploymentUpdate|Invite|RegCode|Regcode|PublicBaseURL)' -count=1 -timeout=25m
+          go test -p 1 ./internal/config ./internal/security ./internal/store ./internal/api -run 'Test.*(Setup|Login|Session|Config|TwoFactor|Register|Password|DeploymentUpdate|Invite|RegCode|Regcode|PublicBaseURL|Jianwei|MiniApp)' -count=1 -timeout=25m
   images:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -88,8 +90,8 @@ jobs:
             echo 'Refusing to replace an already published release; increment VERSION.'
             exit 1
           fi
-          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --draft --target "$GITHUB_SHA" --title "v$version · 安装与面板升级版" --notes-file docs/release-notes.md
-          gh release edit "v$version" --draft=true --target "$GITHUB_SHA" --title "v$version · 安装与面板升级版" --notes-file docs/release-notes.md
+          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --draft --target "$GITHUB_SHA" --title "v$version · 见微 Emby 正式版本" --notes-file docs/release-notes.md
+          gh release edit "v$version" --draft=true --target "$GITHUB_SHA" --title "v$version · 见微 Emby 正式版本" --notes-file docs/release-notes.md
           gh release upload "v$version" dist/* --clobber
   publish:
     needs: [verify, images]

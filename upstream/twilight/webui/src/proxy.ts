@@ -32,7 +32,7 @@ import { buildContentSecurityPolicy } from "@/lib/csp";
  */
 
 export function proxy(request: NextRequest) {
-  const csp = buildContentSecurityPolicy({
+  let csp = buildContentSecurityPolicy({
     isDev: process.env.NODE_ENV !== "production",
     requestOrigin: request.nextUrl.origin,
     apiUrl: process.env.NEXT_PUBLIC_API_URL,
@@ -45,6 +45,8 @@ export function proxy(request: NextRequest) {
       process.env.NEXT_PUBLIC_LANDING_ICON,
     ].filter(Boolean).join(" "),
   });
+  const miniApp = request.nextUrl.pathname === "/miniapp";
+  if (miniApp) csp = csp.replace("script-src 'self'", "script-src 'self' https://telegram.org").replace("frame-ancestors 'none'", "frame-ancestors https://web.telegram.org https://*.telegram.org https://t.me");
   const response = NextResponse.next();
   response.headers.set("Content-Security-Policy", csp);
   return response;

@@ -6,7 +6,7 @@
     @foreign_origin {
         method POST PUT PATCH DELETE
         header Origin *
-        not header_regexp Origin `^http://(localhost|127\.0\.0\.1):13000$`
+        not header Origin http://localhost:13000 http://127.0.0.1:13000 {$PUBLIC_SITE_ORIGIN:https://disabled.invalid} {$PUBLIC_SHOP_ORIGIN:https://disabled.invalid}
     }
     route {
         respond @foreign_origin "Untrusted origin" 403

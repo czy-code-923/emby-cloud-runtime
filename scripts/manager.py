@@ -122,6 +122,24 @@ class Manager:
         self.latest = None
         self.checked_at = 0.0
         self.guard = threading.Lock()
+        self._network = None
+
+    def network(self):
+        with self.guard:
+            if self._network is None:
+                import sys
+                sys.path.insert(0,str(self.root/'scripts'))
+                from network import Network
+                self._network=Network(self)
+        return self._network
+
+    def install_network_units(self):
+        import shutil
+        for name in ['emby-cloud-certificate.service','emby-cloud-certificate.timer']:
+            source=self.root/'deploy'/name
+            if source.exists():shutil.copy2(source,Path('/etc/systemd/system')/name)
+        self.command(['systemctl','daemon-reload'])
+        self.command(['systemctl','enable','--now','emby-cloud-certificate.timer'])
 
     def command(self, args, cwd=None, env=None, timeout=1800):
         with (self.state / 'operations.log').open('a') as log:
@@ -352,7 +370,7 @@ class Manager:
         socketdir.mkdir(parents=True,exist_ok=True)
         os.chown(socketdir,0,10001)
         socketdir.chmod(0o750)
-        for name in ['emby-cloud-updater.service','emby-cloud-backup.service','emby-cloud-backup.timer']:
+        for name in ['emby-cloud-updater.service','emby-cloud-backup.service','emby-cloud-backup.timer','emby-cloud-certificate.service','emby-cloud-certificate.timer']:
             shutil.copy2(self.root/'deploy'/name, Path('/etc/systemd/system')/name)
         shutil.copy2(self.root/'deploy/emby-cloud-tmpfiles.conf', '/etc/tmpfiles.d/emby-cloud.conf')
         self.command(['systemd-tmpfiles','--create','/etc/tmpfiles.d/emby-cloud.conf'])
@@ -382,11 +400,11 @@ class Manager:
                     tty.flush()
                     if tty.readline().strip() != 'DELETE /srv/emby-cloud':
                         raise ValueError('Purge cancelled')
-            self.command(['systemctl','disable','--now','emby-cloud-updater.service','emby-cloud-backup.timer'],timeout=60)
-            self.command(['systemctl','stop','emby-cloud-backup.service'],timeout=120)
+            self.command(['systemctl','disable','--now','emby-cloud-updater.service','emby-cloud-backup.timer','emby-cloud-certificate.timer'],timeout=60)
+            self.command(['systemctl','stop','emby-cloud-backup.service','emby-cloud-certificate.service'],timeout=120)
             if (self.root/'images.lock.yaml').exists():
-                self.command(self.dc('--profile','cloud','--profile','source','down','--remove-orphans'))
-            for name in ['emby-cloud-updater.service','emby-cloud-backup.service','emby-cloud-backup.timer']:
+                self.command(self.dc('--profile','cloud','--profile','source','--profile','tls','down','--remove-orphans'))
+            for name in ['emby-cloud-updater.service','emby-cloud-backup.service','emby-cloud-backup.timer','emby-cloud-certificate.service','emby-cloud-certificate.timer']:
                 (Path('/etc/systemd/system')/name).unlink(missing_ok=True)
             Path('/etc/tmpfiles.d/emby-cloud.conf').unlink(missing_ok=True)
             self.command(['systemctl','daemon-reload'])
@@ -428,12 +446,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if uid not in {0,10001}:
             return self.respond(403,{'error':'Forbidden peer'})
         try:
+            if self.command=='GET' and self.path=='/network/status':
+                return self.respond(200,self.server.manager.network().status())
             if self.command=='GET' and self.path=='/status':
                 return self.respond(200,self.server.manager.status())
             length=int(self.headers.get('Content-Length','0'))
             if self.headers.get('Transfer-Encoding') or not 0 <= length <= 4096:
                 return self.respond(400,{'error':'Invalid body'})
             body=json.loads(self.rfile.read(length) or b'{}')
+            if self.command=='POST' and self.path=='/network/configure':
+                return self.respond(200,self.server.manager.network().configure(body))
+            if self.command=='POST' and self.path in {'/network/issue','/network/renew','/network/publish'} and set(body)=={'profile','expected_revision'}:
+                return self.respond(202,self.server.manager.network().start(self.path.rsplit('/',1)[1],body['profile'],body['expected_revision']))
             if self.command=='POST' and self.path=='/check':
                 return self.respond(200,self.server.manager.check())
             if self.command=='POST' and self.path=='/apply' and set(body)=={'tag','expected_version'}:
@@ -450,7 +474,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('action',choices=['install','upgrade','uninstall','serve','status'])
+    parser.add_argument('action',choices=['install','upgrade','uninstall','serve','status','certificate-renew'])
     parser.add_argument('--version')
     parser.add_argument('--purge',action='store_true')
     parser.add_argument('--yes-delete-data',action='store_true')
@@ -459,7 +483,17 @@ def main():
         raise SystemExit('Run as root')
     os.umask(0o077)
     manager=Manager()
+    if args.action=='certificate-renew':
+        succeeded=True
+        for profile in ['account','shop']:
+            if manager.network().read('desired-'+profile+'.json') or manager.network().read('applied-'+profile+'.json'):
+                succeeded=manager.network().run('renew',profile) and succeeded
+        if not succeeded:raise SystemExit(1)
+        return
     if args.action=='serve':
+        if (manager.root/'deploy/emby-cloud-certificate.timer').exists():
+            manager.install_network_units()
+            manager.network().recover()
         if read_json(manager.status_file,{}).get('phase') in {'queued','download','backup','applying','checking','rollback'}:
             manager.progress('interrupted',error='Updater restarted before completion; inspect current health and retry')
         SOCKET.parent.mkdir(parents=True,exist_ok=True)

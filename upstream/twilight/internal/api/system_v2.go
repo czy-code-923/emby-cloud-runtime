@@ -9,7 +9,7 @@ import (
 // handleV2SystemInfo exposes only the public system projection needed by the
 // setup and shell pages. Configuration secrets, upstream addresses and
 // dependency diagnostics stay behind their dedicated admin resources.
-func (a *App) handleV2SystemInfo(w http.ResponseWriter, _ *http.Request, _ Params) {
+func (a *App) handleV2SystemInfo(w http.ResponseWriter, r *http.Request, _ Params) {
 	cfg := a.cfg()
 	features := map[string]bool{
 		"register":                      cfg.RegisterEnabled,
@@ -46,15 +46,18 @@ func (a *App) handleV2SystemInfo(w http.ResponseWriter, _ *http.Request, _ Param
 		"ticket_image_max_count": cfg.TicketImageMaxCount,
 	}
 	ok(w, "OK", map[string]any{
-		"name":                cfg.AppName,
-		"public_base_url":     cfg.PublicBaseURL,
-		"icon":                a.publicServerIconURL(),
-		"auth_background_url": publicAuthBackgroundURL(cfg.AuthBackgroundURL),
-		"version":             cfg.Version,
-		"api_version":         "v2",
-		"features":            features,
-		"limits":              limits,
-		"setup":               a.setupStatusData(),
+		"name":                    cfg.AppName,
+		"public_base_url":         cfg.PublicBaseURL,
+		"icon":                    a.publicServerIconURL(),
+		"auth_background_url":     publicAuthBackgroundURL(cfg.AuthBackgroundURL),
+		"version":                 cfg.Version,
+		"api_version":             "v2",
+		"features":                features,
+		"limits":                  limits,
+		"setup":                   a.setupStatusData(),
+		"telegram_bot":            a.publicTelegramBotInfo(r.Context()),
+		"telegram_links":          publicTelegramLinks(cfg.TelegramGroupIDs, cfg.TelegramChannelIDs),
+		"required_telegram_links": publicTelegramLinks(requiredTelegramLinkIDs(cfg.TelegramGroupIDs, cfg.TelegramForceBindGroup), requiredTelegramLinkIDs(cfg.TelegramChannelIDs, cfg.TelegramForceBindChannel)),
 	})
 }
 

@@ -92,6 +92,7 @@ const DefaultLoginNotifyEmailBodyTemplate = `你的账号 {username} 于 {time} 
 type Config struct {
 	AppName                       string
 	PublicBaseURL                 string
+	CommerceStoreURL              string
 	Version                       string
 	Host                          string
 	Port                          int
@@ -166,6 +167,8 @@ type Config struct {
 	EmbyWhitelistURLList           []Line
 	EmbyPublicURL                  string
 	EmbyWhitelistURL               string
+	TelegramAutoProvision          bool
+	TelegramMiniAppURL             string
 	TelegramMode                   bool
 	TelegramLoginEnabled           bool
 	TwoFactorEnrollmentEnabled     bool
@@ -411,6 +414,7 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	}
 	cfg.AppName = reader.stringValue(cfg.AppName, "Global.server_name", "server_name")
 	cfg.PublicBaseURL = reader.stringValue(cfg.PublicBaseURL, "Global.public_base_url")
+	cfg.CommerceStoreURL = reader.stringValue(cfg.CommerceStoreURL, "Global.commerce_store_url")
 	cfg.ServerIcon = reader.stringValue(cfg.ServerIcon, "Global.server_icon", "server_icon")
 	cfg.RedisURL = reader.stringValue(cfg.RedisURL, "Global.redis_url", "redis_url")
 	cfg.LogLevel = normalizeLogLevel(reader.stringValue(cfg.LogLevel, "Global.log_level", "log_level"))
@@ -462,6 +466,8 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	cfg.EmbyWhitelistURL = reader.stringValue(cfg.EmbyWhitelistURL, "Emby.emby_whitelist_url", "emby_whitelist_url")
 	cfg.EmbyURLList = parseLinesList(reader.stringListValue(nil, "Emby.emby_url_list", "emby_url_list"))
 	cfg.EmbyWhitelistURLList = parseLinesList(reader.stringListValue(nil, "Emby.emby_url_list_for_whitelist", "emby_url_list_for_whitelist"))
+	cfg.TelegramAutoProvision = reader.boolValue(cfg.TelegramAutoProvision, "Telegram.auto_provision")
+	cfg.TelegramMiniAppURL = reader.stringValue(cfg.TelegramMiniAppURL, "Telegram.mini_app_url")
 	cfg.TelegramMode = reader.boolValue(cfg.TelegramMode, "Global.telegram_mode", "telegram_mode")
 	cfg.TwoFactorEnrollmentEnabled = reader.boolValue(cfg.TwoFactorEnrollmentEnabled, "Security.two_factor_enrollment_enabled")
 	cfg.TwoFactorKey = reader.stringValue(cfg.TwoFactorKey, "Security.two_factor_key")
@@ -681,6 +687,18 @@ func loadConfig(path string, overrides bool) (Config, error) {
 		return Config{}, err
 	}
 	cfg.PublicBaseURL = publicURL
+	storeURL, err := NormalizePublicBaseURL(cfg.CommerceStoreURL)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CommerceStoreURL = storeURL
+	if storeURL != "" && publicURL != "" {
+		shopHost, _ := url.Parse(storeURL)
+		accountHost, _ := url.Parse(publicURL)
+		if shopHost.Hostname() == accountHost.Hostname() {
+			return Config{}, fmt.Errorf("购买网站与Mini App需要不同域名")
+		}
+	}
 	return cfg, nil
 }
 

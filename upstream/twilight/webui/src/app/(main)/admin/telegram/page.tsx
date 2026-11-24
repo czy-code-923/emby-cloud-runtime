@@ -1,5 +1,7 @@
 "use client";
 
+import {Input} from "@/components/ui/input";
+import {Label} from "@/components/ui/label";
 import Link from "next/link";
 import {
   AlertTriangle,
@@ -21,7 +23,8 @@ import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
 import { api } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
-import { useState } from "react";
+import { useState,useCallback } from "react";
+import { useAsyncResource } from "@/hooks/use-async-resource";
 
 type BotTestResult = {
   target: string;
@@ -41,7 +44,7 @@ type BotRuntime = {
 };
 
 const TELEGRAM_BASE_FIELDS = [
-  "bot_token", "telegram_api_url", "login_enabled", "admin_id", "group_id", "channel_id",
+  "auto_provision", "mini_app_url", "bot_token", "telegram_api_url", "login_enabled", "admin_id", "group_id", "channel_id",
   "force_subscribe", "force_bind_group", "force_bind_channel", "require_group_membership",
   "group_check_concurrency", "group_action_concurrency", "membership_breaker_percent", "membership_breaker_max",
   "ban_on_leave", "auto_enable_rejoined", "enable_tg_panel", "parse_mode",
@@ -52,6 +55,11 @@ const TELEGRAM_BASE_FIELDS = [
 export default function AdminTelegramPage() {
   const { toast } = useToast();
   const { t } = useI18n();
+  const identityLoad=useCallback(async(signal?:AbortSignal)=>{const response=await api.telegramIdentity(signal);if(!response.success||!response.data)throw new Error(response.message);return response.data;},[]);
+  const {data:identity,error:identityError,execute:reloadIdentity}=useAsyncResource(identityLoad,{immediate:true,throwOnError:false});
+  const [menuPassword,setMenuPassword]=useState("");
+  const [publishingMenu,setPublishingMenu]=useState(false);
+  const publishMenu=async()=>{setPublishingMenu(true);try{const response=await api.publishMiniApp(menuPassword);if(!response.success)throw new Error(response.message);toast({title:t("jianwei.menuPublished"),variant:"success"});await reloadIdentity();}catch(error){toast({title:t("common.operationFailed"),description:error instanceof Error?error.message:undefined,variant:"destructive"});}finally{setMenuPassword("");setPublishingMenu(false);}};
   const [testing, setTesting] = useState(false);
   const [botResults, setBotResults] = useState<BotTestResult[] | null>(null);
   const [botRuntime, setBotRuntime] = useState<BotRuntime | null>(null);
@@ -87,6 +95,10 @@ export default function AdminTelegramPage() {
         </div>
       </div>
 
+      <Card><CardContent className="space-y-3 p-5"><div className="flex flex-wrap justify-between gap-3"><h2 className="text-lg font-semibold">{t("jianwei.botIdentity")}</h2><Button variant="outline" onClick={()=>void reloadIdentity()}>{t("common.refresh")}</Button></div>
+        {identityError?<p role="alert">{identityError}</p>:<><p className="font-medium">{identity?.bot.username?`@${identity.bot.username}`:identity?.bot.configured?t("jianwei.verifyPending"):t("jianwei.noBotToken")}</p><div className="flex flex-wrap gap-2"><Badge variant="outline">{identity?.bot.configured?t("jianwei.tokenSaved"):t("jianwei.noBotToken")}</Badge><Badge variant={identity?.bot.ok?"success":"secondary"}>{identity?.bot.ok?t("jianwei.identityVerified"):t("jianwei.verifyPending")}</Badge><Badge variant={identity?.runtime.polling?"success":"secondary"}>{identity?.runtime.polling?t("jianwei.polling"):t("jianwei.pollingStopped")}</Badge></div><p className="text-sm text-muted-foreground">{t("jianwei.autoBindHint")}</p></>}
+        <div className="space-y-3 border-t pt-4"><p className="text-sm text-muted-foreground">{t("jianwei.menuHint")}</p><p className="break-all text-sm">{identity?.mini_app_url||t("jianwei.menuNotPublished")}</p><Label htmlFor="menu-password">{t("network.currentPassword")}</Label><div className="flex flex-col gap-3 sm:flex-row"><Input id="menu-password" type="password" autoComplete="current-password" value={menuPassword} onChange={event=>setMenuPassword(event.target.value)} disabled={publishingMenu}/><Button disabled={publishingMenu||!menuPassword||!identity?.bot.ok} onClick={()=>void publishMenu()}>{t("jianwei.publishMenu")}</Button></div></div>
+      </CardContent></Card>
       <Card>
         <CardContent className="space-y-4 p-4">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">

@@ -7,6 +7,15 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodPost, "/api/v2/admin/telegram/miniapp/publish", AuthAdmin, a.handlePublishMiniApp)
+	a.add(http.MethodGet, "/api/v2/admin/network/status", AuthAdmin, a.handleNetworkStatus)
+	a.add(http.MethodPost, "/api/v2/admin/network/configure", AuthAdmin, a.handleNetworkAction)
+	a.add(http.MethodPost, "/api/v2/admin/network/issue", AuthAdmin, a.handleNetworkAction)
+	a.add(http.MethodPost, "/api/v2/admin/network/renew", AuthAdmin, a.handleNetworkAction)
+	a.add(http.MethodPost, "/api/v2/admin/network/publish", AuthAdmin, a.handleNetworkAction)
+	a.add(http.MethodGet, "/api/v2/admin/telegram/identity", AuthAdmin, a.handleJianweiTelegramIdentity)
+	a.add(http.MethodPost, "/api/v2/miniapp/session", AuthPublic, a.handleMiniSession)
+	a.add(http.MethodGet, "/api/v2/miniapp/account", AuthPublic, a.handleMiniAccount)
 	a.add(http.MethodGet, "/api/v2/admin/deployment/status", AuthAdmin, a.handleDeploymentUpdate)
 	a.add(http.MethodPost, "/api/v2/admin/deployment/check", AuthAdmin, a.handleDeploymentCheck)
 	a.add(http.MethodPost, "/api/v2/admin/deployment/apply", AuthAdmin, a.handleDeploymentApply)

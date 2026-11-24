@@ -619,6 +619,10 @@ CREATE TABLE IF NOT EXISTS twilight_playback_daily (
 		_ = db.Close()
 		return nil, status, err
 	}
+	if err := ensureJianweiIdentitySchema(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, status, err
+	}
 	status.SchemaReady = true
 	return db, status, nil
 }

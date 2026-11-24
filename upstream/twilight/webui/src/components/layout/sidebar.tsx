@@ -299,7 +299,7 @@ export function Sidebar() {
                 {visibleAdminNavGroups.map((group) => (
                   <Fragment key={group.category || "account"}>
                     {group.category && (
-                      <p className="px-3 pb-1 pt-3 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/50">
+                      <p className="px-3 pb-1 pt-3 text-xs font-medium tracking-wide text-muted-foreground">
                         {adminCategoryLabelKeys[group.category]
                           ? t(adminCategoryLabelKeys[group.category])
                           : group.category}

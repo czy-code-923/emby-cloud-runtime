@@ -63,12 +63,25 @@ services:
       NODE_OPTIONS: --max-old-space-size=128
     depends_on:
       backend: {condition: service_healthy}
+  edge:
+    <<: *common
+    profiles: [tls]
+    image: ${EDGE_IMAGE:-caddy:2-alpine}
+    network_mode: host
+    mem_limit: 64m
+    pids_limit: 64
+    volumes:
+      - ./runtime/network/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./runtime/network/letsencrypt:/etc/letsencrypt:ro
   gateway:
     <<: *common
     image: caddy:2-alpine
     mem_limit: 64m
     pids_limit: 64
     ports: ["127.0.0.1:13000:8080"]
+    environment:
+      PUBLIC_SITE_ORIGIN: ${PUBLIC_SITE_ORIGIN:-https://disabled.invalid}
+      PUBLIC_SHOP_ORIGIN: ${PUBLIC_SHOP_ORIGIN:-https://disabled.invalid}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./docs:/srv/deployment:ro

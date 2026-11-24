@@ -1536,7 +1536,7 @@ func (a *App) publicTelegramBotInfo(ctx context.Context) map[string]any {
 // 不能因为 /system/info 刚好撞上一次 1.5 秒超时，就让 deep link 退化成手动命令。
 func (a *App) telegramBotInfo(ctx context.Context, timeout time.Duration, retryFailed bool) map[string]any {
 	empty := map[string]any{"username": nil, "url": nil, "enabled": a.cfg().TelegramMode, "configured": strings.TrimSpace(a.cfg().TelegramBotToken) != "", "ok": false, "error": ""}
-	if !a.telegramAvailable() {
+	if strings.TrimSpace(a.cfg().TelegramBotToken) == "" {
 		empty["error"] = "Telegram 未启用或未配置 Bot Token"
 		return empty
 	}
@@ -1545,6 +1545,7 @@ func (a *App) telegramBotInfo(ctx context.Context, timeout time.Duration, retryF
 	a.telegramBotMu.Lock()
 	if a.telegramBotCacheKey == cacheKey && now.Before(a.telegramBotCacheUntil) && a.telegramBotCache != nil {
 		cached := cloneMap(a.telegramBotCache)
+		cached["enabled"] = a.cfg().TelegramMode
 		a.telegramBotMu.Unlock()
 		if ok, _ := cached["ok"].(bool); ok || !retryFailed {
 			return cached
@@ -1563,7 +1564,7 @@ func (a *App) telegramBotInfo(ctx context.Context, timeout time.Duration, retryF
 			bot = map[string]any{"username": username, "url": "https://t.me/" + username, "enabled": a.cfg().TelegramMode, "configured": true, "ok": true, "error": ""}
 		}
 	} else {
-		bot["error"] = err.Error()
+		bot["error"] = "无法验证机器人身份，请检查Token及网络连接"
 	}
 
 	a.telegramBotMu.Lock()
@@ -1670,6 +1671,9 @@ func (a *App) handleServerIcon(w http.ResponseWriter, r *http.Request, _ Params)
 // 仅为兼容回退保留。
 func (a *App) publicServerIconURL() string {
 	value := strings.TrimSpace(a.cfg().ServerIcon)
+	if value == "/brand/jianwei-mark.svg" {
+		return value
+	}
 	if value == "" {
 		return "/api/v2/system/server-icon"
 	}
