@@ -201,7 +201,7 @@ func (a *App) handleMiniSession(w http.ResponseWriter, r *http.Request, _ Params
 	mac := hmac.New(sha256.New, []byte(a.cfg().TelegramBotToken))
 	mac.Write([]byte("jw-mini-session|" + proof + "|" + nonce))
 	token := hex.EncodeToString(mac.Sum(nil))
-	if err = a.store().CreateMiniSession(r.Context(), user.UID, proof, nonce, a.cfg().TelegramBotToken, token, time.Now().Unix()); err != nil {
+	if err = a.store().CreateMiniSession(r.Context(), user.UID, actor.ID, proof, nonce, a.cfg().TelegramBotToken, token, time.Now().Unix()); err != nil {
 		fail(w, 409, "启动凭据已使用，请从机器人重新打开面板")
 		return
 	}
