@@ -4,6 +4,10 @@
 
 ## 已通过
 
+- 2026-11-24，v0.3.0的[CI](https://github.com/czy-code-923/emby-cloud-runtime/actions/runs/45310144778)三项作业全部成功，包含新增域名配置验证、邀请/卡码与鉴权PostgreSQL回归、前端原生邀请契约、schema字段交叉检查和完整安装/回退/卸载演练。9项Release资产的发布摘要与校验清单一致，全量源码包SHA-256验证通过，1471个源码文件未检出本次受保护部署凭据。
+- dmit-pro通过面板原生升级接口由0.2.2升至0.3.0，任务`succeeded`且健康检查通过；管理员登录和数据库正常，原Owner保留。当前/最新均0.3.0，`available=false`。新schema存在`Global.public_base_url`，域名仍为空；没有替管理员发布域名或启用Bot。
+- 浏览器实测邀请管理正常显示用户行、统计和详情；个人邀请中心可读取本人关系，Telegram页面已显示Bot收件、Token和扫码登录等真实字段。未向Telegram发送测试消息，未在生产创建/删除测试用户或卡码。
+
 - v0.2.2正式版本的 [CI运行](https://github.com/czy-code-923/emby-cloud-runtime/actions/runs/45198020748) 全部通过：Go静态检查与鉴权/配置/升级测试、前端构建、固定操作代理、包校验、临时环境安装、保留数据升级、健康故障回退、保留数据卸载/重装、显式清理及无关容器保留。全量源码包、Linux amd64分发包、前后端镜像和校验清单已公开发布。
 - dmit-pro先通过公开一键安装入口从alpha.3迁移到v0.2.1，再通过管理后台使用的原生鉴权升级接口实际应用v0.2.2；管理员密码复核通过，任务最终为`succeeded`，当前/最新正式版本均为0.2.2，检查结果`available=false`。浏览器观察到确认表单、下载阶段、自动重连及升级完成状态。
 - v0.2.2实机再次执行`python3 scripts/check.py`结果`passed=true`：六项服务运行，三个HTTP入口200，未出现OOM与异常重启；原Owner可登录、配置与数据库保留。补装新增tmpfiles配置并重启升级执行器后，后台版本状态/检查接口仍为200；升级服务和备份定时器均为active，原python3:80和sing-box:8080监听保留。
