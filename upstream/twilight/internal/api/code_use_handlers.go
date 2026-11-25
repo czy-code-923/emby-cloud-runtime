@@ -27,6 +27,18 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 	}
 	payload := decodeMap(r)
 	code := firstNonEmpty(stringValue(payload, "reg_code"), stringValue(payload, "code"))
+	if strings.HasPrefix(strings.ToUpper(code), "JW-P-") {
+		var err error
+		code, err = a.shopDigest("code", strings.ToUpper(code))
+		if err != nil {
+			fail(w, 503, "卡码验证暂不可用")
+			return
+		}
+	} else if stored, exists := a.store().RegCode(code); exists && stored.Source == "commerce" {
+		// An internal digest returned to administrators is not a bearer code.
+		failWithCode(w, http.StatusBadRequest, ErrCodeInvalid, "请使用订单页面交付的完整卡码")
+		return
+	}
 	if code == "" {
 		failWithCode(w, http.StatusBadRequest, ErrCodeEmpty, "卡码不能为空")
 		return

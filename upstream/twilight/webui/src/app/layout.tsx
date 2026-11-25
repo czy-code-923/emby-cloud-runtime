@@ -4,6 +4,7 @@ import { GeistMono } from "geist/font/mono";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ThemeInit } from "@/components/theme-init";
 import { BootstrapLoader } from "@/components/bootstrap-loader";
+import { BrandSync } from "@/components/brand-sync";
 import { TwoFactorRecoveryDisplay } from "@/components/two-factor-recovery";
 import { Toaster } from "@/components/ui/toaster";
 import { ConfirmDialogProvider } from "@/components/ui/confirm-dialog";
@@ -91,6 +92,7 @@ export default function RootLayout({
       <body
         className={`${GeistSans.variable} ${GeistMono.variable} font-sans antialiased`}
       >
+        <BrandSync />
         <style>{`#bootstrap-loader{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:var(--background,#09090b);transition:opacity .25s}#bootstrap-loader.hidden{opacity:0;pointer-events:none}.bootstrap-spinner{width:28px;height:28px;border:3px solid rgba(255,255,255,.1);border-top-color:#64748b;border-radius:50%;animation:bootstrap-spin .8s linear infinite}@keyframes bootstrap-spin{to{transform:rotate(360deg)}}`}</style>
         <div id="bootstrap-loader"><div className="bootstrap-spinner" /></div>
         <BootstrapLoader />

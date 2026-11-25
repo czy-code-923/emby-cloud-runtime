@@ -7,6 +7,20 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodGet, "/api/v2/miniapp/announcements", AuthPublic, a.miniMember(a.handleMemberAnnouncements))
+	a.add(http.MethodGet, "/api/v2/miniapp/rank", AuthPublic, a.miniMember(a.handleMemberRank))
+	a.add(http.MethodGet, "/api/v2/miniapp/favorites", AuthPublic, a.miniMember(a.handleMemberLibrary))
+	a.add(http.MethodGet, "/api/v2/miniapp/library", AuthPublic, a.miniMember(a.handleMemberLibrary))
+	a.add(http.MethodPost, "/api/v2/miniapp/favorite", AuthPublic, a.miniMember(a.handleMemberFavorite))
+	a.add(http.MethodGet, "/api/v2/commerce/catalog", AuthPublic, a.handleShopCatalog)
+	a.add(http.MethodPost, "/api/v2/commerce/login", AuthPublic, a.handleShopLogin)
+	a.add(http.MethodPost, "/api/v2/commerce/logout", AuthPublic, a.handleShopLogout)
+	a.add(http.MethodGet, "/api/v2/commerce/orders", AuthPublic, a.shopMember(a.handleShopOrders))
+	a.add(http.MethodPost, "/api/v2/commerce/orders", AuthPublic, a.shopMember(a.handleShopOrderCreate))
+	a.add(http.MethodPost, "/api/v2/commerce/orders/:order_id/payment", AuthPublic, a.shopMember(a.handleShopPaymentSubmit))
+	a.add(http.MethodGet, "/api/v2/admin/commerce", AuthAdmin, a.handleAdminShop)
+	a.add(http.MethodPut, "/api/v2/admin/commerce", AuthAdmin, a.handleAdminShopConfig)
+	a.add(http.MethodPost, "/api/v2/admin/commerce/orders/:order_id/review", AuthAdmin, a.handleAdminShopReview)
 	a.add(http.MethodGet, "/api/v2/internal/emby-access", AuthPublic, a.handleMediaGatewayAccess)
 	a.add(http.MethodGet, "/api/v2/miniapp/device-registry", AuthPublic, a.miniMember(a.handleMemberDeviceRegistry))
 	a.add(http.MethodPost, "/api/v2/miniapp/device-release", AuthPublic, a.miniMember(a.handleMemberReleaseDevice))

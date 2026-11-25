@@ -87,6 +87,7 @@ var telegramAllowedUpdates = [4]string{"message", "callback_query", "chat_member
 
 func telegramPostResult[T any](a *App, ctx context.Context, method string, body any, timeout time.Duration) (T, error) {
 	var zero T
+	method, body = a.memberPanelEdit(ctx, method, body)
 	if !a.telegramAvailable() {
 		return zero, fmt.Errorf("Telegram is not enabled or bot token is not configured")
 	}
@@ -95,6 +96,9 @@ func telegramPostResult[T any](a *App, ctx context.Context, method string, body 
 		return zero, fmt.Errorf("%s", a.telegramSanitizeError(err))
 	}
 	result, err := telegramPostResultToEndpoint[T](ctx, endpoint, method, body, timeout)
+	if method == "editMessageText" && err != nil && strings.Contains(strings.ToLower(err.Error()), "message is not modified") {
+		return zero, nil
+	}
 	if err != nil {
 		return zero, fmt.Errorf("%s", a.telegramSanitizeError(err))
 	}

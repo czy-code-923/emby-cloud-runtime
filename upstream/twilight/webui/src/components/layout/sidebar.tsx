@@ -77,6 +77,7 @@ export const adminNavItems: SidebarNavItem[] = [
   { href: "/admin", labelKey: "navigation.adminHome", icon: LayoutDashboard },
   { href: "/admin/users", labelKey: "navigation.users", icon: Users },
   { href: "/admin/regcodes", labelKey: "navigation.regcodes", icon: FileText },
+  { href: "/admin/commerce", labelKey: "commerce.adminTitle", icon: Coins },
   { href: "/admin/invite", labelKey: "navigation.inviteForest", icon: Network },
 
   { href: "/admin/emby", labelKey: "navigation.embyAdmin", icon: Server, category: "service" },
@@ -219,7 +220,7 @@ export function Sidebar() {
 
   const displaySiteName = systemInfo?.name || SITE_NAME;
   const envIcon = process.env.NEXT_PUBLIC_AUTH_ICON_URL?.trim();
-  const safeSystemIcon = useMemo(() => sanitizeImageUrl(envIcon || systemInfo?.icon), [envIcon, systemInfo?.icon]);
+  const safeSystemIcon = useMemo(() => sanitizeImageUrl(systemInfo?.icon || envIcon), [envIcon, systemInfo?.icon]);
   const safeProfileAvatar = useMemo(() => sanitizeImageUrl(profileAvatar), [profileAvatar]);
   const visibleUserNavItems = useMemo(
     () => filterNavItems(userNavItems, systemInfo?.features, isAdmin),

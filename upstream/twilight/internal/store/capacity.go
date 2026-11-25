@@ -11,6 +11,7 @@ var ErrEmbyCapacityReached = errors.New("emby capacity reached")
 
 // EmbyOccupancyOptions 描述一次 Emby 名额占用统计的口径。
 type EmbyOccupancyOptions struct {
+	ExcludeShopOrder string
 	// ExcludeUID 不计入统计的用户（通常是本次正在开通的用户本人）。
 	ExcludeUID int64
 	// ExcludeRegCode 本次将消费的注册码（锁外预检，尚未消费）：只从它的剩余名额里扣 1。
@@ -53,6 +54,14 @@ func (s *Store) embyOccupancyLocked(opt EmbyOccupancyOptions) int {
 		}
 	}
 	now := time.Now().Unix()
+	for id, order := range s.state.ShopOrders {
+		if id != opt.ExcludeShopOrder && order.Product.Kind == 1 && orderReserves(order, now) {
+			if u, ok := s.state.Users[order.UID]; ok && order.UID != opt.ExcludeUID && opt.CountActiveUsers && u.Active {
+				continue
+			}
+			current++
+		}
+	}
 	for _, code := range s.state.RegCodes {
 		if !code.Active || code.IsDecoy || RegCodeExpired(code, now) {
 			continue
@@ -61,6 +70,11 @@ func (s *Store) embyOccupancyLocked(opt EmbyOccupancyOptions) int {
 			continue
 		}
 		slots := remainingRegCodeSlots(code.UseCount, code.UseCountLimit)
+		if code.Source == "commerce" && code.TargetUID != opt.ExcludeUID && opt.CountActiveUsers {
+			if u, ok := s.state.Users[code.TargetUID]; ok && u.Active {
+				continue
+			}
+		}
 		// 本次消费只占用该码 1 个名额：仅扣减 1，而非把整码剩余名额全部排除。
 		if opt.ExcludeRegCode != "" && strings.EqualFold(code.Code, opt.ExcludeRegCode) && slots > 0 {
 			slots--

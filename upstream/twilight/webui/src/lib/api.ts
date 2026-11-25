@@ -1,3 +1,4 @@
+import type {ShopCatalog,ShopOrders,ShopOrder,ShopSettings,AdminShop} from "./commerce-types";
 import type {
   MiniAccount,
   AdminUserListParams,
@@ -3320,6 +3321,25 @@ class ApiClient {
   async miniAccount(signal?: AbortSignal) {
     return this.request<MiniAccount>("/miniapp/account",{signal,cache:"no-store"},{cacheRead:false,dedupe:false,apiVersion:"v2"});
   }
+  async shopCatalog(signal?:AbortSignal){return this.request<ShopCatalog>("/commerce/catalog",{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniBrowse<T>(section:"announcements"|"rank"|"favorites"|"library",page=1,q="",signal?:AbortSignal){
+    const query=new URLSearchParams({page:String(page),q});const options={signal,cache:"no-store" as const};const extra={apiVersion:"v2" as const,cacheRead:false,dedupe:false};
+    switch(section){
+      case "announcements":return this.request<T>(`/miniapp/announcements?${query}`,options,extra);
+      case "rank":return this.request<T>("/miniapp/rank",options,extra);
+      case "favorites":return this.request<T>(`/miniapp/favorites?${query}`,options,extra);
+      case "library":return this.request<T>(`/miniapp/library?${query}`,options,extra);
+    }
+  }
+  async miniFavorite(item_id:string,favorite:boolean){return this.request("/miniapp/favorite",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"miniapp-action"},body:JSON.stringify({item_id,favorite})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async shopOrders(page=1,signal?:AbortSignal){return this.request<ShopOrders>(`/commerce/orders?page=${page}`,{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async shopLogin(code:string){return this.request("/commerce/login",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-action"},body:JSON.stringify({code})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async shopLogout(){return this.request("/commerce/logout",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-action"},body:"{}"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async shopCreate(product_id:string,revision:number,request_key:string){return this.request<ShopOrder>("/commerce/orders",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-action"},body:JSON.stringify({product_id,revision,request_key})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async shopPayment(id:string,note:string,cancel=false){return this.request<ShopOrder>(`/commerce/orders/${encodeURIComponent(id)}/payment`,{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-action"},body:JSON.stringify({note,cancel})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async adminShop(page=1,signal?:AbortSignal){return this.request<AdminShop>(`/admin/commerce?page=${page}`,{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async saveShop(settings:ShopSettings,password:string){return this.request("/admin/commerce",{method:"PUT",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-admin"},body:JSON.stringify({settings,revision:settings.revision,password})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async reviewShop(id:string,payload:Record<string,unknown>){return this.request<ShopOrder>(`/admin/commerce/orders/${encodeURIComponent(id)}/review`,{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-admin"},body:JSON.stringify(payload)},{apiVersion:"v2",cacheRead:false,dedupe:false});}
 
   async miniRead<T>(section:"lines"|"devices"|"requests"|"invite"|"device-registry", signal?:AbortSignal) {
     const options={signal,cache:"no-store" as const};

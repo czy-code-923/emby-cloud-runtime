@@ -45,6 +45,15 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 	}
 	text += "<b>见微 Emby · 微光影院</b>\n小见世界，细看生活。\n\n"
 	text += "你好，" + escape(user.Username) + "\n"
+	if user.EmbyID == "" {
+		if user.PendingEmby {
+			text += "开通资格已就绪，点击「开通 Emby」设置用户名。\n\n"
+		} else {
+			text += "已建立 Telegram 身份，尚未开通 Emby。请先兑换注册码，再开通媒体账户。\n\n"
+		}
+	} else {
+		text += "欢迎回来，你的 Telegram 与 Emby 已关联。\n\n"
+	}
 	status := "等待开通"
 	if user.EmbyID != "" {
 		status = "已开通"
@@ -72,6 +81,7 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 		rows = append(rows, []map[string]any{button("✦ 每日签到", "/signin"), button("🗓 积分续期", "/renew")})
 	}
 	rows = append(rows, []map[string]any{button("📱 我的设备", "/devices"), button("🧭 播放线路", "/lines")})
+	rows = append(rows, []map[string]any{button("📌 见微公告", "/announcements"), button("♡ 我的收藏", "/favorites")}, []map[string]any{button("🔎 媒体库", "/library"), button("🏆 播放排行", "/rank")})
 	rows = append(rows, []map[string]any{button("🔐 安全码", "/security"), button("🔑 修改密码", "/password")}, []map[string]any{button("设备配额", "/device_list"), button("停用旧设备", "/device_release")})
 	if cfg.MediaRequestEnabled {
 		rows = append(rows, []map[string]any{button("🎬 求片与进度", "/request")})
@@ -84,7 +94,7 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 	}
 	if cfg.TelegramShopEnabled {
 		if target := publicHTTPSURL(cfg.CommerceStoreURL); target != "" {
-			rows = append(rows, []map[string]any{{"text": "🛍 独立发卡商店", "url": target}})
+			rows = append(rows, []map[string]any{{"text": "🛍 独立发卡商店", "url": target}, button("商店登录码", "/shopcode")})
 		}
 	}
 	if cfg.TelegramBannerEnabled {
@@ -108,8 +118,19 @@ func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegr
 		return true
 	}
 	_ = a.telegramAnswerCallbackQuery(ctx, callback.ID, "", false)
+	ctx = context.WithValue(ctx, memberPanelContextKey{}, memberPanelTarget{ChatID: callback.From.ID, MessageID: callback.Message.MessageID})
 	command := strings.TrimPrefix(callback.Data, "jw:")
 	c := telegramCommandCtx{ChatID: callback.From.ID, FromID: callback.From.ID, Username: callback.From.Username, Command: command}
+	// Only bounded read-only discovery commands may carry paging arguments.
+	parts := strings.Fields(command)
+	if len(parts) > 1 {
+		if len(callback.Data) > 64 || (parts[0] != "/announcements" && parts[0] != "/favorites" && parts[0] != "/library") || !strings.HasPrefix(parts[1], "page:") {
+			return true
+		}
+		command = parts[0]
+		c.Command = command
+		c.Args = parts[1:]
+	}
 	// Callbacks cannot dispatch admin commands, custom commands or arguments.
 	if spec, found := telegramCommandRegistry[command]; found && !spec.admin && spec.category == "user" {
 		a.telegramDispatchRegistry(ctx, command, c, true)
@@ -117,6 +138,33 @@ func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegr
 		_ = a.telegramSendMessage(ctx, c.ChatID, a.telegramHelpText(false))
 	}
 	return true
+}
+
+type memberPanelContextKey struct{}
+type memberPanelTarget struct{ ChatID, MessageID int64 }
+
+// Inline button results replace their originating private message. Commands
+// typed by the member have no target and continue to produce a normal reply.
+func (a *App) memberPanelEdit(ctx context.Context, method string, body any) (string, any) {
+	target, ok := ctx.Value(memberPanelContextKey{}).(memberPanelTarget)
+	if !ok || method != "sendMessage" || target.MessageID <= 0 {
+		return method, body
+	}
+	message, ok := body.(telegramSendMessageRequest)
+	if !ok || fmt.Sprint(message.ChatID) != fmt.Sprint(target.ChatID) {
+		return method, body
+	}
+	markup := message.ReplyMarkup
+	if markup == nil {
+		rows := [][]map[string]any{{{"text": "‹ 返回主面板", "callback_data": "jw:/panel"}}}
+		if a.cfg().TelegramShopEnabled {
+			if url := publicHTTPSURL(a.cfg().CommerceStoreURL); url != "" {
+				rows = append(rows, []map[string]any{{"text": "🛍 发卡商店 ↗", "url": url}})
+			}
+		}
+		markup = map[string]any{"inline_keyboard": rows}
+	}
+	return "editMessageText", map[string]any{"chat_id": target.ChatID, "message_id": target.MessageID, "text": message.Text, "parse_mode": message.ParseMode, "disable_web_page_preview": true, "reply_markup": markup}
 }
 
 // A bounded in-process transport reuses the existing business handlers and

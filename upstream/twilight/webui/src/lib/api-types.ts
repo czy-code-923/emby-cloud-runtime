@@ -1698,6 +1698,7 @@ export interface NetworkStatus extends NetworkProfileStatus {
 }
 
 export interface MiniAccount {
+	icon?:string; name?:string;
   uid:number; username:string; emby_username:string; media_enabled:boolean; has_emby:boolean;
   expired_at:number; points:number; signin_enabled:boolean; last_signin:string; can_register:boolean;
   security_code_set:boolean;password_email_required:boolean; invite_enabled:boolean; requests_enabled:boolean; shop_url:string; banner:string; banner_url:string; role:number;

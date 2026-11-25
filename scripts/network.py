@@ -251,7 +251,7 @@ class Network:
 '''
             else:
                 routes='/miniapp /miniapp/* /api/v2/miniapp/*' if profile=='account' else '/shop /shop/* /api/v2/commerce/*'
-                config+=' @public path '+routes+' /_next/* /brand/* /favicon* /api/v2/system/info /api/v2/system/health /api/v2/system/capabilities\n'
+                config+=' @public path '+routes+' /_next/* /brand/* /favicon* /api/v2/system/server-icon /api/v2/system/info /api/v2/system/health /api/v2/system/capabilities\n'
                 config+=' handle @public {\n  reverse_proxy 127.0.0.1:13000 {\n   header_up Host {host}\n   header_up X-Forwarded-Proto https\n   header_down Set-Cookie "^(.+)$" "$1; Secure"\n  }\n }\n'
                 config+=' redir / '+('/miniapp' if profile=='account' else '/shop')+' 302\n respond "Private or separate entrance required" 403\n'
             config+='}\n'

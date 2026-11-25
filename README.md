@@ -59,3 +59,5 @@ curl -fsSL https://raw.githubusercontent.com/czy-code-923/emby-cloud-runtime/mai
 - Emby为厂商闭源软件，使用官方镜像并遵循厂商条款，其专有源码不属于本仓库。
 
 CI在临时环境验证源码/构建、鉴权、恶意源与损坏包拒绝、安装、保留数据升级、健康失败回退、卸载/重装、显式清理和其它容器保留后，才公开发布版本。版本与依赖清单见 [source-manifest.md](docs/source-manifest.md)，实机结果见 [verification.md](docs/verification.md)，使用与恢复说明见 [operations.md](docs/operations.md)。
+
+商店与会员发现的操作和交付边界见 [v0.4.7](docs/v0.4.7-商店与会员发现.md)。

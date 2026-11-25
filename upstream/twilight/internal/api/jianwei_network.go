@@ -65,6 +65,28 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 		}
 		body = map[string]any{"domain": domain.Hostname(), "email": stringValue(payload, "email"), "cloudflare_token": stringValue(payload, "cloudflare_token"), "accept_terms": accepted, "staging": staging, "profile": profile, "expected_revision": revision}
 	case "issue", "renew", "publish":
+		if operation == "publish" && profile != "playback" {
+			snapshot, err := a.configEditSnapshot()
+			if err != nil {
+				fail(w, 503, "暂时无法读取配置版本")
+				return
+			}
+			origins := append([]string{}, a.cfg().CORSOrigins...)
+			found := false
+			for _, allowed := range origins {
+				if allowed == origin {
+					found = true
+				}
+			}
+			if !found {
+				origins = append(origins, origin)
+				_, code, message := a.patchConfigSections(snapshot.revision, map[string]any{"API": map[string]any{"cors_origins": origins}})
+				if code != http.StatusOK {
+					fail(w, code, message)
+					return
+				}
+			}
+		}
 		body = map[string]any{"profile": profile, "expected_revision": revision}
 	default:
 		fail(w, 404, "不支持的证书操作")

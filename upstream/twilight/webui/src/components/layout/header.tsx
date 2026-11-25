@@ -34,7 +34,7 @@ export function Header() {
   const mobileNavRef = useRef<HTMLElement | null>(null);
   const isAdmin = user?.role === 0;
   const envIcon = process.env.NEXT_PUBLIC_AUTH_ICON_URL?.trim();
-  const systemIcon = useMemo(() => sanitizeImageUrl(envIcon || systemInfo?.icon), [envIcon, systemInfo?.icon]);
+  const systemIcon = useMemo(() => sanitizeImageUrl(systemInfo?.icon || envIcon), [envIcon, systemInfo?.icon]);
   const displaySiteName = systemInfo?.name || "见微 Emby";
   const visibleUserNavItems = useMemo(
     () => filterNavItems(userNavItems, systemInfo?.features, isAdmin),

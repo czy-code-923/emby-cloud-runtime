@@ -121,6 +121,8 @@ type PostgresTargetStatus struct {
 }
 
 type State struct {
+	Shop                    ShopSettings                           `json:"shop,omitempty"`
+	ShopOrders              map[string]ShopOrder                   `json:"shop_orders,omitempty"`
 	TwoFactorAccounts       map[int64]TwoFactorAccount             `json:"two_factor_accounts,omitempty"` // Backup-only; runtime records live in a dedicated table.
 	NextUserID              int64                                  `json:"next_user_id"`
 	NextAPIKeyID            int64                                  `json:"next_api_key_id"`
@@ -881,6 +883,9 @@ func (s *State) ensure() {
 	if s.RegCodes == nil {
 		s.RegCodes = map[string]RegCode{}
 	}
+	if s.ShopOrders == nil {
+		s.ShopOrders = map[string]ShopOrder{}
+	}
 	if s.BindCodes == nil {
 		s.BindCodes = map[string]BindCode{}
 	}
@@ -1477,6 +1482,9 @@ func (s *Store) LoadSnapshot(data []byte, configuredKey ...string) error {
 	}
 	state.ensure()
 	if err := ValidateTwoFactorBackup(state, configuredKey...); err != nil {
+		return err
+	}
+	if err := ValidateShopBackup(state, configuredKey...); err != nil {
 		return err
 	}
 	factors := state.TwoFactorAccounts
@@ -5371,6 +5379,13 @@ func (s *Store) consumableRegCodeLocked(code string, uid, telegramID, now int64)
 	if !ok || !r.Active {
 		return RegCode{}, ErrNotFound
 	}
+	for _, order := range s.state.ShopOrders {
+		if order.CodeKey == code {
+			if order.Status != "issued" || order.RedeemedAt > 0 || order.UID != uid || r.Type != order.Product.Kind || r.Days != order.Product.Days || r.TargetUID != order.UID {
+				return RegCode{}, ErrConflict
+			}
+		}
+	}
 	if r.UseCountLimit != -1 && r.UseCount >= r.UseCountLimit {
 		return RegCode{}, ErrConflict
 	}
@@ -5410,6 +5425,17 @@ func (s *Store) consumeRegCodeLocked(r RegCode, uid, telegramID int64) RegCode {
 		r.Active = false
 	}
 	s.state.RegCodes[r.Code] = r
+	{
+		for id, order := range s.state.ShopOrders {
+			if order.CodeKey == r.Code {
+				order.CodeCipher = ""
+				order.RedeemedAt = time.Now().Unix()
+				order.UpdatedAt = time.Now().Unix()
+				order.Revision++
+				s.state.ShopOrders[id] = order
+			}
+		}
+	}
 	return r
 }
 

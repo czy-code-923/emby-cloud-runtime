@@ -323,6 +323,12 @@ func (a *App) handleTelegramUpdate(ctx context.Context, update *telegramUpdate) 
 			return
 		}
 		if command == "/start" {
+			if len(args) == 1 && strings.HasPrefix(args[0], "redeem_") {
+				if !message.From.IsBot && chatID == fromID {
+					a.telegramRedeemLink(ctx, cmdCtx, strings.TrimPrefix(args[0], "redeem_"))
+				}
+				return
+			}
 			if len(args) > 0 && strings.HasPrefix(args[0], "login_") {
 				if !message.From.IsBot && chatID == fromID {
 					a.telegramScanLogin(ctx, fromID, strings.TrimPrefix(args[0], "login_"))

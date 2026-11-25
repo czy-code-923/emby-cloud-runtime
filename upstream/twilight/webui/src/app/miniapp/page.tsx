@@ -8,10 +8,12 @@ import type { MiniAccount } from "@/lib/api-types";
 import { useAsyncResource } from "@/hooks/use-async-resource";
 import { useI18n, type MessageKey } from "@/lib/i18n";
 import styles from "./miniapp.module.css";
+import {Discovery,type DiscoverySection} from "./discovery";
+import {sanitizeImageUrl} from "@/lib/safe-url";
 import {MemberDevices} from "./member-devices";
 
 declare global { interface Window { Telegram?: {WebApp?: {initData:string;ready():void;expand():void;openLink?(url:string):void}} } }
-type Tab = "home"|"benefits"|"requests"|"account";
+type Tab = "discover"|"home"|"benefits"|"requests"|"account";
 type ReadSection = "lines"|"devices"|"requests"|"invite";
 type PanelData = {lines?:{name:string;url:string}[];whitelist_lines?:{name:string;url:string}[];items?:{id:number;title:string;status:string}[];codes?:{code:string;active:boolean;days:number}[];can_invite?:boolean;reason?:string;total?:number};
 type Device = {session_id:string;device_name:string;client:string;now_playing?:{name:string}|null};
@@ -32,6 +34,8 @@ function RemotePanel({section,revision}:{section:ReadSection;revision:number}) {
 export default function MiniAppPage() {
  const {t}=useI18n();
  const [sdk,setSdk]=useState(false),[tab,setTab]=useState<Tab>("home"),[busy,setBusy]=useState(false),[notice,setNotice]=useState(""),[revision,setRevision]=useState(0),[confirmRenew,setConfirmRenew]=useState(false);
+ const [discovery,setDiscovery]=useState<DiscoverySection>("announcements");
+ function openDiscovery(section:DiscoverySection){setDiscovery(section);setTab("discover")}
  const [verificationID,setVerificationID]=useState("");
  const requestId=useRef(""),authenticated=useRef(false),operation=useRef(false);
  const load=useCallback(async(signal?:AbortSignal)=>{
@@ -58,15 +62,17 @@ export default function MiniAppPage() {
   <Script src="https://telegram.org/js/telegram-web-app.js" strategy="afterInteractive" onReady={()=>setSdk(true)} onError={()=>setSdk(true)}/>
   <div className={styles.ambient} aria-hidden="true"/>
   <div className={styles.content}>
-   <header className={styles.header}><Image src="/brand/jianwei-mark.svg" alt="" width={44} height={44}/><div><h1>{t("mini.brand")}</h1><p>{data?`${data.username} · ${t("mini.member")} ${data.uid}`:t("jianwei.tagline")}</p></div><button className={styles.iconButton} aria-label={t("mini.refresh")} disabled={isLoading||busy} onClick={()=>{setRevision(v=>v+1);void execute()}}><RefreshCw size={19}/></button></header>
+   <header className={styles.header}><Image src={sanitizeImageUrl(data?.icon)||"/brand/jianwei-mark.svg"} alt="" width={44} height={44} unoptimized/><div><h1>{t("mini.brand")}</h1><p>{data?`${data.username} · ${t("mini.member")} ${data.uid}`:t("jianwei.tagline")}</p></div><button className={styles.iconButton} aria-label={t("mini.refresh")} disabled={isLoading||busy} onClick={()=>{setRevision(v=>v+1);void execute()}}><RefreshCw size={19}/></button></header>
    {error?<Glass><p role="alert">{error}</p><button onClick={()=>void execute()}>{t("common.retry")}</button></Glass>:isLoading&&!data||!data?<Glass><p>{t("common.loading")}</p></Glass>:<>
     {data.banner&&<aside className={styles.ad}><small>{t("mini.ad")}</small><p>{data.banner}</p>{data.banner_url&&<button onClick={()=>external(data.banner_url)}>{t("mini.learnMore")} <ArrowUpRight size={14}/></button>}</aside>}
     {notice&&<div role="status" aria-live="polite" className={styles.notice}>{notice}</div>}
     {tab==="home"&&<>
      <Glass className={styles.hero}><div className={styles.eyebrow}><span className={`${styles.dot} ${data.media_enabled?styles.online:""}`}/>{data.media_enabled?t("mini.active"):data.has_emby?t("mini.suspended"):t("mini.pending")}</div><h2>{t("mini.welcome")}</h2><p>{t("mini.welcomeDetail")}</p><div className={styles.balance}><span>{data.points.toLocaleString()}<small>{data.signin.config.currency_name}</small></span><Sparkles size={35}/></div><div className={styles.expiry}><span>{t("mini.validUntil")}</span><strong>{expiryText(data,t)}</strong></div></Glass>
      <div className={styles.grid}>{tile(<Sparkles/>,t("mini.signin"),data.signin.summary.today_signed?t("mini.signed"):t("mini.signinRange",{min:data.signin.config.daily_min,max:data.signin.config.daily_max}),()=>void action("signin"),!data.signin_enabled||data.signin.summary.today_signed)}{tile(<Ticket/>,t("mini.redeem"),t("mini.redeemHint"),()=>setTab("benefits"))}{tile(<Compass/>,t("mini.lines"),t("mini.linesHint"),()=>setTab("account"))}{tile(<Clapperboard/>,t("mini.requests"),t("mini.requestsHint"),()=>setTab("requests"),!data.requests_enabled)}</div>
+     <div className={styles.grid}>{tile(<Film/>,t("mini.announcements"),t("mini.announcementsHint"),()=>openDiscovery("announcements"))}{tile(<Sparkles/>,t("mini.rank"),t("mini.rankHint"),()=>openDiscovery("rank"))}{tile(<Film/>,t("mini.favorites"),t("mini.favoritesHint"),()=>openDiscovery("favorites"))}{tile(<ShoppingBag/>,t("mini.shop"),t("mini.shopHint"),()=>data.shop_url?external(data.shop_url):setTab("benefits"),!data.shop_url)}</div>
      <Glass><h3>{t("mini.recent")}</h3>{data.signin.history.length?<div className={styles.history}>{data.signin.history.slice(0,5).map((entry,i)=><div key={`${entry.date}-${i}`}><span>{t("mini.signin")}<small>{entry.date}</small></span><strong>+{entry.total}</strong></div>)}</div>:<p className={styles.muted}>{t("mini.emptyHistory")}</p>}</Glass>
     </>}
+    {tab==="discover"&&<Discovery key={discovery} initial={discovery}/>}
     {tab==="benefits"&&<>
      <Glass><h2>{t("mini.benefits")}</h2><p className={styles.muted}>{t("mini.redeemDescription")}</p><form onSubmit={e=>form(e,"redeem")}><label>{t("mini.code")}<input name="code" maxLength={180} autoComplete="off" required placeholder={t("mini.codePlaceholder")}/></label><button className={styles.primary} disabled={busy}>{t("mini.redeem")}</button></form></Glass>
      {renew?.enabled&&<Glass><h3>{t("mini.renew")}</h3><p>{t("mini.renewRule",{cost:renew.cost,days:renew.days})}</p><button className={styles.primary} disabled={busy||!data.has_emby||!renew.affordable} onClick={()=>confirmRenew?void action("renew"):setConfirmRenew(true)}>{confirmRenew?t("mini.confirmSpend",{cost:renew.cost}):t("mini.renew")}</button>{confirmRenew&&<button className={styles.subtle} onClick={()=>setConfirmRenew(false)}>{t("common.cancel")}</button>}</Glass>}
@@ -82,9 +88,9 @@ export default function MiniAppPage() {
      <Glass><h3>{t("mini.registeredDevices")}</h3><MemberDevices revision={revision} busy={busy} release={body=>action("device-release",body)}/></Glass>
      <Glass><h3><ShieldCheck size={18}/>{t("mini.security")}</h3><p className={styles.muted}>{t("mini.securityHint")}</p><form onSubmit={e=>form(e,"security")}>{data.security_code_set&&<label>{t("mini.oldCode")}<input name="old_code" type="password" inputMode="numeric" pattern="[0-9]{6,12}" autoComplete="off" required/></label>}<label>{t("mini.newCode")}<input name="new_code" type="password" inputMode="numeric" pattern="[0-9]{6,12}" autoComplete="new-password" required/></label><button className={styles.secondary} disabled={busy}>{t("mini.saveSecurity")}</button></form></Glass>
      {data.has_emby&&data.security_code_set&&<Glass><h3>{t("mini.changePassword")}</h3><form onSubmit={e=>form(e,"password")}><label>{t("mini.security")}<input name="security_code" type="password" inputMode="numeric" autoComplete="off" required/></label><label>{t("mini.password")}<input name="new_password" type="password" minLength={8} maxLength={128} autoComplete="new-password" required/></label><input name="verification_id" type="hidden" value={verificationID}/>{data.password_email_required&&<><button type="button" className={styles.secondary} disabled={busy} onClick={()=>void sendPasswordEmail()}>{t("mini.sendEmailCode")}</button><label>{t("mini.emailCode")}<input name="email_code" autoComplete="one-time-code" required/></label></>}<p className={styles.muted}>{t("mini.passwordHint")}</p><button className={styles.secondary} disabled={busy}>{t("mini.changePassword")}</button></form></Glass>}
-     <Glass><h3><ShieldCheck size={18}/>{t("mini.nativeBot")}</h3><p className={styles.muted}>{t("mini.nativeBotHint")}</p><p className={styles.commands}>/panel · /signin · /redeem · /register · /devices · /lines · /request · /invite · /help</p><details><summary>{t("mini.about")}</summary><p>{t("mini.aboutText")}</p><a href="https://github.com/czy-code-923/emby-cloud-runtime" target="_blank" rel="noopener noreferrer">{t("mini.sourceLicense")}</a></details></Glass>
+     <Glass><h3><ShieldCheck size={18}/>{t("mini.nativeBot")}</h3><p className={styles.muted}>{t("mini.nativeBotHint")}</p><p className={styles.commands}>/panel · /announcements · /rank · /favorites · /library · /shopcode · /signin · /redeem · /register · /devices · /lines · /request · /invite · /help</p><details><summary>{t("mini.about")}</summary><p>{t("mini.aboutText")}</p><a href="https://github.com/czy-code-923/emby-cloud-runtime" target="_blank" rel="noopener noreferrer">{t("mini.sourceLicense")}</a></details></Glass>
     </>}
-    <nav className={styles.nav} aria-label={t("mini.navigation")}>{([{key:"home",icon:<Film/>,label:t("mini.home")},{key:"benefits",icon:<Ticket/>,label:t("mini.benefits")},{key:"requests",icon:<Clapperboard/>,label:t("mini.requests")},{key:"account",icon:<UserRound/>,label:t("mini.account")}] as const).map(item=><button key={item.key} aria-current={tab===item.key?"page":undefined} onClick={()=>{setTab(item.key);setNotice("");setConfirmRenew(false)}}>{item.icon}<span>{item.label}</span></button>)}</nav>
+    <nav className={styles.nav} aria-label={t("mini.navigation")}>{([{key:"home",icon:<Film/>,label:t("mini.home")},{key:"discover",icon:<Compass/>,label:t("mini.discovery")},{key:"benefits",icon:<Ticket/>,label:t("mini.benefits")},{key:"requests",icon:<Clapperboard/>,label:t("mini.requests")},{key:"account",icon:<UserRound/>,label:t("mini.account")}] as const).map(item=><button key={item.key} aria-current={tab===item.key?"page":undefined} onClick={()=>{setTab(item.key);setNotice("");setConfirmRenew(false)}}>{item.icon}<span>{item.label}</span></button>)}</nav>
    </>}
   </div>
  </main>;
