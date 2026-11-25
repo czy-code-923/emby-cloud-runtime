@@ -62,6 +62,8 @@ func TestJianweiCommerceConcurrentInventoryAndCapacity(t *testing.T) {
 	if err != nil || issued.Status != "issued" {
 		t.Fatal("own capacity reservation blocked fulfillment", err, issued.Status)
 	}
+	rc,_:=s.RegCode(key)
+	if RegCodeExpired(rc,rc.CreatedAt+30*86400-1)||!RegCodeExpired(rc,rc.CreatedAt+30*86400) {t.Fatal("shop code must expire at exactly 30 days; legacy validity uses hours")}
 	replay, err = s.ConfirmShopPayment(review.ID, review.Revision, 1, 1000, time.Now().Unix(), receipt, strings.Repeat("C", 64), "second-cipher", "", 1, false)
 	if err != nil || replay.CodeKey != key || s.CountRegCodes() != 1 {
 		t.Fatal("confirmation replay minted another code", err)

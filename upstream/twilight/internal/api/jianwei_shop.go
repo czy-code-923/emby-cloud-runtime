@@ -135,7 +135,7 @@ func (a *App) shopOrderView(o store.ShopOrder, admin bool) map[string]any {
 	if o.CodeKey != "" {
 		if rc, ok := a.store().RegCode(o.CodeKey); ok {
 			out["redeemed"] = rc.UseCount > 0 || o.RedeemedAt > 0
-			out["code_expires_at"] = rc.CreatedAt + rc.ValidityTime
+			out["code_expires_at"] = rc.CreatedAt + rc.ValidityTime*3600
 			if !admin && o.Status == "issued" && rc.Active && rc.UseCount == 0 && o.RedeemedAt == 0 {
 				if code, err := a.shopCipher(o.ID, o.CodeCipher, true); err == nil {
 					out["code"] = code

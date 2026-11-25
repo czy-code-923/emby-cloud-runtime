@@ -294,7 +294,7 @@ func (s *Store) ConfirmShopPayment(id string, revision, admin, received, paidAt 
 			return nil
 		}
 		now := time.Now().Unix()
-		rc := RegCode{Code: codeKey, Type: o.Product.Kind, Days: o.Product.Days, UseCountLimit: 1, Active: true, TargetUID: o.UID, TargetTelegramID: u.TelegramID, Source: "commerce", CreatorUID: admin, CreatedAt: now, CreatedTime: now, ValidityTime: 30 * 86400, Note: "shop:" + id}
+		rc := RegCode{Code: codeKey, Type: o.Product.Kind, Days: o.Product.Days, UseCountLimit: 1, Active: true, TargetUID: o.UID, TargetTelegramID: u.TelegramID, Source: "commerce", CreatorUID: admin, CreatedAt: now, CreatedTime: now, ValidityTime: 30 * 24, Note: "shop:" + id}
 		s.state.RegCodes[codeKey] = rc
 		o.Status = "issued"
 		o.CodeKey = codeKey
@@ -376,7 +376,7 @@ func (s *Store) ReviewShopOrder(id, action, note, refundReference string, revisi
 			if !ok || !rc.Active || rc.UseCount > 0 || !RegCodeExpired(rc, time.Now().Unix()) {
 				return ErrConflict
 			}
-			rc.ValidityTime = time.Now().Unix() + 30*86400 - rc.CreatedAt
+			rc.ValidityTime = (time.Now().Unix() + 30*86400 - rc.CreatedAt + 3599) / 3600
 			s.state.RegCodes[o.CodeKey] = rc
 		default:
 			return ErrInvalid
