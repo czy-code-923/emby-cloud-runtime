@@ -65,6 +65,7 @@ type routePathIndexKey struct {
 }
 
 type App struct {
+	mediaIdentity mediaIdentityCache
 	// runtime 持有 cfg / store / sessions / limiter / redis 这五个 hot reload
 	// 期间会被整体替换的运行时句柄。读端必须经 a.cfg() / a.store() 等访问器，
 	// 一次性 Load 出 *runtimeState 后再读字段；reload 端构造完整的 next 状态后
@@ -825,6 +826,9 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 写进 context：后续黑名单 / 限速 / 访问日志及各 handler 全部复用，
 	// 连 OPTIONS 早返回路径上的 defer 访问日志也命中缓存，不再二次解析。
 	clientIP := a.computeClientIP(r)
+	if gatewayIP := a.mediaGatewayClientIP(r); gatewayIP != "" {
+		clientIP = gatewayIP
+	}
 	r = r.WithContext(context.WithValue(r.Context(), clientIPKey, clientIP))
 	a.applySecurityHeaders(lw)
 	if a.applyCORS(lw, r) && r.Method == http.MethodOptions {
@@ -1839,6 +1843,7 @@ func publicUser(u store.User) map[string]any {
 // expireStatus 的 now 比较；列表页一页渲染 N 行时复用同一 now，避免每行系统调用。
 func publicUserAt(u store.User, now int64) map[string]any {
 	return map[string]any{
+		"media_max_devices": u.MediaMaxDevices, "media_max_streams": u.MediaMaxStreams, "security_code_set": u.SecurityCodeHash != "",
 		"uid":               u.UID,
 		"username":          u.Username,
 		"email":             u.Email,

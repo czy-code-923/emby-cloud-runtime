@@ -33,7 +33,7 @@ class NetworkTest(unittest.TestCase):
  def test_ingress_separates_miniapp_cash_and_admin(self):
   output=self.network.render_ingress({'account':{'domain':'jw.example.com'},'shop':{'domain':'shop.example.com'}})
   self.assertIn('https://jw.example.com',output);self.assertIn('https://shop.example.com',output)
-  self.assertIn('/api/v2/admin/*',output)
+  self.assertIn('respond "Private or separate entrance required" 403',output)
   self.assertIn('/api/v2/commerce/*',output)
   self.assertNotIn(':80 ',output)
  def test_interrupted_publish_restores_prior_configuration(self):

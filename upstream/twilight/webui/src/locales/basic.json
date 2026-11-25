@@ -3645,7 +3645,8 @@
     "running": "正在执行，请稍候。可切换页面后返回查看结果。",
     "succeeded": "执行完成；请核对当前已发布入口与证书状态。",
     "failed": "执行未完成，请检查凭据、域名或私有主机日志后重试。",
-    "renewalInactive": "定时任务未运行，请检查主机证书服务。"
+    "renewalInactive": "定时任务未运行，请检查主机证书服务。",
+    "playback": "Emby playback entrance"
   },
   "mini": {
     "brand": "见微 Emby",
@@ -3726,6 +3727,29 @@
       "rejected": "已拒绝",
       "cancelled": "已取消",
       "failed": "处理失败"
-    }
+    },
+    "maxDevices": "Maximum Emby devices",
+    "maxStreams": "Concurrent Emby streams",
+    "roleDefault": "Leave blank for role default",
+    "limitHint": "Blank inherits the role; 0 means unlimited. Device quotas require the managed playback gateway.",
+    "security": "Security code",
+    "securityHint": "Use 6–12 digits, different from your Emby password. Contact the administrator if forgotten.",
+    "oldCode": "Current security code",
+    "newCode": "New security code",
+    "saveSecurity": "Save security code",
+    "changePassword": "Change Emby password",
+    "emailCode": "Email code (required if email verification is enabled)",
+    "registeredDevices": "Registered playback devices",
+    "releaseDevice": "Revoke and free slot",
+    "releaseHint": "The revoked device ID cannot reconnect. Use a new device or contact the administrator to restore access.",
+    "unlimited": "Unlimited",
+    "deviceID": "Device ID",
+    "sendEmailCode": "Send email code",
+    "adminReset": "Security and device reset",
+    "resetSecurity": "Clear security code",
+    "resetDevices": "Reset device registry",
+    "resetHint": "Actions take effect immediately. Clearing the code lets the member set a new one. Resetting devices clears this member’s registrations and revocations.",
+    "adminPassword": "Current administrator password",
+    "confirmReset": "I confirm the selected reset"
   }
 }

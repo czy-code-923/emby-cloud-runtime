@@ -173,6 +173,7 @@ export default function AdminUsersPage() {
   // Edit dialog states
   const [editOpen, setEditOpen] = useState(false);
   const [editForm, setEditForm] = useState({
+    media_max_devices:null as number|null, media_max_streams:null as number|null,
     role: 1,
     emby_id: "",
     active: true,
@@ -1171,6 +1172,7 @@ export default function AdminUsersPage() {
   const handleOpenEdit = (user: UserInfo) => {
     setSelectedUser(user);
     setEditForm({
+      media_max_devices:user.media_max_devices??null, media_max_streams:user.media_max_streams??null,
       role: user.role,
       emby_id: user.emby_id || "",
       active: user.active,

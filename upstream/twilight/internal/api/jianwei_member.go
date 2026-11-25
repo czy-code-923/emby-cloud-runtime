@@ -72,7 +72,7 @@ func (a *App) memberAccount(user store.User) map[string]any {
 		"can_register":   user.EmbyID == "" && (user.PendingEmby || cfg.EmbyDirectRegisterEnabled),
 		"invite_enabled": cfg.InviteEnabled, "requests_enabled": cfg.MediaRequestEnabled,
 		"shop_url": shop, "banner": banner, "banner_url": bannerURL,
-		"signin": a.signinPagePayload(user, 12), "role": user.Role,
+		"signin": a.signinPagePayload(user, 12), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.passwordChangeEmailRequired(user, emailPurposeChangeEmby),
 	}
 }
 

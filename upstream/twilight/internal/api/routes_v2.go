@@ -7,6 +7,15 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodGet, "/api/v2/internal/emby-access", AuthPublic, a.handleMediaGatewayAccess)
+	a.add(http.MethodGet, "/api/v2/miniapp/device-registry", AuthPublic, a.miniMember(a.handleMemberDeviceRegistry))
+	a.add(http.MethodPost, "/api/v2/miniapp/device-release", AuthPublic, a.miniMember(a.handleMemberReleaseDevice))
+	a.add(http.MethodPost, "/api/v2/miniapp/password-email", AuthPublic, a.miniMember(a.handleMemberPasswordEmail))
+	a.add(http.MethodPost, "/api/v2/admin/users/:uid/media-devices/reset", AuthAdmin, a.handleAdminResetMediaDevices)
+	a.add(http.MethodPost, "/api/v2/miniapp/security", AuthPublic, a.miniMember(a.handleMemberSecurityCode))
+	a.add(http.MethodPost, "/api/v2/miniapp/password", AuthPublic, a.miniMember(a.handleMemberPassword))
+	a.add(http.MethodPost, "/api/v2/admin/users/:uid/security-code/reset", AuthAdmin, a.handleAdminResetMemberSecurity)
+
 	a.add(http.MethodPost, "/api/v2/admin/telegram/miniapp/publish", AuthAdmin, a.handlePublishMiniApp)
 	a.add(http.MethodGet, "/api/v2/admin/network/status", AuthAdmin, a.handleNetworkStatus)
 	a.add(http.MethodPost, "/api/v2/admin/network/configure", AuthAdmin, a.handleNetworkAction)

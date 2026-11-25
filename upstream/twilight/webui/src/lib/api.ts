@@ -3294,7 +3294,7 @@ class ApiClient {
   async networkStatus(signal?: AbortSignal) {
     return this.request<NetworkStatus>("/admin/network/status",{signal,cache:"no-store"},{cacheRead:false,dedupe:false});
   }
-  async networkAction(operation: "configure"|"issue"|"renew"|"publish", payload: {password:string;profile:"account"|"shop";expected_revision:number;email?:string;cloudflare_token?:string;accept_terms?:boolean;staging?:boolean}) {
+  async networkAction(operation: "configure"|"issue"|"renew"|"publish", payload: {password:string;profile:"account"|"shop"|"playback";expected_revision:number;email?:string;cloudflare_token?:string;accept_terms?:boolean;staging?:boolean}) {
     const options={headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"network-certificate"},body:JSON.stringify(payload)};
     switch(operation){
       case "configure":return this.request<NetworkStatus>("/admin/network/configure",{...options,method:"POST"});
@@ -3312,25 +3312,35 @@ class ApiClient {
   async miniSession(initData: string, requestId: string, signal?: AbortSignal) {
     return this.request<{authenticated:boolean}>("/miniapp/session", {method:"POST",signal,body:JSON.stringify({init_data:initData,request_id:requestId})},{cacheRead:false,dedupe:false,apiVersion:"v2"});
   }
+  async resetMemberSecurity(uid:number,password:string,devices=false) {
+    const options={method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"member-security-reset"},body:JSON.stringify({password})};
+    if(devices)return this.request(`/admin/users/${uid}/media-devices/reset`,{...options,method:"POST"},{apiVersion:"v2"});
+    return this.request(`/admin/users/${uid}/security-code/reset`,{...options,method:"POST"},{apiVersion:"v2"});
+  }
   async miniAccount(signal?: AbortSignal) {
     return this.request<MiniAccount>("/miniapp/account",{signal,cache:"no-store"},{cacheRead:false,dedupe:false,apiVersion:"v2"});
   }
 
-  async miniRead<T>(section:"lines"|"devices"|"requests"|"invite", signal?:AbortSignal) {
+  async miniRead<T>(section:"lines"|"devices"|"requests"|"invite"|"device-registry", signal?:AbortSignal) {
     const options={signal,cache:"no-store" as const};
     const extra={cacheRead:false,dedupe:false,apiVersion:"v2" as const};
     switch(section){
       case "lines":return this.request<T>("/miniapp/lines",options,extra);
       case "devices":return this.request<T>("/miniapp/devices",options,extra);
+      case "device-registry":return this.request<T>("/miniapp/device-registry",options,extra);
       case "requests":return this.request<T>("/miniapp/requests",options,extra);
       case "invite":return this.request<T>("/miniapp/invite",options,extra);
     }
   }
-  async miniAction<T=Record<string,unknown>>(action:"signin"|"renew"|"redeem"|"register"|"requests"|"invite",payload:Record<string,unknown>={}) {
+  async miniAction<T=Record<string,unknown>>(action:"signin"|"renew"|"redeem"|"register"|"requests"|"invite"|"security"|"password"|"password-email"|"device-release",payload:Record<string,unknown>={}) {
     const options={method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"miniapp-action"},body:JSON.stringify(payload),cache:"no-store" as const};
     const extra={cacheRead:false,dedupe:false,apiVersion:"v2" as const};
     switch(action){
       case "signin":return this.request<T>("/miniapp/signin", {...options, method:"POST"}, extra);
+      case "password-email":return this.request<T>("/miniapp/password-email", {...options, method:"POST"}, extra);
+      case "security":return this.request<T>("/miniapp/security", {...options, method:"POST"}, extra);
+      case "password":return this.request<T>("/miniapp/password", {...options, method:"POST"}, extra);
+      case "device-release":return this.request<T>("/miniapp/device-release", {...options, method:"POST"}, extra);
       case "renew":return this.request<T>("/miniapp/renew", {...options, method:"POST"}, extra);
       case "redeem":return this.request<T>("/miniapp/redeem", {...options, method:"POST"}, extra);
       case "register":return this.request<T>("/miniapp/register", {...options, method:"POST"}, extra);

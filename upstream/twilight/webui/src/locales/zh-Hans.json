@@ -657,7 +657,8 @@
     "running": "正在执行，请稍候。可切换页面后返回查看结果。",
     "succeeded": "执行完成；请核对当前已发布入口与证书状态。",
     "failed": "执行未完成，请检查凭据、域名或私有主机日志后重试。",
-    "renewalInactive": "定时任务未运行，请检查主机证书服务。"
+    "renewalInactive": "定时任务未运行，请检查主机证书服务。",
+    "playback": "Emby 播放入口"
   },
   "mini": {
     "brand": "见微 Emby",
@@ -738,6 +739,29 @@
       "rejected": "已拒绝",
       "cancelled": "已取消",
       "failed": "处理失败"
-    }
+    },
+    "maxDevices": "Emby 最大设备数",
+    "maxStreams": "Emby 最大同时播放流",
+    "roleDefault": "留空使用身份默认值",
+    "limitHint": "留空使用身份默认；0 表示不限；设备配额需要启用受控播放入口。",
+    "security": "安全码",
+    "securityHint": "使用 6–12 位数字，勿与 Emby 密码相同。忘记后联系管理员重置。",
+    "oldCode": "当前安全码",
+    "newCode": "新的安全码",
+    "saveSecurity": "保存安全码",
+    "changePassword": "修改 Emby 密码",
+    "emailCode": "邮箱验证码（开启邮箱验证时必填）",
+    "registeredDevices": "登记的播放设备",
+    "releaseDevice": "停用并释放名额",
+    "releaseHint": "停用后该设备标识将被禁止访问，需使用新设备或联系管理员恢复。",
+    "unlimited": "不限",
+    "deviceID": "设备标识",
+    "sendEmailCode": "发送邮箱验证码",
+    "adminReset": "安全与设备重置",
+    "resetSecurity": "清除安全码",
+    "resetDevices": "重置设备登记",
+    "resetHint": "确认后立即执行：清除安全码让用户重新设置；重置设备会清除该用户登记与停用列表，允许设备重新登记。",
+    "adminPassword": "当前管理员密码",
+    "confirmReset": "我已确认要执行所选重置"
   }
 }

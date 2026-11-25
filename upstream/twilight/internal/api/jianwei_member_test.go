@@ -80,7 +80,7 @@ func TestJianweiAdminOnlyWebRejectsExistingUserSession(t *testing.T) {
 	a := newTestApp(t)
 	cookies := registerAndLogin(t, a, "ordinary-reader", "Reader123456")
 	a.cfg().WebAdminOnly = true
-	if w := doJSON(a, http.MethodGet, "/api/v2/settings/identity", "", cookies); w.Code != http.StatusUnauthorized {
+	if w := doJSON(a, http.MethodGet, "/api/v1/users/me", "", cookies); w.Code != http.StatusUnauthorized {
 		t.Fatalf("ordinary Web session survived: %d", w.Code)
 	}
 	u, found := a.store().FindUserByUsername("ordinary-reader")

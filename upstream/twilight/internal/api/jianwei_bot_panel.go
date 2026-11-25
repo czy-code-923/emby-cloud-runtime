@@ -26,6 +26,10 @@ func init() {
 		{"lines", "查看我的播放线路", "/lines"},
 		{"request", "提交求片并查看进度", "/request <片名> 或 /request"},
 		{"invite", "查看邀请资格", "/invite"},
+		{"security", "设置或修改安全码", "/security <新安全码> [当前安全码]"},
+		{"password", "安全码验证后修改 Emby 密码", "/password <安全码> <新密码>"},
+		{"device_list", "查看登记设备与播放配额", "/device_list"},
+		{"device_release", "停用设备并释放名额", "/device_release <安全码> <设备标识>"},
 	} {
 		command := "/" + item.name
 		telegramCommandRegistry[command] = telegramCommandSpec{name: item.name, label: command, description: item.description, usage: item.usage, category: "user", order: 31 + index, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramMemberCommand(ctx, c) }}
@@ -68,6 +72,7 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 		rows = append(rows, []map[string]any{button("✦ 每日签到", "/signin"), button("🗓 积分续期", "/renew")})
 	}
 	rows = append(rows, []map[string]any{button("📱 我的设备", "/devices"), button("🧭 播放线路", "/lines")})
+	rows = append(rows, []map[string]any{button("🔐 安全码", "/security"), button("🔑 修改密码", "/password")}, []map[string]any{button("设备配额", "/device_list"), button("停用旧设备", "/device_release")})
 	if cfg.MediaRequestEnabled {
 		rows = append(rows, []map[string]any{button("🎬 求片与进度", "/request")})
 	}
@@ -203,6 +208,43 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 		body["emby_password"] = password
 	case "/devices":
 		handler = a.handleV2EmbyUserSessions
+	case "/security":
+		if len(c.Args) < 1 || len(c.Args) > 2 {
+			_ = a.telegramSendMessage(ctx, c.ChatID, "发送 /security 新安全码 [当前安全码]\n使用6–12位数字；已有安全码时必须提供当前码。仅在此私聊输入，完成后删除含码的消息。")
+			return
+		}
+		handler = a.handleMemberSecurityCode
+		body["new_code"] = c.Args[0]
+		if len(c.Args) == 2 {
+			body["old_code"] = c.Args[1]
+		}
+		if c.MessageID > 0 {
+			_ = a.telegramDeleteMessage(ctx, c.ChatID, c.MessageID)
+		}
+	case "/password":
+		if len(c.Args) != 2 {
+			_ = a.telegramSendMessage(ctx, c.ChatID, "发送 /password 安全码 新Emby密码\n密码至少8位，包含大小写字母和数字。若账户要求邮箱验证，请使用 Mini App 完成验证。仅在此私聊输入。")
+			return
+		}
+		handler = a.handleMemberPassword
+		body["security_code"] = c.Args[0]
+		body["new_password"] = c.Args[1]
+		if c.MessageID > 0 {
+			_ = a.telegramDeleteMessage(ctx, c.ChatID, c.MessageID)
+		}
+	case "/device_list":
+		handler = a.handleMemberDeviceRegistry
+	case "/device_release":
+		if len(c.Args) != 2 {
+			_ = a.telegramSendMessage(ctx, c.ChatID, "先发送 /device_list 查看标识，再发送 /device_release 安全码 设备标识\n此操作将禁止该设备继续访问并释放名额；需要重新使用时请联系管理员。")
+			return
+		}
+		handler = a.handleMemberReleaseDevice
+		body["security_code"] = c.Args[0]
+		body["device_id"] = c.Args[1]
+		if c.MessageID > 0 {
+			_ = a.telegramDeleteMessage(ctx, c.ChatID, c.MessageID)
+		}
 	case "/lines":
 		handler = a.handleEmbyURLs
 	case "/invite":
@@ -239,6 +281,18 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 				}
 				if len(items) == 0 {
 					message += "当前没有在线设备。"
+				}
+			}
+		case "/device_list":
+			message = "登记的播放设备\n"
+			if d, ok := data.(map[string]any); ok {
+				message += fmt.Sprintf("设备上限：%v · 同时播放流：%v（0为不限）\n", d["max_devices"], d["max_streams"])
+				if list, ok := d["items"].([]any); ok {
+					for _, v := range list {
+						if device, ok := v.(map[string]any); ok {
+							message += "• " + asString(device["name"]) + "\n标识：" + asString(device["id"]) + "\n"
+						}
+					}
 				}
 			}
 		case "/lines":

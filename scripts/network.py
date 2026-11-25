@@ -49,7 +49,7 @@ class Network:
 
     def configure(self,body):
         profile=body.get('profile','account')
-        if profile not in {'account','shop'}:raise ValueError('Unsupported ingress profile')
+        if profile not in {'account','shop','playback'}:raise ValueError('Unsupported ingress profile')
         allowed={'domain','email','cloudflare_token','accept_terms','staging','profile','expected_revision'}
         if set(body)-allowed:raise ValueError('Unsupported configuration field')
         domain=validate_domain(body.get('domain',''))
@@ -67,6 +67,10 @@ class Network:
                 temp=credentials.with_suffix('.tmp')
                 temp.write_text('dns_cloudflare_api_token = '+token+'\n')
                 temp.chmod(0o600);temp.replace(credentials)
+            if not credentials.exists() and not token and current.get('domain'):
+                previous=credential_dir/(validate_domain(current['domain'])+'.ini')
+                if previous.exists():
+                    credentials.write_bytes(previous.read_bytes());credentials.chmod(0o600)
             if not credentials.exists():raise ValueError('Save a Cloudflare scoped DNS API token first')
             self.write('desired-'+profile+'.json',{'revision':current.get('revision',0)+1,'domain':domain,'email':email,'accept_terms':body['accept_terms'],'staging':body['staging'],'updated_at':int(time.time())})
         return self.status()
@@ -88,7 +92,7 @@ class Network:
                 'certificate':self.certificate(desired.get('domain'),desired.get('staging',False)),'active_certificate':self.certificate(applied.get('domain'))}
 
     def status(self):
-        profiles={profile:self.profile_status(profile) for profile in ['account','shop']}
+        profiles={profile:self.profile_status(profile) for profile in ['account','shop','playback']}
         renewal={'interval_hours':12,'enabled':False,'active':False}
         if Path('/run/systemd/system').exists():
             try:
@@ -99,7 +103,7 @@ class Network:
         return {**profiles['account'],'profiles':profiles,'job':self.read('job.json',{'phase':'idle'}),'automatic_renewal':renewal}
 
     def start(self,operation,profile,revision):
-        if profile not in {"account","shop"}:raise ValueError("Unsupported ingress profile")
+        if profile not in {"account","shop","playback"}:raise ValueError("Unsupported ingress profile")
         if type(revision) is not int or revision<0:raise ValueError('A configuration revision is required')
         if operation not in {'issue','renew','publish'}:raise ValueError('Unsupported certificate operation')
         with self.guard:
@@ -187,9 +191,9 @@ class Network:
         certificate=self.certificate(domain,desired['staging'])
         if not certificate or certificate['staging'] or certificate['expires_at']<=time.time()+3600:raise ValueError('A valid production certificate is required')
         applied=self.read('applied-'+profile+'.json')
-        if not any(self.read('applied-'+key+'.json') for key in ['account','shop']):
+        if not any(self.read('applied-'+key+'.json') for key in ['account','shop','playback']):
             with socket.socket() as listener:listener.bind(('0.0.0.0',443))
-        sites={key:self.read('applied-'+key+'.json') for key in ['account','shop']}
+        sites={key:self.read('applied-'+key+'.json') for key in ['account','shop','playback']}
         sites[profile]={'domain':domain,'origin':'https://'+domain}
         if len({item['domain'] for item in sites.values() if item})!=sum(bool(item) for item in sites.values()):raise ValueError('Account and shop require separate hostnames')
         config=self.render_ingress(sites)
@@ -198,12 +202,12 @@ class Network:
         if not re.fullmatch(r'(?:docker\.io/(?:library/)?)?caddy@sha256:[0-9a-f]{64}',edge_image):raise ValueError('A pinned gateway image is required')
         path=self.root/'Caddyfile';previous=path.read_text() if path.exists() else None
         env_path=self.manager.root/'.env';previous_env=env_path.read_text()
-        snapshot={'env':previous_env,'config':previous,'applied':{key:self.read('applied-'+key+'.json') for key in ['account','shop']}}
+        snapshot={'env':previous_env,'config':previous,'applied':{key:self.read('applied-'+key+'.json') for key in ['account','shop','playback']}}
         self.write('pending-publish.json',snapshot)
         try:
             path.write_text(config);path.chmod(0o600)
             # Owned template validation before opening the listener.
-            self.manager.command(['docker','run','--rm','--network','none','-v',str(path)+':/etc/caddy/Caddyfile:ro','-v',str(self.root/'letsencrypt')+':/etc/letsencrypt:ro',edge_image,'caddy','validate','--config','/etc/caddy/Caddyfile'],timeout=60)
+            self.manager.command(['docker','run','--rm','--network','none','-e','BOT_INTERNAL_SECRET=validation-placeholder-not-a-secret','-v',str(path)+':/etc/caddy/Caddyfile:ro','-v',str(self.root/'letsencrypt')+':/etc/letsencrypt:ro',edge_image,'caddy','validate','--config','/etc/caddy/Caddyfile'],timeout=60)
             lines=[line for line in previous_env.splitlines() if not line.startswith(('PUBLIC_SITE_ORIGIN=','PUBLIC_SHOP_ORIGIN=','EDGE_IMAGE=','COMPOSE_PROFILES='))]
             profiles=next((line.split('=',1)[1].split(',') for line in previous_env.splitlines() if line.startswith('COMPOSE_PROFILES=')),['cloud'])
             if 'tls' not in profiles:profiles.append('tls')
@@ -212,7 +216,7 @@ class Network:
             self.manager.command(self.manager.dc('up','-d','--no-deps','--force-recreate','gateway'),timeout=60)
             self.manager.command(self.edge_command('up','-d','--no-deps','edge'),timeout=60)
             self.reload_edge()
-            self.probe_origin(domain)
+            self.probe_origin(domain,profile)
             self.write('applied-'+profile+'.json',{'domain':domain,'origin':'https://'+domain,'admin_exposed':False,'published_at':int(time.time())})
             self.write('previous-publish.json',snapshot)
             (self.root/'pending-publish.json').unlink(missing_ok=True)
@@ -227,21 +231,39 @@ class Network:
         for profile,site in sites.items():
             if not site:continue
             domain=validate_domain(site['domain'])
-            if profile=='account':
-                routes=' @private path /admin /admin/* /deployment /deployment/* /api/v1/* /api/v2/admin/* /api/v2/system/stats /api/v2/system/health/* /api/v2/openapi.json /api/v2/setup/* /shop /shop/* /api/v2/commerce/*\n respond @private "Private or separate shop entrance required" 403\n'
+            config+='https://'+domain+' {\n tls /etc/letsencrypt/live/jw-'+domain+'/fullchain.pem /etc/letsencrypt/live/jw-'+domain+'/privkey.pem\n'
+            if profile=='playback':
+                # Fixed upstreams and a secret injected by Compose; the public client
+                # can never choose the gateway identity or authentication target.
+                config+=''' route {
+  @management path /web /web/* /emby/web /emby/web/* /Users /Users/Public /emby/Users /emby/Users/Public /System/Configuration* /emby/System/Configuration* /Plugins* /emby/Plugins* /ScheduledTasks* /emby/ScheduledTasks* /swagger* /emby/swagger*
+  respond @management "Private administration entrance required" 403
+  forward_auth 127.0.0.1:13000 {
+   uri /api/v2/internal/emby-access
+   header_up -Origin
+   header_up X-JW-Gateway {$BOT_INTERNAL_SECRET}
+   header_up X-JW-URI {http.request.uri}
+   header_up X-JW-Method {http.request.method}
+   header_up X-JW-Client-IP {http.request.remote.host}
+  }
+  reverse_proxy 127.0.0.1:18096
+ }
+'''
             else:
-                routes=' @public path /shop /shop/* /login /forgot-password /_next/* /brand/* /favicon* /api/v2/auth/* /api/v2/commerce/* /api/v2/system/info /api/v2/system/health /api/v2/system/capabilities /api/v2/settings/identity /api/v2/users/me\n handle @public {\n  reverse_proxy 127.0.0.1:13000 {\n   header_up Host {host}\n   header_up X-Forwarded-Proto https\n   header_down Set-Cookie "^(.+)$" "$1; Secure"\n  }\n }\n respond "Use the account or private management entrance" 403\n'
-            config+='https://'+domain+' {\n tls /etc/letsencrypt/live/jw-'+domain+'/fullchain.pem /etc/letsencrypt/live/jw-'+domain+'/privkey.pem\n'+routes
-            if profile=='account':config+=' reverse_proxy 127.0.0.1:13000 {\n  header_up Host {host}\n  header_up X-Forwarded-Proto https\n   header_down Set-Cookie "^(.+)$" "$1; Secure"\n }\n'
+                routes='/miniapp /miniapp/* /api/v2/miniapp/*' if profile=='account' else '/shop /shop/* /api/v2/commerce/*'
+                config+=' @public path '+routes+' /_next/* /brand/* /favicon* /api/v2/system/info /api/v2/system/health /api/v2/system/capabilities\n'
+                config+=' handle @public {\n  reverse_proxy 127.0.0.1:13000 {\n   header_up Host {host}\n   header_up X-Forwarded-Proto https\n   header_down Set-Cookie "^(.+)$" "$1; Secure"\n  }\n }\n'
+                config+=' redir / '+('/miniapp' if profile=='account' else '/shop')+' 302\n respond "Private or separate entrance required" 403\n'
             config+='}\n'
         return config
 
     @staticmethod
-    def probe_origin(domain):
+    def probe_origin(domain,profile='account'):
         # Validate the real local TLS chain and HTTP host; no certificate bypass.
         context=ssl.create_default_context()
         with socket.create_connection(('127.0.0.1',443),timeout=10) as raw:
             with context.wrap_socket(raw,server_hostname=domain) as tls:
-                tls.sendall(('GET /api/v2/system/health HTTP/1.1\r\nHost: '+domain+'\r\nConnection: close\r\n\r\n').encode())
+                health_path='/System/Info/Public' if profile=='playback' else '/api/v2/system/health'
+                tls.sendall(('GET '+health_path+' HTTP/1.1\r\nHost: '+domain+'\r\nConnection: close\r\n\r\n').encode())
                 response=http.client.HTTPResponse(tls);response.begin()
                 if response.status!=200:raise ValueError('Origin health check failed')

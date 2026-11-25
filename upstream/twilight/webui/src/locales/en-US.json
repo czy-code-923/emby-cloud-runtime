@@ -3661,7 +3661,8 @@
     "running": "Operation running; you may return later to check the result.",
     "succeeded": "Completed. Review the published entrance and certificate status.",
     "failed": "Operation did not complete; check the domain, credentials and protected host log.",
-    "renewalInactive": "The renewal timer is inactive. Check the host certificate service."
+    "renewalInactive": "The renewal timer is inactive. Check the host certificate service.",
+    "playback": "Emby playback entrance"
   },
   "mini": {
     "brand": "Jianwei Emby",
@@ -3742,6 +3743,29 @@
       "rejected": "Rejected",
       "cancelled": "Cancelled",
       "failed": "Failed"
-    }
+    },
+    "maxDevices": "Maximum Emby devices",
+    "maxStreams": "Concurrent Emby streams",
+    "roleDefault": "Leave blank for role default",
+    "limitHint": "Blank inherits the role; 0 means unlimited. Device quotas require the managed playback gateway.",
+    "security": "Security code",
+    "securityHint": "Use 6–12 digits, different from your Emby password. Contact the administrator if forgotten.",
+    "oldCode": "Current security code",
+    "newCode": "New security code",
+    "saveSecurity": "Save security code",
+    "changePassword": "Change Emby password",
+    "emailCode": "Email code (required if email verification is enabled)",
+    "registeredDevices": "Registered playback devices",
+    "releaseDevice": "Revoke and free slot",
+    "releaseHint": "The revoked device ID cannot reconnect. Use a new device or contact the administrator to restore access.",
+    "unlimited": "Unlimited",
+    "deviceID": "Device ID",
+    "sendEmailCode": "Send email code",
+    "adminReset": "Security and device reset",
+    "resetSecurity": "Clear security code",
+    "resetDevices": "Reset device registry",
+    "resetHint": "Actions take effect immediately. Clearing the code lets the member set a new one. Resetting devices clears this member’s registrations and revocations.",
+    "adminPassword": "Current administrator password",
+    "confirmReset": "I confirm the selected reset"
   }
 }

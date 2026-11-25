@@ -117,6 +117,17 @@ func (a *App) handleAdminUser(w http.ResponseWriter, r *http.Request, params Par
 func (a *App) handleAdminUpdateUser(w http.ResponseWriter, r *http.Request, params Params) {
 	uid, _ := int64Param(params, "uid")
 	payload := decodeMap(r)
+	mediaDevices, hasMediaDevices, validationErr := parseMediaLimit(payload, "media_max_devices")
+	if validationErr != nil {
+		fail(w, 400, validationErr.Error())
+		return
+	}
+	mediaStreams, hasMediaStreams, validationErr := parseMediaLimit(payload, "media_max_streams")
+	if validationErr != nil {
+		fail(w, 400, validationErr.Error())
+		return
+	}
+
 	// 在进入 store.UpdateUser 之前先把字段校验跑完：role 必须在已知集合内，
 	// username 必须通过 validate.ValidateUsername，否则会出现：
 	//   - admin 给用户写入未知 role（如 99），前端 roleName 落到"未识别"，
@@ -208,6 +219,13 @@ func (a *App) handleAdminUpdateUser(w http.ResponseWriter, r *http.Request, para
 		}
 	}
 	u, err := a.store().UpdateUser(uid, func(u *store.User) error {
+		if hasMediaDevices {
+			u.MediaMaxDevices = mediaDevices
+		}
+		if hasMediaStreams {
+			u.MediaMaxStreams = mediaStreams
+		}
+
 		if username := stringValue(payload, "username"); username != "" {
 			u.Username = username
 		}
@@ -219,12 +237,18 @@ func (a *App) handleAdminUpdateUser(w http.ResponseWriter, r *http.Request, para
 	if statusFromError(w, err) {
 		return
 	}
+
+	if (hasRole || hasMediaDevices || hasMediaStreams) && a.cfg().MediaLimitsEnabled && u.EmbyID != "" {
+		if err := a.applyMediaStreamLimit(r.Context(), u); err != nil {
+			embySyncFailed = true
+		}
+	}
 	data := publicUser(u)
 	if embySyncFailed {
 		data["emby_sync_failed"] = true
 	}
 	a.audit(r, "update_user", "admin", uid, map[string]any{
-		"has_role": hasRole, "has_active": hasActive,
+		"has_role": hasRole, "has_active": hasActive, "has_media_devices": hasMediaDevices, "has_media_streams": hasMediaStreams,
 	})
 	ok(w, "user updated", data)
 }

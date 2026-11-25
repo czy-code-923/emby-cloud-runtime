@@ -168,6 +168,7 @@ export interface User {
 }
 
 export interface UserInfo {
+ media_max_devices?:number|null; media_max_streams?:number|null; security_code_set?:boolean;
   uid: number;
   username: string;
   email?: string;
@@ -883,6 +884,8 @@ export interface AdminUserListResponse {
 }
 
 export interface UserUpdateData {
+	media_max_devices?: number | null;
+	media_max_streams?: number | null;
   role?: number;
   active?: boolean;
   expired_at?: string;
@@ -1688,8 +1691,8 @@ export interface NetworkProfileStatus {
  active_certificate?:{domain:string;expires_at:number;days_remaining:number;staging:boolean;issuer:string}|null;
 }
 export interface NetworkStatus extends NetworkProfileStatus {
- profiles:Record<"account"|"shop",NetworkProfileStatus>;
- desired_origins:Record<"account"|"shop",string>;
+ profiles:Record<"account"|"shop"|"playback",NetworkProfileStatus>;
+ desired_origins:Record<"account"|"shop"|"playback",string>;
  job:{phase:string;operation?:string;profile?:string;error?:string;updated_at?:number};
  automatic_renewal:{interval_hours:number;enabled:boolean;active:boolean};
 }
@@ -1697,6 +1700,6 @@ export interface NetworkStatus extends NetworkProfileStatus {
 export interface MiniAccount {
   uid:number; username:string; emby_username:string; media_enabled:boolean; has_emby:boolean;
   expired_at:number; points:number; signin_enabled:boolean; last_signin:string; can_register:boolean;
-  invite_enabled:boolean; requests_enabled:boolean; shop_url:string; banner:string; banner_url:string; role:number;
+  security_code_set:boolean;password_email_required:boolean; invite_enabled:boolean; requests_enabled:boolean; shop_url:string; banner:string; banner_url:string; role:number;
   signin:{summary:SigninSummary;config:SigninPublicConfig;history:SigninHistoryRecord[]};
 }

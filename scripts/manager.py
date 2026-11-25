@@ -561,7 +561,7 @@ def main():
     manager=Manager()
     if args.action=='certificate-renew':
         succeeded=True
-        for profile in ['account','shop']:
+        for profile in ['account','shop','playback']:
             if manager.network().read('desired-'+profile+'.json') or manager.network().read('applied-'+profile+'.json'):
                 succeeded=manager.network().run('renew',profile) and succeeded
         if not succeeded:raise SystemExit(1)

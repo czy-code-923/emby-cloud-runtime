@@ -53,10 +53,11 @@ type telegramCommandCatalogItem struct {
 // telegramCommandCtx 把命令分发上下文打包成单一参数，方便 handler 签名收敛、
 // 后续扩展（如加 traceID / requestID）也不用回头改所有 handler 签名。
 type telegramCommandCtx struct {
-	ChatID   int64
-	FromID   int64
-	Username string
-	Command  string
+	MessageID int64
+	ChatID    int64
+	FromID    int64
+	Username  string
+	Command   string
 	// Args 是 fields[1:]，handler 自行选择 strings.Join 还是按位置取。
 	Args []string
 }

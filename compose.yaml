@@ -69,6 +69,8 @@ services:
     profiles: [tls]
     image: ${EDGE_IMAGE:-caddy:2-alpine}
     network_mode: host
+    environment:
+      BOT_INTERNAL_SECRET: ${BOT_INTERNAL_SECRET:?Generate local secrets first}
     mem_limit: 64m
     pids_limit: 64
     volumes:

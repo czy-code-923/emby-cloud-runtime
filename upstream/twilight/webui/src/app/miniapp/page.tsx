@@ -8,6 +8,7 @@ import type { MiniAccount } from "@/lib/api-types";
 import { useAsyncResource } from "@/hooks/use-async-resource";
 import { useI18n, type MessageKey } from "@/lib/i18n";
 import styles from "./miniapp.module.css";
+import {MemberDevices} from "./member-devices";
 
 declare global { interface Window { Telegram?: {WebApp?: {initData:string;ready():void;expand():void;openLink?(url:string):void}} } }
 type Tab = "home"|"benefits"|"requests"|"account";
@@ -31,6 +32,7 @@ function RemotePanel({section,revision}:{section:ReadSection;revision:number}) {
 export default function MiniAppPage() {
  const {t}=useI18n();
  const [sdk,setSdk]=useState(false),[tab,setTab]=useState<Tab>("home"),[busy,setBusy]=useState(false),[notice,setNotice]=useState(""),[revision,setRevision]=useState(0),[confirmRenew,setConfirmRenew]=useState(false);
+ const [verificationID,setVerificationID]=useState("");
  const requestId=useRef(""),authenticated=useRef(false),operation=useRef(false);
  const load=useCallback(async(signal?:AbortSignal)=>{
   const app=window.Telegram?.WebApp;
@@ -47,7 +49,8 @@ export default function MiniAppPage() {
   if(operation.current)return;operation.current=true;setBusy(true);setNotice("");
   try{const r=await api.miniAction(name,body);if(!r.success)throw new Error(r.message);setNotice(r.message||t("mini.saved"));setRevision(v=>v+1);await execute()}catch(e){setNotice(e instanceof Error?e.message:t("mini.failed"))}finally{operation.current=false;setBusy(false);setConfirmRenew(false)}
  }
- function form(e:FormEvent<HTMLFormElement>,name:"redeem"|"register"|"requests") {e.preventDefault();const el=e.currentTarget;const body=Object.fromEntries(new FormData(el).entries());el.reset();void action(name,body)}
+ function form(e:FormEvent<HTMLFormElement>,name:"redeem"|"register"|"requests"|"security"|"password"|"device-release") {e.preventDefault();const el=e.currentTarget;const body=Object.fromEntries(new FormData(el).entries());el.reset();void action(name,body)}
+ async function sendPasswordEmail(){if(operation.current)return;operation.current=true;setBusy(true);try{const r=await api.miniAction<{verification_id:string}>("password-email");if(!r.success)throw new Error(r.message);setVerificationID(r.data?.verification_id||"");setNotice(r.message)}catch(e){setNotice(e instanceof Error?e.message:t("mini.failed"))}finally{operation.current=false;setBusy(false)}}
  function external(url:string){if(!url.startsWith("https://"))return;if(window.Telegram?.WebApp?.openLink)window.Telegram.WebApp.openLink(url);else window.open(url,"_blank","noopener,noreferrer")}
  const renew=data?.signin.summary.renewal;
  const tile=(icon:ReactNode,label:string,detail:string,click:()=>void,disabled=false)=><button type="button" className={styles.tile} disabled={disabled||busy} onClick={click}><span className={styles.tileIcon}>{icon}</span><span><strong>{label}</strong><small>{detail}</small></span></button>;
@@ -76,6 +79,9 @@ export default function MiniAppPage() {
      {!data.has_emby&&<Glass><h3>{t("mini.register")}</h3>{data.can_register?<form onSubmit={e=>form(e,"register")}><label>{t("mini.username")}<input name="emby_username" minLength={3} maxLength={32} autoComplete="username" required/></label><label>{t("mini.password")}<input name="emby_password" type="password" minLength={8} maxLength={128} autoComplete="new-password" required/></label><p className={styles.muted}>{t("mini.passwordHint")}</p><button className={styles.primary} disabled={busy}>{t("mini.register")}</button></form>:<><p>{t("mini.registrationRequired")}</p><button className={styles.secondary} onClick={()=>setTab("benefits")}>{t("mini.redeem")}</button></>}</Glass>}
      <Glass><h3><Compass size={18}/>{t("mini.lines")}</h3><RemotePanel section="lines" revision={revision}/></Glass>
      <Glass><h3><Smartphone size={18}/>{t("mini.devices")}</h3><RemotePanel section="devices" revision={revision}/></Glass>
+     <Glass><h3>{t("mini.registeredDevices")}</h3><MemberDevices revision={revision} busy={busy} release={body=>action("device-release",body)}/></Glass>
+     <Glass><h3><ShieldCheck size={18}/>{t("mini.security")}</h3><p className={styles.muted}>{t("mini.securityHint")}</p><form onSubmit={e=>form(e,"security")}>{data.security_code_set&&<label>{t("mini.oldCode")}<input name="old_code" type="password" inputMode="numeric" pattern="[0-9]{6,12}" autoComplete="off" required/></label>}<label>{t("mini.newCode")}<input name="new_code" type="password" inputMode="numeric" pattern="[0-9]{6,12}" autoComplete="new-password" required/></label><button className={styles.secondary} disabled={busy}>{t("mini.saveSecurity")}</button></form></Glass>
+     {data.has_emby&&data.security_code_set&&<Glass><h3>{t("mini.changePassword")}</h3><form onSubmit={e=>form(e,"password")}><label>{t("mini.security")}<input name="security_code" type="password" inputMode="numeric" autoComplete="off" required/></label><label>{t("mini.password")}<input name="new_password" type="password" minLength={8} maxLength={128} autoComplete="new-password" required/></label><input name="verification_id" type="hidden" value={verificationID}/>{data.password_email_required&&<><button type="button" className={styles.secondary} disabled={busy} onClick={()=>void sendPasswordEmail()}>{t("mini.sendEmailCode")}</button><label>{t("mini.emailCode")}<input name="email_code" autoComplete="one-time-code" required/></label></>}<p className={styles.muted}>{t("mini.passwordHint")}</p><button className={styles.secondary} disabled={busy}>{t("mini.changePassword")}</button></form></Glass>}
      <Glass><h3><ShieldCheck size={18}/>{t("mini.nativeBot")}</h3><p className={styles.muted}>{t("mini.nativeBotHint")}</p><p className={styles.commands}>/panel · /signin · /redeem · /register · /devices · /lines · /request · /invite · /help</p><details><summary>{t("mini.about")}</summary><p>{t("mini.aboutText")}</p><a href="https://github.com/czy-code-923/emby-cloud-runtime" target="_blank" rel="noopener noreferrer">{t("mini.sourceLicense")}</a></details></Glass>
     </>}
     <nav className={styles.nav} aria-label={t("mini.navigation")}>{([{key:"home",icon:<Film/>,label:t("mini.home")},{key:"benefits",icon:<Ticket/>,label:t("mini.benefits")},{key:"requests",icon:<Clapperboard/>,label:t("mini.requests")},{key:"account",icon:<UserRound/>,label:t("mini.account")}] as const).map(item=><button key={item.key} aria-current={tab===item.key?"page":undefined} onClick={()=>{setTab(item.key);setNotice("");setConfirmRenew(false)}}>{item.icon}<span>{item.label}</span></button>)}</nav>

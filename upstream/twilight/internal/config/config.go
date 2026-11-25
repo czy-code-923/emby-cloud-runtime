@@ -362,6 +362,13 @@ type Config struct {
 	PermanentInviteMaxDays       int
 	UserLimit                    int
 	DeviceLimitEnabled           bool
+	MediaLimitsEnabled           bool
+	MediaNormalDevices           int
+	MediaNormalStreams           int
+	MediaWhitelistDevices        int
+	MediaWhitelistStreams        int
+	MediaAdminDevices            int
+	MediaAdminStreams            int
 	MaxDevices                   int
 	MaxStreams                   int
 
@@ -659,6 +666,13 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	cfg.SystemUpdateIntervalHours = reader.intValue(cfg.SystemUpdateIntervalHours, "SystemUpdate.auto_update_interval_hours", "auto_update_interval_hours")
 	cfg.SystemUpdateTime = reader.stringValue(cfg.SystemUpdateTime, "SystemUpdate.auto_update_time", "auto_update_time")
 	cfg.DeviceLimitEnabled = reader.boolValue(cfg.DeviceLimitEnabled, "DeviceLimit.enabled", "DeviceLimit.device_limit_enabled", "device_limit_enabled")
+	cfg.MediaLimitsEnabled = reader.boolValue(cfg.MediaLimitsEnabled, "DeviceLimit.media_limits_enabled")
+	cfg.MediaNormalDevices = reader.intValue(cfg.MediaNormalDevices, "DeviceLimit.media_normal_devices")
+	cfg.MediaNormalStreams = reader.intValue(cfg.MediaNormalStreams, "DeviceLimit.media_normal_streams")
+	cfg.MediaWhitelistDevices = reader.intValue(cfg.MediaWhitelistDevices, "DeviceLimit.media_whitelist_devices")
+	cfg.MediaWhitelistStreams = reader.intValue(cfg.MediaWhitelistStreams, "DeviceLimit.media_whitelist_streams")
+	cfg.MediaAdminDevices = reader.intValue(cfg.MediaAdminDevices, "DeviceLimit.media_admin_devices")
+	cfg.MediaAdminStreams = reader.intValue(cfg.MediaAdminStreams, "DeviceLimit.media_admin_streams")
 	cfg.MaxDevices = reader.intValue(cfg.MaxDevices, "DeviceLimit.max_devices", "max_devices")
 	cfg.MaxStreams = reader.intValue(cfg.MaxStreams, "DeviceLimit.max_streams", "max_streams")
 	cfg.ForgotPasswordEnabled = reader.boolValue(cfg.ForgotPasswordEnabled, "Security.forgot_password_enabled", "forgot_password_enabled")
@@ -859,6 +873,12 @@ func defaults() Config {
 		InviteDefaultDays:                    30,
 		PermanentInviteMaxDays:               365,
 		UserLimit:                            -1,
+		MediaNormalDevices:                   5,
+		MediaNormalStreams:                   2,
+		MediaWhitelistDevices:                10,
+		MediaWhitelistStreams:                3,
+		MediaAdminDevices:                    0,
+		MediaAdminStreams:                    0,
 		MaxDevices:                           5,
 		MaxStreams:                           2,
 		ForgotPasswordEnabled:                true,

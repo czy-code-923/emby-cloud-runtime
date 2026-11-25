@@ -23,10 +23,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "@/lib/i18n";
 import { api, type UserInfo } from "@/lib/api";
+import { MemberSecurityReset } from "@/components/admin/member-security-reset";
 import { formatDate } from "@/lib/utils";
 
 export interface EditUserForm {
+  media_max_devices:number|null; media_max_streams:number|null;
   role: number;
   emby_id: string;
   active: boolean;
@@ -35,7 +38,7 @@ export interface EditUserForm {
 /**
  * 编辑用户基本信息对话框：角色 / Emby ID / 启停。
  * - 角色枚举与后端 store.Role 一致（0=管理员 / 1=普通 / 2=白名单）
- * - Emby ID 留空表示"清除绑定"，由后端 update 流程兜底校验
+ * - Emby ID 只读；绑定与解绑通过专用操作完成
  * - 提交按钮在 isLoading 时禁用，避免双击重复请求
  */
 export function EditUserDialog({
@@ -55,6 +58,7 @@ export function EditUserDialog({
   onSubmit: () => void;
   isLoading: boolean;
 }) {
+  const {t}=useI18n();
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
@@ -84,12 +88,18 @@ export function EditUserDialog({
           <div className="space-y-2">
             <Label>Emby ID（可选）</Label>
             <Input
-              placeholder="输入 Emby 用户 ID"
+              readOnly
+              placeholder="Emby ID"
               value={form.emby_id}
               onChange={(e) => onFormChange({ ...form, emby_id: e.target.value })}
             />
           </div>
 
+
+          <div className="grid grid-cols-2 gap-3">
+           <div className="space-y-2"><Label htmlFor="media-devices">{t("mini.maxDevices")}</Label><Input id="media-devices" type="number" min={0} max={100} value={form.media_max_devices??""} placeholder={t("mini.roleDefault")} onChange={e=>onFormChange({...form,media_max_devices:e.target.value===""?null:Number(e.target.value)})}/></div>
+           <div className="space-y-2"><Label htmlFor="media-streams">{t("mini.maxStreams")}</Label><Input id="media-streams" type="number" min={0} max={100} value={form.media_max_streams??""} placeholder={t("mini.roleDefault")} onChange={e=>onFormChange({...form,media_max_streams:e.target.value===""?null:Number(e.target.value)})}/></div>
+          </div><p className="text-xs font-normal text-muted-foreground">{t("mini.limitHint")}</p>{user&&<MemberSecurityReset uid={user.uid}/>}
           <div className="flex items-center gap-2">
             <input
               type="checkbox"

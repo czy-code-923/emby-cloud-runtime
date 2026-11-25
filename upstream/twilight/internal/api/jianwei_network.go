@@ -13,7 +13,7 @@ func (a *App) handleNetworkStatus(w http.ResponseWriter, r *http.Request, _ Para
 		return
 	}
 	data["desired_origin"] = a.cfg().PublicBaseURL
-	data["desired_origins"] = map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL}
+	data["desired_origins"] = map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL, "playback": a.cfg().EmbyPublicURL}
 	w.Header().Set("Cache-Control", "private, no-store")
 	ok(w, "OK", data)
 }
@@ -31,8 +31,8 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 	}
 	operation := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 	profile := stringValue(payload, "profile")
-	if profile != "account" && profile != "shop" {
-		fail(w, 400, "请选择账户或购买网站入口")
+	if profile != "account" && profile != "shop" && profile != "playback" {
+		fail(w, 400, "请选择 Mini App、商店或播放入口")
 		return
 	}
 	revision := intValue(payload, "expected_revision", -1)
@@ -43,6 +43,9 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 	origin := a.cfg().PublicBaseURL
 	if profile == "shop" {
 		origin = a.cfg().CommerceStoreURL
+	}
+	if profile == "playback" {
+		origin = a.cfg().EmbyPublicURL
 	}
 	var body map[string]any
 	switch operation {
@@ -76,7 +79,7 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 		fail(w, status, "证书操作未提交，请检查域名、凭据与任务状态")
 		return
 	}
-	data["desired_origins"] = map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL}
+	data["desired_origins"] = map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL, "playback": a.cfg().EmbyPublicURL}
 	a.audit(r, "network_"+operation, "system", current(r).User.UID, map[string]any{"origin": a.cfg().PublicBaseURL})
 	w.Header().Set("Cache-Control", "private, no-store")
 	ok(w, "OK", data)

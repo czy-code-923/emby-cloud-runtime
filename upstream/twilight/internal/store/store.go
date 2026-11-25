@@ -173,6 +173,13 @@ type State struct {
 }
 
 type User struct {
+	SecurityCodeHash    string        `json:"security_code_hash,omitempty"`
+	MediaMaxDevices     *int          `json:"media_max_devices,omitempty"`
+	MediaMaxStreams     *int          `json:"media_max_streams,omitempty"`
+	MediaPolicyManaged  bool          `json:"media_policy_managed,omitempty"`
+	MediaDevices        []MediaDevice `json:"media_devices,omitempty"`
+	MediaRevokedDevices []string      `json:"media_revoked_devices,omitempty"`
+
 	UID              int64  `json:"uid"`
 	Username         string `json:"username"`
 	Email            string `json:"email,omitempty"`
