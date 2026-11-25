@@ -1693,3 +1693,10 @@ export interface NetworkStatus extends NetworkProfileStatus {
  job:{phase:string;operation?:string;profile?:string;error?:string;updated_at?:number};
  automatic_renewal:{interval_hours:number;enabled:boolean;active:boolean};
 }
+
+export interface MiniAccount {
+  uid:number; username:string; emby_username:string; media_enabled:boolean; has_emby:boolean;
+  expired_at:number; points:number; signin_enabled:boolean; last_signin:string; can_register:boolean;
+  invite_enabled:boolean; requests_enabled:boolean; shop_url:string; banner:string; banner_url:string; role:number;
+  signin:{summary:SigninSummary;config:SigninPublicConfig;history:SigninHistoryRecord[]};
+}

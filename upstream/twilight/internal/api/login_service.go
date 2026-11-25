@@ -109,6 +109,9 @@ func (a *App) completeLogin(r *http.Request, input loginInput, user store.User) 
 	return a.completeVerifiedLogin(r, input, user, "", "")
 }
 func (a *App) completeVerifiedLogin(r *http.Request, input loginInput, user store.User, version, proof string) (loginResult, error) {
+	if a.cfg().WebAdminOnly && user.Role != store.RoleAdmin {
+		return loginResult{}, loginFail(http.StatusForbidden, ErrForbidden, "网页仅供管理员登录，请使用 Telegram 机器人或 Mini App")
+	}
 	deviceID := loginDeviceID(input.DeviceID, input.UserAgent, input.IP)
 	// 管理员封禁的设备不能再登录：先于签发会话拦截，并顺手吊销该设备上残留的会话
 	// （封禁发生在本修复之前、当时没有吊销的旧会话）。

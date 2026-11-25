@@ -1110,7 +1110,7 @@ func (a *App) authenticateUser(r *http.Request) (*principal, bool) {
 	// 必须立即被拒。redis 缓存的 sessionRecord 不含 active 字段，所以不能依赖
 	// 缓存层做这件事；store.User 才是 active 的唯一真相源。
 	// 与 authenticateAPIKey:495 的 `!u.Active` 检查口径一致。
-	if !u.Active {
+	if !u.Active || (a.cfg().WebAdminOnly && u.Role != store.RoleAdmin) {
 		return nil, false
 	}
 	return &principal{User: u, Token: token, FromCookie: fromCookie, Session: record}, true

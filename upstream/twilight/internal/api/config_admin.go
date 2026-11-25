@@ -1040,7 +1040,8 @@ func configSectionDefs() []configSectionDef {
 	selectRegcodeDecoyAction := regcodeDecoyActionOptions()
 	return []configSectionDef{
 		{Key: "Global", Title: "全局", Description: "基础运行参数", Category: "runtime", Collapsed: true, Fields: []configFieldDef{
-			{Key: "commerce_store_url", Label: "独立购买网站域名", Type: "string", Description: "例如 https://jwshop.iczy.top；与账户/Mini App域名分开，不在Telegram中分发。"},
+			{Key: "admin_only", Label: "网页仅允许管理员登录", Type: "bool", Description: "普通用户使用 Telegram 与 Mini App；启用后已有普通网页会话也失效，不影响 Emby 客户端登录"},
+			{Key: "commerce_store_url", Label: "独立购买网站域名", Type: "string", Description: "例如 https://jwshop.iczy.top；与账户/Mini App域名分开；Telegram 中的商店按钮由 shop_enabled 控制。"},
 			{Key: "public_base_url", Label: "账户与Mini App域名", Type: "string", Description: "例如 https://account.example.com；保存期望地址后，在站点与入口单独申请证书并发布。管理后台继续通过SSH/VPN安全入口使用。"},
 			{Key: "server_name", Label: "服务器名称", Type: "string", Description: "前端展示的站点或服务器名称"},
 			{Key: "server_icon", Label: "服务器图标", Type: "string", Description: "HTTPS 图片 URL 或本地图片路径；留空使用内置图标"},
@@ -1090,6 +1091,10 @@ func configSectionDefs() []configSectionDef {
 		}},
 		{Key: "Telegram", Title: "Telegram", Description: "Bot、订阅校验和群组管理\n推荐在 Telegram 管理页面操作 Bot 基础设置，高级参数在此调整", Category: "integration", Collapsed: true, Fields: []configFieldDef{
 			{Key: "auto_provision", Label: "启动时自动建立用户身份", Type: "bool", Description: "用户在Bot私聊/start时按Telegram ID幂等建立普通账户；不匹配同名网页用户、不授予管理员或免费Emby权限，仍受总用户上限控制"},
+			{Key: "shop_enabled", Label: "显示独立发卡商店入口", Type: "bool", Description: "在机器人和 Mini App 显示外部购买网站按钮；实际核款和发卡仍在独立网站完成"},
+			{Key: "banner_enabled", Label: "显示机器人顶部推广位", Type: "bool", Description: "在机器人主面板和 Mini App 顶部显示带推广标识的内容"},
+			{Key: "banner_text", Label: "推广位文案", Type: "string", Description: "纯文本，最多显示500字；不支持脚本或HTML"},
+			{Key: "banner_url", Label: "推广位链接", Type: "string", Description: "可选HTTPS链接，关闭推广位后隐藏"},
 			{Key: "mini_app_url", Label: "Mini App HTTPS地址", Type: "string", Description: "例如 https://account.example.com/miniapp；需先发布有效域名证书；与独立商店分离"},
 			{Key: "login_enabled", Label: "Telegram 扫码登录", Type: "bool", Description: "仅已绑定账号可登录，需要在 Bot 私聊确认；默认关闭"},
 			{Key: "telegram_api_url", Label: "Bot API URL", Type: "string", Description: "Telegram Bot API 基础地址"},
@@ -1310,7 +1315,7 @@ func configSectionDefs() []configSectionDef {
 func configValues(cfg config.Config) map[string]map[string]any {
 	return map[string]map[string]any{
 		"Global": {
-			"server_name": cfg.AppName, "public_base_url": cfg.PublicBaseURL, "commerce_store_url": cfg.CommerceStoreURL, "server_icon": cfg.ServerIcon, "auth_background_url": cfg.AuthBackgroundURL, "databases_dir": cfg.DatabaseDir, "redis_url": cfg.RedisURL, "telegram_mode": cfg.TelegramMode, "force_bind_telegram": cfg.ForceBindTelegram,
+			"admin_only": cfg.WebAdminOnly, "server_name": cfg.AppName, "public_base_url": cfg.PublicBaseURL, "commerce_store_url": cfg.CommerceStoreURL, "server_icon": cfg.ServerIcon, "auth_background_url": cfg.AuthBackgroundURL, "databases_dir": cfg.DatabaseDir, "redis_url": cfg.RedisURL, "telegram_mode": cfg.TelegramMode, "force_bind_telegram": cfg.ForceBindTelegram,
 			"log_level": cfg.LogLevel, "runtime_log_limit": cfg.RuntimeLogLimit, "runtime_memory_limit_mb": cfg.RuntimeMemoryLimitMB,
 			"tmdb_api_key": cfg.TMDBAPIKey, "tmdb_api_url": cfg.TMDBAPIURL, "tmdb_image_url": cfg.TMDBImageURL, "bangumi_token": cfg.BangumiToken, "bangumi_api_url": cfg.BangumiAPIURL,
 			"bangumi_app_id": cfg.BangumiAppID,
@@ -1329,7 +1334,7 @@ func configValues(cfg config.Config) map[string]map[string]any {
 			"playback_reporting_enabled": cfg.PlaybackReportingEnabled,
 		},
 		"Telegram": {
-			"auto_provision": cfg.TelegramAutoProvision, "mini_app_url": cfg.TelegramMiniAppURL, "login_enabled": cfg.TelegramLoginEnabled,
+			"shop_enabled": cfg.TelegramShopEnabled, "banner_enabled": cfg.TelegramBannerEnabled, "banner_text": cfg.TelegramBannerText, "banner_url": cfg.TelegramBannerURL, "auto_provision": cfg.TelegramAutoProvision, "mini_app_url": cfg.TelegramMiniAppURL, "login_enabled": cfg.TelegramLoginEnabled,
 			"telegram_api_url": cfg.TelegramAPIURL, "bot_token": cfg.TelegramBotToken, "admin_id": int64sToAny(cfg.TelegramAdminIDs), "group_id": cfg.TelegramGroupIDs,
 			"force_subscribe":  cfg.TelegramForceSubscribe,
 			"force_bind_group": cfg.TelegramForceBindGroup, "channel_id": cfg.TelegramChannelIDs, "force_bind_channel": cfg.TelegramForceBindChannel,

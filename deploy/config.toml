@@ -1,5 +1,6 @@
 setup_mode = true
 [Global]
+admin_only = true
 server_name = "见微 Emby"
 server_icon = "/brand/jianwei-mark.svg"
 public_base_url = ""
@@ -31,6 +32,10 @@ emby_url_list = []
 emby_url_list_for_whitelist = []
 [Telegram]
 auto_provision = true
+shop_enabled = false
+banner_enabled = false
+banner_text = ""
+banner_url = ""
 mini_app_url = ""
 bot_token = ""
 login_enabled = false

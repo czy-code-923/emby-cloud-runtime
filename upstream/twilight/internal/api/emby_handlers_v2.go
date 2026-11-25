@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 )
 
 func (a *App) handleV2EmbyStats(w http.ResponseWriter, r *http.Request, _ Params) {
@@ -76,6 +77,10 @@ func (a *App) handleV2EmbyUserSessions(w http.ResponseWriter, r *http.Request, _
 		return
 	}
 	user := current(r).User
+	if strings.TrimSpace(user.EmbyID) == "" {
+		ok(w, "OK", []any{})
+		return
+	}
 	items := []map[string]any{}
 	for _, session := range remote {
 		if asString(session["UserId"]) != user.EmbyID {
@@ -100,15 +105,7 @@ func (a *App) handleV2EmbyUserSessions(w http.ResponseWriter, r *http.Request, _
 }
 
 func (a *App) handleV2EmbyURLs(w http.ResponseWriter, r *http.Request, _ Params) {
-	cfg := a.cfg()
-	lines := []map[string]string{}
-	for _, line := range cfg.EmbyURLList {
-		lines = append(lines, map[string]string{"name": line.Name, "url": line.URL})
-	}
-	if cfg.EmbyPublicURL != "" {
-		lines = append(lines, map[string]string{"name": "默认线路", "url": cfg.EmbyPublicURL})
-	}
-	ok(w, "OK", map[string]any{"lines": lines})
+	a.handleEmbyURLs(w, r, nil)
 }
 
 func (a *App) handleV2AdminEmbyURLs(w http.ResponseWriter, r *http.Request, _ Params) {

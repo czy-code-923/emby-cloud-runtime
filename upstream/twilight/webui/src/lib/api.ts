@@ -1,4 +1,5 @@
 import type {
+  MiniAccount,
   AdminUserListParams,
   AdminUserListResponse,
   Announcement,
@@ -3312,7 +3313,30 @@ class ApiClient {
     return this.request<{authenticated:boolean}>("/miniapp/session", {method:"POST",signal,body:JSON.stringify({init_data:initData,request_id:requestId})},{cacheRead:false,dedupe:false,apiVersion:"v2"});
   }
   async miniAccount(signal?: AbortSignal) {
-    return this.request<{uid:number;username:string;media_enabled:boolean;expired_at:number|null;points:number;signin_enabled:boolean;last_signin:string}>("/miniapp/account",{signal,cache:"no-store"},{cacheRead:false,dedupe:false,apiVersion:"v2"});
+    return this.request<MiniAccount>("/miniapp/account",{signal,cache:"no-store"},{cacheRead:false,dedupe:false,apiVersion:"v2"});
+  }
+
+  async miniRead<T>(section:"lines"|"devices"|"requests"|"invite", signal?:AbortSignal) {
+    const options={signal,cache:"no-store" as const};
+    const extra={cacheRead:false,dedupe:false,apiVersion:"v2" as const};
+    switch(section){
+      case "lines":return this.request<T>("/miniapp/lines",options,extra);
+      case "devices":return this.request<T>("/miniapp/devices",options,extra);
+      case "requests":return this.request<T>("/miniapp/requests",options,extra);
+      case "invite":return this.request<T>("/miniapp/invite",options,extra);
+    }
+  }
+  async miniAction<T=Record<string,unknown>>(action:"signin"|"renew"|"redeem"|"register"|"requests"|"invite",payload:Record<string,unknown>={}) {
+    const options={method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"miniapp-action"},body:JSON.stringify(payload),cache:"no-store" as const};
+    const extra={cacheRead:false,dedupe:false,apiVersion:"v2" as const};
+    switch(action){
+      case "signin":return this.request<T>("/miniapp/signin", {...options, method:"POST"}, extra);
+      case "renew":return this.request<T>("/miniapp/renew", {...options, method:"POST"}, extra);
+      case "redeem":return this.request<T>("/miniapp/redeem", {...options, method:"POST"}, extra);
+      case "register":return this.request<T>("/miniapp/register", {...options, method:"POST"}, extra);
+      case "requests":return this.request<T>("/miniapp/requests", {...options, method:"POST"}, extra);
+      case "invite":return this.request<T>("/miniapp/invite", {...options, method:"POST"}, extra);
+    }
   }
 
   async getInviteSummary(signal?: AbortSignal) {

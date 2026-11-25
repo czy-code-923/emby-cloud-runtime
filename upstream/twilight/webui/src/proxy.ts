@@ -49,6 +49,7 @@ export function proxy(request: NextRequest) {
   if (miniApp) csp = csp.replace("script-src 'self'", "script-src 'self' https://telegram.org").replace("frame-ancestors 'none'", "frame-ancestors https://web.telegram.org https://*.telegram.org https://t.me https://webogram.org");
   const response = NextResponse.next();
   response.headers.set("Content-Security-Policy", csp);
+  if (miniApp) response.headers.set("Cache-Control", "private, no-store");
   return response;
 }
 

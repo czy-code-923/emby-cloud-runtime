@@ -204,6 +204,9 @@ func (a *App) RunTelegramBot(ctx context.Context) error {
 			if botIdentity != "" && botIdentity != activeBot {
 				activeBot = botIdentity
 				a.setTelegramRuntimeStatus(true, nil)
+				if err := a.publishTelegramMemberCommands(ctx); err != nil {
+					zap.L().Warn("Telegram command menu publication failed")
+				}
 				zap.L().Info("Telegram bot polling started", zap.String("username", botIdentity), zap.Int64("resume_offset", offset))
 			}
 		}
@@ -256,6 +259,9 @@ func (a *App) handleTelegramUpdate(ctx context.Context, update *telegramUpdate) 
 	}
 	a.observeTelegramRoster(update)
 	if callback := update.CallbackQuery; callback != nil {
+		if a.telegramHandleMemberCallback(ctx, callback) {
+			return
+		}
 		if a.telegramHandleLoginCallback(ctx, callback) {
 			return
 		}

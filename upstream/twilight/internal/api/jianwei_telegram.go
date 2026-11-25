@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -91,17 +90,7 @@ func (a *App) telegramStartProfile(ctx context.Context, chatID, fromID int64, us
 	if created {
 		a.auditTelegramAction(fromID, "telegram_profile_created", "user", user.UID, map[string]any{"source": "start"})
 	}
-	text := fmt.Sprintf("见微 Emby\n\n已识别您的 Telegram 身份\n账户：%s\nUID：%d\n", user.Username, user.UID)
-	if user.EmbyID == "" {
-		text += "媒体服务：尚未开通\n身份建立不会自动授予播放权限。"
-	} else {
-		text += "媒体服务：已绑定\n可在面板查看权益和保号进度。"
-	}
-	if target := a.jianweiMiniURL(); target != "" {
-		_, _ = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: chatID, Text: text, DisableWebPagePreview: true, ReplyMarkup: map[string]any{"inline_keyboard": [][]map[string]any{{{"text": "打开见微面板", "web_app": map[string]string{"url": target}}}}}}, 20*time.Second)
-	} else {
-		_ = a.telegramSendMessage(ctx, chatID, text+"\n\nMini App 等待管理员配置 HTTPS 入口。")
-	}
+	a.telegramMemberPanel(ctx, chatID, user)
 }
 
 func (a *App) handleJianweiTelegramIdentity(w http.ResponseWriter, r *http.Request, _ Params) {
@@ -233,6 +222,5 @@ func (a *App) handleMiniAccount(w http.ResponseWriter, r *http.Request, _ Params
 	if !okUser {
 		return
 	}
-	si := a.store().Signin(user.UID)
-	ok(w, "OK", map[string]any{"uid": user.UID, "username": user.Username, "media_enabled": user.EmbyID != "" && !user.EmbyDisabled, "expired_at": publicExpiryUnix(user.ExpiredAt), "points": si.Points, "signin_enabled": a.cfg().SigninEnabled, "last_signin": si.LastSignin})
+	ok(w, "OK", a.memberAccount(user))
 }

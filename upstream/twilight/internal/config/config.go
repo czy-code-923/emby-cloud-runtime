@@ -167,6 +167,11 @@ type Config struct {
 	EmbyWhitelistURLList           []Line
 	EmbyPublicURL                  string
 	EmbyWhitelistURL               string
+	WebAdminOnly                   bool
+	TelegramShopEnabled            bool
+	TelegramBannerEnabled          bool
+	TelegramBannerText             string
+	TelegramBannerURL              string
 	TelegramAutoProvision          bool
 	TelegramMiniAppURL             string
 	TelegramMode                   bool
@@ -466,6 +471,11 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	cfg.EmbyWhitelistURL = reader.stringValue(cfg.EmbyWhitelistURL, "Emby.emby_whitelist_url", "emby_whitelist_url")
 	cfg.EmbyURLList = parseLinesList(reader.stringListValue(nil, "Emby.emby_url_list", "emby_url_list"))
 	cfg.EmbyWhitelistURLList = parseLinesList(reader.stringListValue(nil, "Emby.emby_url_list_for_whitelist", "emby_url_list_for_whitelist"))
+	cfg.WebAdminOnly = reader.boolValue(cfg.WebAdminOnly, "Global.admin_only")
+	cfg.TelegramShopEnabled = reader.boolValue(cfg.TelegramShopEnabled, "Telegram.shop_enabled")
+	cfg.TelegramBannerEnabled = reader.boolValue(cfg.TelegramBannerEnabled, "Telegram.banner_enabled")
+	cfg.TelegramBannerText = reader.stringValue(cfg.TelegramBannerText, "Telegram.banner_text")
+	cfg.TelegramBannerURL = reader.stringValue(cfg.TelegramBannerURL, "Telegram.banner_url")
 	cfg.TelegramAutoProvision = reader.boolValue(cfg.TelegramAutoProvision, "Telegram.auto_provision")
 	cfg.TelegramMiniAppURL = reader.stringValue(cfg.TelegramMiniAppURL, "Telegram.mini_app_url")
 	cfg.TelegramMode = reader.boolValue(cfg.TelegramMode, "Global.telegram_mode", "telegram_mode")
