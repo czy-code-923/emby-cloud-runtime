@@ -63,7 +63,7 @@ export default function AdminIndexPage() {
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-2xl font-bold">{t("adminNav.title")}</h1>
+        <h1 className="text-2xl font-semibold">{t("adminNav.title")}</h1>
         <p className="text-sm text-muted-foreground mt-1">{t("adminNav.description")}</p>
       </div>
 

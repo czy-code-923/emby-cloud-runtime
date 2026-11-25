@@ -285,7 +285,7 @@ export default function AdminRuntimeLogsPage() {
     <div className="space-y-5">
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div className="min-w-0">
-          <h1 className="text-2xl font-bold sm:text-3xl">{t("adminLogs.title")}</h1>
+          <h1 className="text-2xl font-semibold sm:text-3xl">{t("adminLogs.title")}</h1>
           <p className="break-words text-sm text-muted-foreground">{t("adminLogs.description")}</p>
         </div>
         <div className="flex flex-wrap gap-2">

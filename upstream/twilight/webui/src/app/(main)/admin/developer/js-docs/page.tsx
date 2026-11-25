@@ -13,7 +13,7 @@ export default function DeveloperJSDocsPage() {
     <div className="space-y-5">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0">
-          <h1 className="flex items-center gap-2 text-2xl font-bold">
+          <h1 className="flex items-center gap-2 text-2xl font-semibold">
             <BookOpen className="h-6 w-6" />
             {t("adminDeveloper.docsPageTitle")}
           </h1>

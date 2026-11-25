@@ -2,6 +2,7 @@
 # Consistent application snapshot. Does not copy PostgreSQL's live data directory.
 set -Eeuo pipefail
 umask 077
+readiness_script="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/wait-emby.py"
 backup_root=${EMBY_CLOUD_ROOT:-"$(dirname -- "${BASH_SOURCE[0]}")/.."}
 cd -- "$backup_root"
 [[ $EUID == 0 ]] || { echo 'Run as root'; exit 1; }
@@ -23,6 +24,13 @@ cleanup() {
   rc=$?
   trap - EXIT
   if $restore_created; then "${dc[@]}" exec -T postgres dropdb -U twilight --if-exists "$restore_db" >/dev/null || rc=1; fi
+  # Resume the media server before its consumers. A successful container start
+  # does not mean Emby's HTTP listener is ready after a consistent backup.
+  if [[ " ${writers[*]} " == *" emby "* ]]; then
+    "${dc[@]}" start emby || rc=1
+    python3 "$readiness_script" || rc=1
+  fi
+  # Always restore the other services, even when Emby needs operator attention.
   if ((${#writers[@]})); then "${dc[@]}" start "${writers[@]}" || rc=1; fi
   rm -rf -- "$stage"
   exit "$rc"

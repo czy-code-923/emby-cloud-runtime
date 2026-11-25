@@ -28,15 +28,12 @@ import {
   BookOpen,
   Info,
   CircleDot,
-  GitPullRequest,
   Database,
   Archive,
   Trash2,
   Upload,
   Image as ImageIcon,
 } from "lucide-react";
-import { GithubIcon } from "@/components/icons/github-icon";
-import { GithubProjectLink } from "@/components/github-project-link";
 import {
   Card,
   CardContent,
@@ -1098,11 +1095,7 @@ export default function AdminConfigPage() {
   );
   const [activeSection, setActiveSection] = useState("");
   const [showSaveDialog, setShowSaveDialog] = useState(false);
-  const [updateRepoUrl, setUpdateRepoUrl] = useState("https://github.com/Prejudice-Studio/Twilight.git");
-  const [updateBranch, setUpdateBranch] = useState("main");
-  const [updateRestartServices, setUpdateRestartServices] = useState(true);
-  const [isUpdating, setIsUpdating] = useState(false);
-  const [updateOutput, setUpdateOutput] = useState<string[]>([]);
+
   const [configBackups, setConfigBackups] = useState<ConfigBackup[]>([]);
   const [isLoadingConfigBackups, setIsLoadingConfigBackups] = useState(false);
   const [isConfigBackupBusy, setIsConfigBackupBusy] = useState(false);
@@ -1742,60 +1735,6 @@ export default function AdminConfigPage() {
     }
   };
 
-  const handleGitUpdate = async (dryRun = false) => {
-    setIsUpdating(true);
-    setUpdateOutput([]);
-    try {
-      const res = await api.updateFromGit({
-        repo_url: updateRepoUrl.trim(),
-        branch: updateBranch.trim() || "main",
-        restart_services: updateRestartServices,
-        dry_run: dryRun,
-      });
-      if (res.success) {
-        const before = res.data?.before;
-        const after = res.data?.after;
-        const summary = [
-          `mode=${dryRun ? "preflight" : "update"}`,
-          before ? `before=${before.branch}@${before.commit.slice(0, 12)} dirty=${before.dirty_count}` : "",
-          after ? `after=${after.branch}@${after.commit.slice(0, 12)} dirty=${after.dirty_count}` : "",
-          res.data?.repo_url ? `repo=${res.data.repo_url}` : "",
-        ].filter(Boolean);
-        const logs = (res.data?.results || []).map((item) => {
-          const output = [item.stdout, item.stderr].filter(Boolean).join("\n").trim();
-          return `$ ${item.command}\nexit=${item.returncode} duration=${item.duration_ms}ms${output ? `\n${output}` : ""}`;
-        });
-        setUpdateOutput([...summary, ...logs]);
-        toast({
-          title: dryRun ? t("adminConfig.preflightPassedTitle") : t("adminConfig.updateCompleteTitle"),
-          description: res.message || t("adminConfig.updateCompleteDescription"),
-          variant: "success",
-        });
-      } else {
-        const dirty = res.data?.before?.dirty_files?.length
-          ? [`dirty files (${res.data.before.dirty_count}):`, ...res.data.before.dirty_files]
-          : [];
-        setUpdateOutput([
-          ...dirty,
-          ...(res.data?.results || []).map((item) => `$ ${item.command}\n${item.stderr || item.stdout}`),
-        ]);
-        toast({
-          title: t("adminConfig.updateFailedTitle"),
-          description: res.message || t("adminConfig.checkCommandOutput"),
-          variant: "destructive",
-        });
-      }
-    } catch (error: any) {
-      toast({
-        title: t("adminConfig.updateFailedTitle"),
-        description: error.message || t("common.checkNetwork"),
-        variant: "destructive",
-      });
-    } finally {
-      setIsUpdating(false);
-    }
-  };
-
   if (schemaError && tomlError) {
     return (
       <PageError
@@ -1809,7 +1748,7 @@ export default function AdminConfigPage() {
     <TooltipProvider delayDuration={300}>
       <div className="space-y-6">
         <div>
-          <h1 className="text-3xl font-bold">{t("adminConfig.pageTitle")}</h1>
+          <h1 className="text-3xl font-semibold">{t("adminConfig.pageTitle")}</h1>
           <p className="text-muted-foreground">
             {t("adminConfig.pageDescription")}
           </p>
@@ -1830,10 +1769,7 @@ export default function AdminConfigPage() {
                 <Archive className="h-4 w-4" />
                 {t("adminConfig.tabBackups")}
               </TabsTrigger>
-              <TabsTrigger value="update" className="min-w-0 gap-1.5 px-2 sm:px-4">
-                <GitPullRequest className="h-4 w-4" />
-                {t("adminConfig.tabUpdate")}
-              </TabsTrigger>
+
             </TabsList>
           </div>
 
@@ -2096,7 +2032,7 @@ export default function AdminConfigPage() {
 
             {schema && !searchText && (
               <SectionPicker
-                sections={schema.sections}
+                sections={schema.sections.filter(section => section.key !== "SystemUpdate")}
                 categories={schema.categories ?? [FALLBACK_CATEGORY]}
                 activeSection={activeSection}
                 changedCounts={changedCounts}
@@ -2109,7 +2045,7 @@ export default function AdminConfigPage() {
               {/* 侧边导航 */}
               {schema && !searchText && (
                 <SectionNav
-                  sections={schema.sections}
+                  sections={schema.sections.filter(section => section.key !== "SystemUpdate")}
                   categories={schema.categories ?? [FALLBACK_CATEGORY]}
                   activeSection={activeSection}
                   changedCounts={changedCounts}
@@ -2144,7 +2080,7 @@ export default function AdminConfigPage() {
                           buckets.set(key, []);
                           orderedKeys.push(key);
                         }
-                        buckets.get(key)!.push(section);
+                        if (section.key !== "SystemUpdate") buckets.get(key)!.push(section);
                       }
                       const renderSection = (section: ConfigSection) => (
                         <SectionCard
@@ -2167,7 +2103,7 @@ export default function AdminConfigPage() {
 
                       // 搜索态：扁平渲染，不显示分组标题
                       if (searchText) {
-                        return schema.sections.map(renderSection);
+                        return schema.sections.filter(section => section.key !== "SystemUpdate").map(renderSection);
                       }
 
                       return orderedKeys.map((key) => {
@@ -2393,77 +2329,7 @@ export default function AdminConfigPage() {
             </div>
           </TabsContent>
 
-          <TabsContent value="update" className="mt-4">
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <GithubIcon className="h-5 w-5" />
-                  {t("adminConfig.gitUpdateTitle")}
-                </CardTitle>
-                <CardDescription>
-                  {t("adminConfig.gitUpdateDescription")}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-5">
-                <Alert>
-                  <AlertTriangle className="h-4 w-4" />
-                  <AlertTitle>{t("adminConfig.productionOperationTitle")}</AlertTitle>
-                  <AlertDescription>
-                    {t("adminConfig.productionOperationDescription")}
-                  </AlertDescription>
-                </Alert>
 
-                <div className="grid gap-4 md:grid-cols-[1fr_180px]">
-                  <div className="space-y-2">
-                    <Label htmlFor="update-repo-url">{t("adminConfig.repoUrlLabel")}</Label>
-                    <Input
-                      id="update-repo-url"
-                      value={updateRepoUrl}
-                      onChange={(e) => setUpdateRepoUrl(e.target.value)}
-                      placeholder="https://github.com/Prejudice-Studio/Twilight.git"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="update-branch">{t("adminConfig.branchLabel")}</Label>
-                    <Input
-                      id="update-branch"
-                      value={updateBranch}
-                      onChange={(e) => setUpdateBranch(e.target.value)}
-                      placeholder="main"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="flex items-center justify-between rounded-lg border p-3">
-                    <span>
-                      <span className="block text-sm font-medium">{t("adminConfig.autoRestartServices")}</span>
-                      <span className="text-xs text-muted-foreground">{t("adminConfig.autoRestartDescription")}</span>
-                    </span>
-                    <Switch checked={updateRestartServices} onCheckedChange={setUpdateRestartServices} />
-                  </label>
-                </div>
-
-                <div className="flex flex-wrap gap-2">
-                  <Button variant="outline" onClick={() => void handleGitUpdate(true)} disabled={isUpdating || !updateRepoUrl.trim()}>
-                    {isUpdating ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Shield className="mr-2 h-4 w-4" />}
-                    {t("adminConfig.safePreflight")}
-                  </Button>
-                  <Button onClick={() => void handleGitUpdate(false)} disabled={isUpdating || !updateRepoUrl.trim()}>
-                    {isUpdating ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <GitPullRequest className="mr-2 h-4 w-4" />}
-                    {t("adminConfig.pullAndUpdate")}
-                  </Button>
-                  <GithubProjectLink compact className="w-full sm:w-auto" />
-                </div>
-
-                {updateOutput.length > 0 && (
-                  <pre className="custom-scrollbar max-h-96 overflow-auto overscroll-contain rounded-lg border bg-muted/50 p-4 text-xs whitespace-pre-wrap">
-                    {updateOutput.join("\n\n")}
-                  </pre>
-                )}
-              </CardContent>
-            </Card>
-          </TabsContent>
         </Tabs>
 
         <Dialog open={showConfigBackupView} onOpenChange={setShowConfigBackupView}>

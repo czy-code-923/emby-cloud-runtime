@@ -357,7 +357,7 @@ export default function AdminEmbyPage() {
     <div className="space-y-6">
       {/* Page Header */}
       <div>
-        <h1 className="text-3xl font-bold">{t("adminEmby.title")}</h1>
+        <h1 className="text-3xl font-semibold">{t("adminEmby.title")}</h1>
         <p className="text-muted-foreground">
           {t("adminEmby.description")}
         </p>
@@ -549,21 +549,21 @@ export default function AdminEmbyPage() {
               {/* Summary */}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                 <div className="rounded-lg border p-3 text-center">
-                  <div className="text-2xl font-bold">{embyData.total_emby}</div>
+                  <div className="text-2xl font-semibold">{embyData.total_emby}</div>
                   <div className="text-xs text-muted-foreground">{t("adminEmby.statEmbyUsers")}</div>
                 </div>
                 <div className="rounded-lg border p-3 text-center">
-                  <div className="text-2xl font-bold text-emerald-500">{embyData.total_linked}</div>
+                  <div className="text-2xl font-semibold text-emerald-500">{embyData.total_linked}</div>
                   <div className="text-xs text-muted-foreground">{t("adminEmby.statLinked")}</div>
                 </div>
                 <div className="rounded-lg border p-3 text-center">
-                  <div className="text-2xl font-bold text-blue-500">
+                  <div className="text-2xl font-semibold text-blue-500">
                     {embyData.total_emby - embyData.total_linked}
                   </div>
                   <div className="text-xs text-muted-foreground">{t("adminEmby.statUnlinked")}</div>
                 </div>
                 <div className="rounded-lg border p-3 text-center">
-                  <div className={`text-2xl font-bold ${embyData.total_orphans > 0 ? "text-amber-500" : ""}`}>
+                  <div className={`text-2xl font-semibold ${embyData.total_orphans > 0 ? "text-amber-500" : ""}`}>
                     {embyData.total_orphans}
                   </div>
                   <div className="text-xs text-muted-foreground">{t("adminEmby.statOrphans")}</div>

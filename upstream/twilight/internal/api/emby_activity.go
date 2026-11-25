@@ -93,7 +93,10 @@ func (a *App) fetchAndStoreEmbyActivityLogsSince(ctx context.Context, since time
 	for startIndex := 0; startIndex < embyActivityFetchLimit; startIndex += embyActivityFetchPageSize {
 		var resp logEntry
 		path := fmt.Sprintf("/System/ActivityLog/Entries?StartIndex=%d&Limit=%d&HasUserId=true", startIndex, embyActivityFetchPageSize)
-		if err := a.embyGet(ctx, path, &resp); err != nil {
+		if err := embyRetryOn5xx(ctx, func(attemptCtx context.Context) error {
+			resp = logEntry{}
+			return a.embyGet(attemptCtx, path, &resp)
+		}); err != nil {
 			return 0, fmt.Errorf("emby activity log fetch: %w", err)
 		}
 		if len(resp.Items) == 0 {

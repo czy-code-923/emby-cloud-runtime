@@ -3584,7 +3584,14 @@
       "rolled_back": "已恢復上一版本程式",
       "recovery_required": "需要人工檢查恢復",
       "interrupted": "上次升級已中斷"
-    }
+    },
+    "privateTitle": "私有仓库访问",
+    "privateHint": "公开仓库无需填写。改为私有后，在这里保存仅授权此仓库、Contents 只读权限的 GitHub Token。凭据只存放于主机受保护文件，不会返回页面；更换后请检查最新版本。",
+    "tokenConfigured": "已保存访问凭据",
+    "tokenMissing": "当前使用公开访问",
+    "tokenLabel": "新的 GitHub Token",
+    "saveToken": "保存访问凭据",
+    "clearToken": "清除凭据，恢复公开访问"
   },
   "entrySettings": {
     "title": "站點與入口",

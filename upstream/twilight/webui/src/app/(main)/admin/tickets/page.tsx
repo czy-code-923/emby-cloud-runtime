@@ -229,7 +229,7 @@ export default function AdminTicketsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold flex items-center gap-2"><MessageSquareMore className="h-5 w-5" />{t("adminTickets.title")}</h1>
+        <h1 className="text-2xl font-semibold flex items-center gap-2"><MessageSquareMore className="h-5 w-5" />{t("adminTickets.title")}</h1>
         <p className="text-sm text-muted-foreground mt-1">{t("adminTickets.description")}</p>
       </div>
 
@@ -322,7 +322,7 @@ export default function AdminTicketsPage() {
                       </div>
                       <p className="text-xs text-muted-foreground flex items-center gap-1"><User className="h-3 w-3" />{ticket.username} (UID: {ticket.uid})</p>
                       <button className="block min-w-0 text-left" onClick={() => openConversation(ticket.id)}>
-                        <h3 className="font-bold text-base hover:underline">{ticket.title}</h3>
+                        <h3 className="font-semibold text-base hover:underline">{ticket.title}</h3>
                       </button>
                     </div>
                     <div className="flex w-full shrink-0 flex-wrap gap-2 sm:w-auto">

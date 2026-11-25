@@ -32,6 +32,7 @@ services:
     pids_limit: 128
     environment:
       TZ: Asia/Shanghai
+      EMBY_CLOUD_RELEASE_MANAGED: "1"
       GOMAXPROCS: "1"
       GOMEMLIMIT: 160MiB
       TWILIGHT_DATABASE_DRIVER: postgres

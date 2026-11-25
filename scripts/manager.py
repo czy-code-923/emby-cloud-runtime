@@ -19,6 +19,8 @@ import tarfile
 import threading
 import time
 import urllib.request
+import urllib.error
+from urllib.parse import urlparse
 
 REPO = 'czy-code-923/emby-cloud-runtime'
 ROOT = Path('/srv/emby-cloud')
@@ -47,24 +49,55 @@ def read_json(path, default=None):
     return json.loads(path.read_text()) if path.exists() else default
 
 
-def fetch_json(url):
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def github_open(url, token, accept, timeout=45):
+    # Credentials are sent only to our fixed GitHub API origin. Signed asset
+    # redirects are followed without Authorization, including same-host ones.
+    if not url.startswith(f'https://api.github.com/repos/{REPO}/releases/'):
+        raise ValueError('Unexpected release API origin')
+    headers = {'User-Agent': 'emby-cloud-release-manager', 'Accept': accept}
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    opener = urllib.request.build_opener(NoRedirect())
+    for attempt in range(4):
+        try:
+            return opener.open(urllib.request.Request(url, headers=headers), timeout=timeout)
+        except urllib.error.HTTPError as error:
+            if error.code not in {301, 302, 303, 307, 308} or accept != 'application/octet-stream':
+                raise ValueError('Release access failed; check repository access and token expiry') from None
+            target = error.headers.get('Location', '')
+            error.close()
+            parsed = urlparse(target)
+            if parsed.scheme != 'https' or parsed.username or parsed.port not in {None, 443} or not parsed.hostname or not parsed.hostname.endswith('.githubusercontent.com'):
+                raise ValueError('Unexpected asset redirect')
+            url = target
+            headers = {'User-Agent': 'emby-cloud-release-manager', 'Accept': accept}
+    raise ValueError('Too many asset redirects')
+
+
+def fetch_json(url, token=''):
     request = urllib.request.Request(url, headers={'User-Agent': 'emby-cloud-release-manager', 'Accept': 'application/vnd.github+json'})
-    with urllib.request.urlopen(request, timeout=45) as response:
+    response = github_open(url, token, 'application/vnd.github+json') if token else urllib.request.urlopen(request, timeout=45)
+    with response:
         return json.load(response)
 
 
-def release_info(tag=None):
+def release_info(tag=None, token=''):
     suffix = 'tags/' + tag if tag else 'latest'
     if tag:
         version_tuple(tag)
-    result = fetch_json(f'https://api.github.com/repos/{REPO}/releases/{suffix}')
+    result = fetch_json(f'https://api.github.com/repos/{REPO}/releases/{suffix}', token)
     version_tuple(result['tag_name'])
     if result.get('draft') or result.get('prerelease'):
         raise ValueError('The selected release is not a published stable release')
     return result
 
 
-def download_asset(release, name, dest):
+def download_asset(release, name, dest, token=''):
     asset = next((a for a in release['assets'] if a['name'] == name), None)
     if not asset or not re.fullmatch(r'sha256:[0-9a-f]{64}', asset.get('digest', '')):
         raise ValueError('Missing verified release asset: ' + name)
@@ -74,7 +107,14 @@ def download_asset(release, name, dest):
     digest = hashlib.sha256()
     size = 0
     request = urllib.request.Request(expected_url, headers={'User-Agent': 'emby-cloud-release-manager'})
-    with urllib.request.urlopen(request, timeout=120) as response, dest.open('wb') as output:
+    if token:
+        asset_id = asset.get('id')
+        if type(asset_id) is not int or asset_id <= 0:
+            raise ValueError('Missing release asset identity')
+        response = github_open(f'https://api.github.com/repos/{REPO}/releases/assets/{asset_id}', token, 'application/octet-stream', 120)
+    else:
+        response = urllib.request.urlopen(request, timeout=120)
+    with response, dest.open('wb') as output:
         while chunk := response.read(1024 * 1024):
             output.write(chunk)
             digest.update(chunk)
@@ -150,12 +190,45 @@ class Manager:
     def dc(self, *args):
         return ['docker', 'compose', '-f', str(self.root/'compose.yaml'), '-f', str(self.root/'images.lock.yaml'), *args]
 
+    def resume_stack(self):
+        self.command(self.dc('up', '-d', 'emby'))
+        readiness = self.root/'scripts/wait-emby.py'
+        if readiness.exists():
+            self.command(['python3', str(readiness)], timeout=100)
+        self.command(self.dc('up', '-d', '--wait', '--wait-timeout', '240'))
+
     def status(self):
         marker = read_json(self.root/'.emby-cloud.json', {})
         current = (self.root/'VERSION').read_text().strip() if (self.root/'VERSION').exists() else None
         return {'installed_version': current, 'protocol': 1, 'source_repo': REPO,
                 'latest': self.latest, 'job': read_json(self.status_file, {'phase': 'idle'}),
-                'uninstalled': marker.get('uninstalled', False)}
+                'uninstalled': marker.get('uninstalled', False), 'credentials': self.credentials_status()}
+
+    def release_credentials(self):
+        return read_json(self.state/'release-credentials.json', {'revision': 0, 'token': ''})
+
+    def credentials_status(self):
+        value = self.release_credentials()
+        return {'configured': bool(value.get('token')), 'revision': value['revision']}
+
+    def configure_credentials(self, body):
+        if set(body) != {'token', 'clear', 'expected_revision'} or type(body['clear']) is not bool or type(body['expected_revision']) is not int:
+            raise ValueError('Invalid credential settings')
+        token = body['token']
+        if not isinstance(token, str) or (token and not re.fullmatch(r'[A-Za-z0-9_]{20,255}', token)) or (body['clear'] and token):
+            raise ValueError('Invalid GitHub token')
+        with self.guard:
+            if read_json(self.status_file, {}).get('phase') in {'queued','download','backup','applying','checking','rollback'}:
+                raise ValueError('Wait for the current upgrade to finish')
+            value = self.release_credentials()
+            if body['expected_revision'] != value['revision']:
+                raise ValueError('Settings changed; refresh and retry')
+            if not token and not body['clear']:
+                raise ValueError('Enter a token or explicitly clear the existing token')
+            write_json(self.state/'release-credentials.json', {'revision': value['revision']+1, 'token': token})
+            self.latest = None
+            self.checked_at = 0
+        return self.status()
 
     def progress(self, phase, **fields):
         previous = read_json(self.status_file, {})
@@ -171,7 +244,7 @@ class Manager:
     def check(self):
         if self.latest is not None and time.monotonic() - self.checked_at < 60:
             return self.status()
-        release = release_info()
+        release = release_info(token=self.release_credentials().get('token', ''))
         current = self.status()['installed_version']
         self.latest = {'tag': release['tag_name'], 'version': release['tag_name'].lstrip('v'),
                        'url': release['html_url'], 'published_at': release['published_at'],
@@ -220,7 +293,8 @@ class Manager:
             self._install(tag)
 
     def _install(self, tag):
-        release = release_info(tag)
+        token = self.release_credentials().get('token', '')
+        release = release_info(tag, token=token)
         version = release['tag_name'].lstrip('v')
         old_version = self.status()['installed_version']
         if old_version and VERSION_RE.fullmatch(old_version) and version_tuple(version) < version_tuple(old_version):
@@ -235,20 +309,20 @@ class Manager:
         stage = self.state/'staging'/stamp
         stage.mkdir(parents=True)
         self.progress('download', target=release['tag_name'], error=None)
-        download_asset(release, 'release.json', stage/'release.json')
+        download_asset(release, 'release.json', stage/'release.json', token=token)
         metadata = read_json(stage/'release.json')
         old_marker = read_json(self.root/'.emby-cloud.json', {'database_schema': 1})
         if metadata.get('version') != version or metadata.get('protocol') != 1 or metadata.get('database_schema') != old_marker.get('database_schema',1) or metadata.get('rollback_safe') is not True:
             raise ValueError('Release requires an unsupported protocol or manual data migration')
         source_name = f'emby-cloud-{version}-source.tar.gz'
-        download_asset(release, source_name, stage/source_name)
+        download_asset(release, source_name, stage/source_name, token=token)
         source = stage/'source'
         unpack_source(stage/source_name, source)
         if (source/'VERSION').read_text().strip() != version:
             raise ValueError('Source version differs from release')
         for component in ['backend', 'webui']:
             name = f'{component}-{version}-amd64.tar.gz'
-            download_asset(release, name, stage/name)
+            download_asset(release, name, stage/name, token=token)
             self.command(['docker','load','--input',str(stage/name)])
         # Pull images before stopping any application service.
         registry = ['postgres:17-alpine','caddy:2-alpine','emby/embyserver:4.10.2.0']
@@ -299,7 +373,7 @@ class Manager:
                 self.prepare_config(version, old_version is None)
                 self.install_service()
                 self.command(['python3',str(self.root/'scripts/lock_images.py')])
-                self.command(self.dc('up','-d','--wait','--wait-timeout','240'))
+                self.resume_stack()
                 self.progress('checking')
                 self.command(['python3',str(self.root/'scripts/check.py')], timeout=90)
                 if old_version is None:
@@ -319,7 +393,7 @@ class Manager:
                         elif dest.is_file():
                             dest.unlink()
                     if active:
-                        self.command(self.dc('up','-d','--wait','--wait-timeout','240'))
+                        self.resume_stack()
                     self.progress('rolled_back', message='Previous program and image selection restored; databases preserved')
                 except Exception:
                     self.progress('recovery_required', message='Automatic program rollback failed; consult local operations.log')
@@ -460,6 +534,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.respond(202,self.server.manager.network().start(self.path.rsplit('/',1)[1],body['profile'],body['expected_revision']))
             if self.command=='POST' and self.path=='/check':
                 return self.respond(200,self.server.manager.check())
+            if self.command=='POST' and self.path=='/credentials':
+                return self.respond(200,self.server.manager.configure_credentials(body))
             if self.command=='POST' and self.path=='/apply' and set(body)=={'tag','expected_version'}:
                 return self.respond(202,self.server.manager.start(body['tag'],body['expected_version']))
             self.respond(404,{'error':'Unsupported operation'})

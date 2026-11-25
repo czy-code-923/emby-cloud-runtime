@@ -72,7 +72,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
             root=Path(folder)/'app';root.mkdir();(root/'VERSION').write_text('0.2.0')
             manager=m.Manager(root,Path(folder)/'state')
             release={'tag_name':'v0.3.0'}
-            def download(_release,name,dest):dest.write_text(json.dumps({'version':'0.3.0','protocol':1,'database_schema':2,'rollback_safe':True}))
+            def download(_release,name,dest,token=''):dest.write_text(json.dumps({'version':'0.3.0','protocol':1,'database_schema':2,'rollback_safe':True}))
             with patch.object(m,'release_info',return_value=release),patch.object(m,'download_asset',side_effect=download),patch.object(manager,'command') as command:
                 with self.assertRaisesRegex(ValueError,'manual data migration'):manager._install('v0.3.0')
                 command.assert_not_called()

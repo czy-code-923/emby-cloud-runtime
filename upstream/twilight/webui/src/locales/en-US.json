@@ -3584,7 +3584,14 @@
       "rolled_back": "Previous program restored",
       "recovery_required": "Manual recovery check required",
       "interrupted": "The previous upgrade was interrupted"
-    }
+    },
+    "privateTitle": "Private repository access",
+    "privateHint": "Public repositories need no token. For a private repository, save a GitHub token with read-only Contents permission for this repository. It stays in a protected host file and is never returned. Check for updates after replacing it.",
+    "tokenConfigured": "Access token saved",
+    "tokenMissing": "Using public access",
+    "tokenLabel": "New GitHub token",
+    "saveToken": "Save access token",
+    "clearToken": "Clear token and use public access"
   },
   "entrySettings": {
     "title": "Site and entry points",

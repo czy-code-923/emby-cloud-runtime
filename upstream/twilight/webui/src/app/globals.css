@@ -847,7 +847,7 @@
 
 /* 见微：优先使用系统中文字体，不向第三方请求字体或可选媒体接口。 */
 @layer base {
- body { font-size: 15px; line-height: 1.65; text-rendering: optimizeLegibility; }
+ body { font-size: 15px; font-weight: 400; font-synthesis: none; line-height: 1.65; text-rendering: optimizeLegibility; }
  h1,h2,h3 { letter-spacing: -.015em; line-height: 1.4; }
  input,textarea,select { font-variant-numeric: tabular-nums; }
  ::selection { background: hsl(164 35% 75% / .45); }

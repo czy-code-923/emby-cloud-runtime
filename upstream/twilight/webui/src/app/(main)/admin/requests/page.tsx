@@ -425,7 +425,7 @@ export default function AdminRequestsPage() {
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
-          <h1 className="text-2xl font-bold sm:text-3xl">{t("adminRequests.title")}</h1>
+          <h1 className="text-2xl font-semibold sm:text-3xl">{t("adminRequests.title")}</h1>
           <p className="text-sm text-muted-foreground">{t("adminRequests.description")}</p>
         </div>
         <Badge variant="outline" className="self-start px-3 py-1.5 text-sm sm:self-auto sm:px-4 sm:py-2 sm:text-lg">

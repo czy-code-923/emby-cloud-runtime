@@ -91,7 +91,7 @@ export function UserAvatar({ user }: { user: UserInfo }) {
   return (
     <Avatar className="h-8 w-8 shrink-0 ring-1 ring-border/50">
       <AvatarImage src={src} />
-      <AvatarFallback className="bg-primary/10 text-primary text-xs font-bold">
+      <AvatarFallback className="bg-primary/10 text-primary text-xs font-semibold">
         {user.username.charAt(0).toUpperCase()}
       </AvatarFallback>
     </Avatar>

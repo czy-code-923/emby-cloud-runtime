@@ -126,7 +126,7 @@ export default function AdminViolationsPage() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <ShieldAlert className="h-6 w-6 text-destructive" />
-          <h1 className="break-words text-2xl font-bold">{t("adminViolations.title")}</h1>
+          <h1 className="break-words text-2xl font-semibold">{t("adminViolations.title")}</h1>
           {total > 0 && (
             <Badge variant="destructive" className="ml-2">
               {total}

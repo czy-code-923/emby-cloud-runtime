@@ -224,7 +224,7 @@ export default function AdminBangumiPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold flex items-center gap-2">
+        <h1 className="text-2xl font-semibold flex items-center gap-2">
           <BookOpen className="h-6 w-6" />
           {t("bangumi.adminTitle")}
         </h1>

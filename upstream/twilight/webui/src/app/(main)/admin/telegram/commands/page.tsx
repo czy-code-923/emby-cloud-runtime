@@ -271,7 +271,7 @@ export default function AdminTelegramCommandsPage() {
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="flex items-center gap-2 text-2xl font-bold">
+          <h1 className="flex items-center gap-2 text-2xl font-semibold">
             <Code2 className="h-6 w-6" />
             {t("adminTelegramCommands.title")}
           </h1>

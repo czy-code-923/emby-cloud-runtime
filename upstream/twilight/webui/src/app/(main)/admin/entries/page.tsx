@@ -10,7 +10,7 @@ import { useI18n } from "@/lib/i18n";
 export default function EntrySettingsPage() {
  const { t } = useI18n();
  return <div className="space-y-6">
-  <div><h1 className="text-2xl font-bold">{t("entrySettings.title")}</h1><p className="mt-2 text-sm text-muted-foreground">{t("entrySettings.description")}</p></div>
+  <div><h1 className="text-2xl font-semibold">{t("entrySettings.title")}</h1><p className="mt-2 text-sm text-muted-foreground">{t("entrySettings.description")}</p></div>
   <Card><CardContent className="space-y-3 p-4 text-sm">
    <h2 className="font-semibold">{t("entrySettings.manualTitle")}</h2>
    <p>{t("entrySettings.manualSteps")}</p>

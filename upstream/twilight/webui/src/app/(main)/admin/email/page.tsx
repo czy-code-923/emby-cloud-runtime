@@ -210,7 +210,7 @@ export default function AdminEmailPage() {
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="flex items-center gap-2 text-2xl font-bold">
+          <h1 className="flex items-center gap-2 text-2xl font-semibold">
             <Mail className="h-5 w-5" />
             {t("emailAdmin.title")}
           </h1>

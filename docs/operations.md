@@ -58,3 +58,9 @@ systemd-tmpfiles --create /etc/tmpfiles.d/emby-cloud.conf
 账户 HTTPS 验证后进入 Telegram 管理页，验证 Bot 身份，再输入当前管理员密码发布 Mini App 菜单。用户私聊 /start 可建立普通身份；不会自动授予 Emby 服务。已有 Web 身份继续使用其签名绑定链接，不按同名账号合并。Mini App 会话独立于 Web 管理登录，15 分钟过期，Bot 密钥轮换撤销旧会话。便携数据迁移不导出 Mini App 登录会话，恢复后从 Bot 重新打开；整机加密备份保留运行数据库和域名凭据。
 
 独立购买域名不会在 Bot/Mini App 中显示。v0.4 只提供购买入口的证书与隔离基础，实际商品、核款和履约尚待后续业务版本。
+
+## 私有仓库与升级
+
+版本与升级是本部署唯一更新入口。公开仓库无需 Token；改为私有前保存仅此仓库 Contents 只读权限的 GitHub fine-grained Token。凭据在主机 `/var/lib/emby-cloud-updater/release-credentials.json` 中以 0600 权限保存，不返回客户端，不进入源码包。Token 失效时替换并重新检查版本；升级过程中禁止修改凭据。安装后的命令行升级可使用 `sudo python3 /usr/local/lib/emby-cloud/manager.py upgrade`，卸载仍使用本机安装器。全新主机在仓库私有后需要通过有权限的 GitHub 账户下载安装器，公开 raw 链接不再可用。仓库私有不免除上游 AGPL 对网络用户提供对应源码的要求。
+
+备份恢复先等待 Emby 的本机 HTTP 入口，最多 90 秒；即使未就绪也会恢复其他服务，并让备份任务返回失败，避免误报成功。日志同步仅对连接错误及 5xx 重试，不重试认证失败，也不伪造成功记录。

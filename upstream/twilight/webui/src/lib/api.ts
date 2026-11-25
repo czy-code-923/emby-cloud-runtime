@@ -3931,9 +3931,13 @@ class ApiClient {
   async deploymentApply(tag: string, expected_version: string, password: string, signal?: AbortSignal) {
     return this.request<DeploymentUpdateState>("/admin/deployment/apply", { method: "POST", signal, cache: "no-store", headers: { "X-Twilight-Client": "webui", "X-Twilight-Intent": "deploy-release" }, body: JSON.stringify({ tag, expected_version, password }) }, { apiVersion: "v2", cacheRead: false, dedupe: false });
   }
+  async deploymentCredentials(token: string, clear: boolean, expected_revision: number, password: string) {
+    return this.request<DeploymentUpdateState>("/admin/deployment/credentials", { method: "POST", cache: "no-store", headers: { "X-Twilight-Client": "webui", "X-Twilight-Intent": "deploy-release" }, body: JSON.stringify({ token, clear, expected_revision, password }) }, { apiVersion: "v2", cacheRead: false, dedupe: false });
+  }
 }
 
 export interface DeploymentUpdateState {
+  credentials?: { configured: boolean; revision: number };
   installed_version: string | null;
   source_repo: string;
   latest?: { tag: string; version: string; available: boolean; url: string } | null;

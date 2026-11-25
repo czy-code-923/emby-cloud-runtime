@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -164,6 +165,9 @@ type schedulerTZEntry struct {
 }
 
 func schedulerJobEnabledByConfig(systemUpdateEnabled bool, job map[string]any) bool {
+	if fmt.Sprint(job["id"]) == "system_auto_update" && os.Getenv("EMBY_CLOUD_RELEASE_MANAGED") == "1" {
+		return false
+	}
 	if enabled, ok := job["enabled"].(bool); ok && !enabled {
 		if fmt.Sprint(job["id"]) != "system_auto_update" || !systemUpdateEnabled {
 			return false

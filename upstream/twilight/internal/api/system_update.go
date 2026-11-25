@@ -52,6 +52,9 @@ func validateUpdateBranch(branch string) (string, error) {
 }
 
 func applyGitUpdate(ctx context.Context, repoURL, branch string, restartServices bool, dryRun bool, allowDirty bool) map[string]any {
+	if os.Getenv("EMBY_CLOUD_RELEASE_MANAGED") == "1" {
+		return map[string]any{"success": false, "message": "当前部署统一使用“版本与升级”，请勿执行 Git 源码更新", "error_code": ErrUpdateNotGitRepo, "code": 409, "results": []any{}}
+	}
 	_ = allowDirty
 	repoURL, err := validateUpdateRepoURL(repoURL)
 	if err != nil {

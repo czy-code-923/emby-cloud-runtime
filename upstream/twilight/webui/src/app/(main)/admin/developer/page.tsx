@@ -632,7 +632,7 @@ export default function AdminDeveloperPage() {
       <div className="space-y-5">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div className="min-w-0">
-            <h1 className="flex items-center gap-2 text-2xl font-bold">
+            <h1 className="flex items-center gap-2 text-2xl font-semibold">
               <Code2 className="h-6 w-6" />
               {t("adminDeveloper.title")}
             </h1>
@@ -659,7 +659,7 @@ export default function AdminDeveloperPage() {
     <div className="space-y-5">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0">
-          <h1 className="flex items-center gap-2 text-2xl font-bold">
+          <h1 className="flex items-center gap-2 text-2xl font-semibold">
             <Code2 className="h-6 w-6" />
             {t("adminDeveloper.title")}
           </h1>
@@ -677,15 +677,15 @@ export default function AdminDeveloperPage() {
             <AlertTriangle className="h-6 w-6 animate-pulse" />
           </div>
           <div className="space-y-2 min-w-0">
-            <h2 className="text-xl font-extrabold tracking-tight text-red-600 dark:text-red-400">
+            <h2 className="text-xl font-semibold tracking-tight text-red-600 dark:text-red-400">
               最高级别安全警示与管理员免责声明 / SYSTEM SECURITY WARNING & DISCLAIMER
             </h2>
             <p className="text-sm font-black text-foreground uppercase tracking-wide leading-relaxed">
               ⚠️ 开发者模式（动态代码沙箱）目前处于「已开启 (ACTIVE)」状态！
             </p>
-            <p className="text-xs font-bold text-muted-foreground leading-relaxed">
+            <p className="text-xs font-semibold text-muted-foreground leading-relaxed">
               重要提示：在此状态下，任何已被绑定的「js:」或「js:preset:」自定义脚本将可直接在线上被触发并调用 Goja 执行引擎。
-              <span className="font-extrabold text-red-500 underline mx-1">
+              <span className="font-semibold text-red-500 underline mx-1">
                 特此声明：对于在开发者模式启用期间由于自定义执行脚本带来的所有系统稳定性异常、数据回写失误、Telegram 命令泛滥、以及由此可能引发的网络与权限防线穿透风险，系统管理员（您自己）自愿承诺承担一切直接和间接的技术及法律全部风险后果！
               </span>
               如果这些指令无需继续调试，请务必立即通过在仪表盘兑换框输入「DEBUGMODE」并进行密码验证以全面将本模式关闭、阻断此类调用！
@@ -1104,7 +1104,7 @@ export default function AdminDeveloperPage() {
                           <button
                             type="button"
                             onClick={() => toggleGroup(`ns-${ns}`)}
-                            className="flex w-full items-center justify-between py-0.5 text-[11px] font-bold text-foreground/80 hover:text-foreground"
+                            className="flex w-full items-center justify-between py-0.5 text-[11px] font-semibold text-foreground/80 hover:text-foreground"
                           >
                             <span className="flex items-center gap-1 font-mono">
                               {isExpanded(`ns-${ns}`, false) ? <ChevronDown className="h-2.5 w-2.5" /> : <ChevronRight className="h-2.5 w-2.5" />}
@@ -1206,7 +1206,7 @@ export default function AdminDeveloperPage() {
                     <div className="pl-3 space-y-3 border-l ml-1.5 border-muted">
                       {docs.config_keys && docs.config_keys.length > 0 && (
                         <div className="space-y-1">
-                          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">{t("adminDeveloper.configKeysTitle")}</p>
+                          <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">{t("adminDeveloper.configKeysTitle")}</p>
                           <div className="flex flex-wrap gap-1">
                             {docs.config_keys.map((k) => (
                               <button
@@ -1225,7 +1225,7 @@ export default function AdminDeveloperPage() {
 
                       {docs.env_keys && docs.env_keys.length > 0 && (
                         <div className="space-y-1">
-                          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">{t("adminDeveloper.envKeysTitle")}</p>
+                          <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">{t("adminDeveloper.envKeysTitle")}</p>
                           <div className="flex flex-wrap gap-1">
                             {docs.env_keys.map((k) => (
                               <button

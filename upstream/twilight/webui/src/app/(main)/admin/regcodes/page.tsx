@@ -766,7 +766,7 @@ export default function AdminRegcodesPage() {
       )}
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">{t("adminRegcodes.pageTitle")}</h1>
+          <h1 className="text-2xl sm:text-3xl font-semibold">{t("adminRegcodes.pageTitle")}</h1>
           <p className="text-sm text-muted-foreground">{t("adminRegcodes.pageSubtitle")}</p>
         </div>
         <div className="flex flex-wrap gap-2">

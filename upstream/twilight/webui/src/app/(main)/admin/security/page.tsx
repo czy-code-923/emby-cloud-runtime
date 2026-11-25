@@ -20,7 +20,7 @@ export default function AdminSecurityCenterPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold">{t("adminSecurity.title")}</h1>
+        <h1 className="text-2xl font-semibold">{t("adminSecurity.title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{t("adminSecurity.description")}</p>
       </div>
 

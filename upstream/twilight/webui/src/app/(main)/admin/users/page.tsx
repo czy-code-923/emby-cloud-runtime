@@ -1912,7 +1912,7 @@ export default function AdminUsersPage() {
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">用户管理</h1>
+          <h1 className="text-2xl sm:text-3xl font-semibold">用户管理</h1>
           <p className="text-sm text-muted-foreground">管理所有注册用户</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -2377,7 +2377,7 @@ export default function AdminUsersPage() {
                       />
                       <Avatar className="h-10 w-10 shrink-0 ring-1 ring-border/50">
                               <AvatarImage src={normalizeAssetUrl(user.avatar)} />
-                        <AvatarFallback className="bg-primary/10 text-primary text-sm font-bold">
+                        <AvatarFallback className="bg-primary/10 text-primary text-sm font-semibold">
                           {user.username.charAt(0).toUpperCase()}
                         </AvatarFallback>
                       </Avatar>
@@ -2471,7 +2471,7 @@ export default function AdminUsersPage() {
                           <div className="flex items-center gap-3 min-w-0">
                             <Avatar className="h-8 w-8 shrink-0 ring-1 ring-border/50">
                         <AvatarImage src={normalizeAssetUrl(user.avatar)} />
-                              <AvatarFallback className="bg-primary/10 text-primary text-xs font-bold">
+                              <AvatarFallback className="bg-primary/10 text-primary text-xs font-semibold">
                                 {user.username.charAt(0).toUpperCase()}
                               </AvatarFallback>
                             </Avatar>

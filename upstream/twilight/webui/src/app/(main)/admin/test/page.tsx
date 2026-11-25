@@ -152,7 +152,7 @@ export default function AdminStatusPage() {
     <div className="space-y-6">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-3xl font-bold">{t("adminStatus.title")}</h1>
+          <h1 className="text-3xl font-semibold">{t("adminStatus.title")}</h1>
           <p className="text-muted-foreground">{t("adminStatus.description")}</p>
         </div>
         <Button className="w-full sm:w-auto" onClick={() => void loadStatus()} disabled={loading}>

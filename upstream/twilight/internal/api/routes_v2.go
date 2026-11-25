@@ -17,6 +17,7 @@ func (a *App) registerV2Routes() {
 	a.add(http.MethodPost, "/api/v2/miniapp/session", AuthPublic, a.handleMiniSession)
 	a.add(http.MethodGet, "/api/v2/miniapp/account", AuthPublic, a.handleMiniAccount)
 	a.add(http.MethodGet, "/api/v2/admin/deployment/status", AuthAdmin, a.handleDeploymentUpdate)
+	a.add(http.MethodPost, "/api/v2/admin/deployment/credentials", AuthAdmin, a.handleDeploymentCredentials)
 	a.add(http.MethodPost, "/api/v2/admin/deployment/check", AuthAdmin, a.handleDeploymentCheck)
 	a.add(http.MethodPost, "/api/v2/admin/deployment/apply", AuthAdmin, a.handleDeploymentApply)
 	a.add(http.MethodGet, "/api/v2/system/health", AuthPublic, a.handleV2Health)

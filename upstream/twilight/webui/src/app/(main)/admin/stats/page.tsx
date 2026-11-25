@@ -55,7 +55,7 @@ export default function AdminStatsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-3xl font-bold">{t("adminStats.title")}</h1>
+        <h1 className="text-3xl font-semibold">{t("adminStats.title")}</h1>
         <p className="text-muted-foreground">{t("adminStats.description")}</p>
       </div>
 
@@ -70,7 +70,7 @@ export default function AdminStatsPage() {
               <Users className="h-4 w-4 text-blue-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">
+              <div className="text-3xl font-semibold">
                 {stats?.cpu_count ?? 0}
               </div>
             </CardContent>
@@ -86,7 +86,7 @@ export default function AdminStatsPage() {
               <TrendingUp className="h-4 w-4 text-emerald-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold text-emerald-500">
+              <div className="text-3xl font-semibold text-emerald-500">
                 {stats?.cpu_percent != null ? `${stats.cpu_percent}%` : t("adminStats.unknown")}
               </div>
             </CardContent>
@@ -102,7 +102,7 @@ export default function AdminStatsPage() {
               <FileText className="h-4 w-4 text-orange-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold text-orange-500">
+              <div className="text-3xl font-semibold text-orange-500">
                 {stats?.memory?.percent != null ? `${stats.memory.percent}%` : t("adminStats.unknown")}
               </div>
             </CardContent>
@@ -118,7 +118,7 @@ export default function AdminStatsPage() {
               <Coins className="h-4 w-4 text-info" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">
+              <div className="text-3xl font-semibold">
                 {formatBytes(stats?.memory?.available, t("adminStats.unknown"))}
               </div>
             </CardContent>
@@ -134,7 +134,7 @@ export default function AdminStatsPage() {
               <Clock className="h-4 w-4 text-info" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">
+              <div className="text-3xl font-semibold">
                 {stats?.disk?.percent != null ? `${stats.disk.percent}%` : t("adminStats.unknown")}
               </div>
             </CardContent>

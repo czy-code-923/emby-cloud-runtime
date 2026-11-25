@@ -40,7 +40,7 @@ def prepare(version):
         archive.add(source,arcname='emby-cloud')
     (fixture/'release.json').write_text(json.dumps({'version':version,'commit':'ci-fixture','protocol':1,'database_schema':1,'rollback_safe':True}))
 
-def copy_asset(_release,name,dest):shutil.copy2(fixture/name,dest)
+def copy_asset(_release,name,dest,token=""):shutil.copy2(fixture/name,dest)
 manager=m.Manager()
 jar=http.cookiejar.CookieJar()
 op=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPCookieProcessor(jar))
@@ -50,7 +50,7 @@ def api(path,data=None):
         data=json.dumps(data).encode() if data is not None else None)
     with op.open(req,timeout=30) as response:return json.load(response)
 
-with patch.object(m,'release_info',side_effect=lambda *_args:dict(release)),patch.object(m,'download_asset',side_effect=copy_asset):
+with patch.object(m,'release_info',side_effect=lambda *_args,**_kwargs:dict(release)),patch.object(m,'download_asset',side_effect=copy_asset):
     prepare(base)
     manager.install('v'+base)
     assert manager.status()['installed_version']==base

@@ -102,11 +102,12 @@ func (a *App) notifySchedulerOutcome(st *store.Store, result store.SchedulerRun)
 		break
 	}
 	var text string
+	brand := firstNonEmpty(a.cfg().AppName, "见微 Emby")
 	switch {
 	case failed && !previousFailed:
-		text = fmt.Sprintf("[失败] Twilight 定时任务\n任务：%s\n状态：%s\n原因：%s\n运行 ID：%d", schedulerJobName(result.JobID), result.Status, truncateString(firstNonEmpty(result.Error, result.Message), 300), result.ID)
+		text = fmt.Sprintf("[失败] %s 定时任务\n任务：%s\n状态：%s\n原因：%s\n运行 ID：%d", brand, schedulerJobName(result.JobID), result.Status, truncateString(firstNonEmpty(result.Error, result.Message), 300), result.ID)
 	case !failed && previousFailed:
-		text = fmt.Sprintf("[恢复] Twilight 定时任务已恢复正常\n任务：%s\n运行 ID：%d", schedulerJobName(result.JobID), result.ID)
+		text = fmt.Sprintf("[恢复] %s 定时任务已恢复正常\n任务：%s\n运行 ID：%d", brand, schedulerJobName(result.JobID), result.ID)
 	default:
 		return
 	}
@@ -144,7 +145,7 @@ func (a *App) notifySchedulerOutcome(st *store.Store, result store.SchedulerRun)
 				continue
 			}
 			seen[key] = true
-			if err := smtpDeliver(ctx, *a.cfg(), u.Email, "Twilight 定时任务通知", redactSensitiveText(text)); err != nil {
+			if err := smtpDeliver(ctx, *a.cfg(), u.Email, brand+" 定时任务通知", redactSensitiveText(text)); err != nil {
 				zap.L().Warn("failed to send scheduler email", zap.String("job_id", result.JobID), zap.Int64("uid", u.UID), zap.Error(err))
 			}
 		}

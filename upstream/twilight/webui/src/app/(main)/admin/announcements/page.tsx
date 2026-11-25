@@ -306,7 +306,7 @@ export default function AdminAnnouncementsPage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
-          <h1 className="text-2xl font-bold flex items-center gap-2">
+          <h1 className="text-2xl font-semibold flex items-center gap-2">
             <Megaphone className="h-5 w-5" />
             {t("adminAnnouncements.title")}
           </h1>
@@ -390,7 +390,7 @@ export default function AdminAnnouncementsPage() {
                           </Badge>
                         )}
                         {ann.title && (
-                          <h3 className="font-bold text-sm">{ann.title}</h3>
+                          <h3 className="font-semibold text-sm">{ann.title}</h3>
                         )}
                       </div>
                       <p className="text-[11px] text-muted-foreground mt-1">

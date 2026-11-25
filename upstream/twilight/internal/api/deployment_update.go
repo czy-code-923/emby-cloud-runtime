@@ -22,6 +22,10 @@ func (a *App) handleDeploymentApply(w http.ResponseWriter, r *http.Request, _ Pa
 	a.handleDeploymentUpdate(w, r, Params{"operation": "apply"})
 }
 
+func (a *App) handleDeploymentCredentials(w http.ResponseWriter, r *http.Request, _ Params) {
+	a.handleDeploymentUpdate(w, r, Params{"operation": "credentials"})
+}
+
 func deploymentRequest(ctx context.Context, socketPath, method, path string, payload map[string]any) (map[string]any, int, error) {
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
@@ -60,7 +64,7 @@ func (a *App) handleDeploymentUpdate(w http.ResponseWriter, r *http.Request, par
 		operation = "status"
 	}
 	if (r.Method == http.MethodGet && operation != "status") ||
-		(r.Method == http.MethodPost && operation != "check" && operation != "apply") {
+		(r.Method == http.MethodPost && operation != "check" && operation != "apply" && operation != "credentials") {
 		failWithCode(w, http.StatusNotFound, ErrNotFound, "不支持的版本操作")
 		return
 	}
@@ -70,11 +74,15 @@ func (a *App) handleDeploymentUpdate(w http.ResponseWriter, r *http.Request, par
 			return
 		}
 		payload = decodeMap(r)
-		if operation == "apply" {
+		if operation == "apply" || operation == "credentials" {
 			if !a.twoFactorPassword(w, r, payload) {
 				return
 			}
-			payload = map[string]any{"tag": stringValue(payload, "tag"), "expected_version": stringValue(payload, "expected_version")}
+			if operation == "apply" {
+				payload = map[string]any{"tag": stringValue(payload, "tag"), "expected_version": stringValue(payload, "expected_version")}
+			} else {
+				payload = map[string]any{"token": stringValue(payload, "token"), "clear": payload["clear"], "expected_revision": payload["expected_revision"]}
+			}
 		} else {
 			payload = map[string]any{}
 		}
@@ -90,6 +98,9 @@ func (a *App) handleDeploymentUpdate(w http.ResponseWriter, r *http.Request, par
 	}
 	if operation == "apply" {
 		a.audit(r, "deployment_release_apply", "system", current(r).User.UID, map[string]any{"tag": payload["tag"], "expected_version": payload["expected_version"]})
+	}
+	if operation == "credentials" {
+		a.audit(r, "deployment_credentials_change", "system", current(r).User.UID, map[string]any{"cleared": payload["clear"]})
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	ok(w, "OK", data)

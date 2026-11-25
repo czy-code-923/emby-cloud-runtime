@@ -418,7 +418,7 @@ export default function AdminTicketDetailPage() {
               {ticket.type ? <Badge variant="secondary">{ticket.type === "all" ? t("tickets.typeAll") : ticket.type}</Badge> : null}
               <Badge variant="secondary" className="font-mono">#{ticket.id}</Badge>
             </div>
-            <h1 className="break-words text-2xl font-bold">{ticket.title}</h1>
+            <h1 className="break-words text-2xl font-semibold">{ticket.title}</h1>
             <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
               <span className="inline-flex items-center gap-1"><User className="h-3.5 w-3.5" />{ticket.username} (UID: {ticket.uid})</span>
               <span className="inline-flex items-center gap-1"><Clock className="h-3.5 w-3.5" />{toDateTime(ticket.created_at)}</span>

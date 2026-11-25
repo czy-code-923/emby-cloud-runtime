@@ -306,7 +306,7 @@ export default function AdminAuditLogsPage() {
         <div className="flex items-center gap-2">
           <ScrollText className="h-6 w-6 text-primary" />
           <div>
-            <h1 className="text-2xl font-bold">{t("adminAuditLog.title")}</h1>
+            <h1 className="text-2xl font-semibold">{t("adminAuditLog.title")}</h1>
             <p className="text-sm text-muted-foreground">{t("adminAuditLog.totalCount", { count: total })}</p>
           </div>
         </div>
