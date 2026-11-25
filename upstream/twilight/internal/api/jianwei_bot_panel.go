@@ -81,6 +81,7 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 		rows = append(rows, []map[string]any{button("✦ 每日签到", "/signin"), button("🗓 积分续期", "/renew")})
 	}
 	rows = append(rows, []map[string]any{button("📱 我的设备", "/devices"), button("🧭 播放线路", "/lines")})
+	rows = append(rows, []map[string]any{button("🛡 保号方式与进度", "/retention")})
 	rows = append(rows, []map[string]any{button("📌 见微公告", "/announcements"), button("♡ 我的收藏", "/favorites")}, []map[string]any{button("🔎 媒体库", "/library"), button("🏆 播放排行", "/rank")})
 	rows = append(rows, []map[string]any{button("🔐 安全码", "/security"), button("🔑 修改密码", "/password")}, []map[string]any{button("设备配额", "/device_list"), button("停用旧设备", "/device_release")})
 	if cfg.MediaRequestEnabled {
@@ -124,7 +125,10 @@ func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegr
 	// Only bounded read-only discovery commands may carry paging arguments.
 	parts := strings.Fields(command)
 	if len(parts) > 1 {
-		if len(callback.Data) > 64 || (parts[0] != "/announcements" && parts[0] != "/favorites" && parts[0] != "/library") || !strings.HasPrefix(parts[1], "page:") {
+		paging := (parts[0] == "/announcements" || parts[0] == "/favorites" || parts[0] == "/library") && strings.HasPrefix(parts[1], "page:")
+		selection := len(parts) == 2 && parts[0] == "/retention" && (parts[1] == "A" || parts[1] == "B" || parts[1] == "off")
+		confirmation := len(parts) == 2 && parts[0] == "/retention_confirm" && len(parts[1]) == 24 && memberRedeemPayload.MatchString(parts[1])
+		if len(callback.Data) > 64 || (!paging && !selection && !confirmation) {
 			return true
 		}
 		command = parts[0]

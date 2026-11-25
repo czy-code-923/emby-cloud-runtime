@@ -474,6 +474,8 @@ func schedulerNextRunAtFromSnapshot(spec map[string]any, now time.Time, snapshot
 
 func (a *App) schedulerDefaultTriggerSpec(jobID string) map[string]any {
 	switch jobID {
+	case "retention_watch":
+		return map[string]any{"type": "interval", "seconds": 30}
 	case "check_expired":
 		return dailySpec(a.cfg().SchedulerExpiredCheckTime, 3, 0)
 	case "check_expiring", "expiry_reminders":

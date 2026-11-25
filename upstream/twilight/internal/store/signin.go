@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"github.com/prejudice-studio/twilight/internal/retention"
 	"strings"
 	"time"
 )
@@ -55,7 +56,7 @@ func (s *Store) AddSigninWithOptions(uid int64, dailyPoints int, bonusForStreak 
 	var awarded bool
 	err := s.mutateAndSaveLocked(func() error {
 		result, awarded = Signin{}, false
-		now := time.Now()
+		now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600))
 		today := now.Format(signinDateLayout)
 		yesterday := now.AddDate(0, 0, -1).Format(signinDateLayout)
 		si := s.state.Signin[uid]
@@ -83,13 +84,19 @@ func (s *Store) AddSigninWithOptions(uid int64, dailyPoints int, bonusForStreak 
 		if bonusForStreak != nil {
 			bonusPoints = bonusForStreak(si.Streak)
 		}
-		totalPoints := dailyPoints + bonusPoints
+		rawAward := dailyPoints + bonusPoints
+		totalPoints := rawAward
+		if s.state.Retention.Policy.Enabled {
+			totalPoints = retention.OrganicAward(si.Points, rawAward, s.state.Retention.Policy.OrganicCap)
+			dailyPoints = totalPoints
+			bonusPoints = 0
+		}
 		si.LastSignin = today
 		si.Points += totalPoints
 		// 新建切片再追加，避免写入与锁外持有的 Signin 副本共享底层数组。
 		records := make([]SigninRecord, 0, len(si.Records)+1)
 		records = append(records, si.Records...)
-		records = append(records, SigninRecord{Date: today, Points: dailyPoints, BonusPoints: bonusPoints, Total: totalPoints, Streak: si.Streak, CreatedAt: now.Unix()})
+		records = append(records, SigninRecord{RawAward: rawAward, CapWithheld: rawAward - totalPoints, Date: today, Points: dailyPoints, BonusPoints: bonusPoints, Total: totalPoints, Streak: si.Streak, CreatedAt: now.Unix()})
 		if len(records) > maxSigninRecords {
 			records = compactTail(records, maxSigninRecords)
 		}
@@ -105,7 +112,7 @@ func (s *Store) AddSigninWithOptions(uid int64, dailyPoints int, bonusForStreak 
 	if err != nil {
 		return Signin{}, false, err
 	}
-	return result, awarded, nil
+	return s.state.Signin[uid], awarded, nil
 }
 
 // errSigninAlreadyToday 仅用于让 mutateAndSaveLocked 跳过落盘的内部哨兵。

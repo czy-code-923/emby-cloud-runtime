@@ -10,6 +10,7 @@ import { useI18n, type MessageKey } from "@/lib/i18n";
 import styles from "./miniapp.module.css";
 import {Discovery,type DiscoverySection} from "./discovery";
 import {sanitizeImageUrl} from "@/lib/safe-url";
+import {RetentionPanel} from "./retention";
 import {MemberDevices} from "./member-devices";
 
 declare global { interface Window { Telegram?: {WebApp?: {initData:string;ready():void;expand():void;openLink?(url:string):void}} } }
@@ -70,7 +71,7 @@ export default function MiniAppPage() {
      <Glass className={styles.hero}><div className={styles.eyebrow}><span className={`${styles.dot} ${data.media_enabled?styles.online:""}`}/>{data.media_enabled?t("mini.active"):data.has_emby?t("mini.suspended"):t("mini.pending")}</div><h2>{t("mini.welcome")}</h2><p>{t("mini.welcomeDetail")}</p><div className={styles.balance}><span>{data.points.toLocaleString()}<small>{data.signin.config.currency_name}</small></span><Sparkles size={35}/></div><div className={styles.expiry}><span>{t("mini.validUntil")}</span><strong>{expiryText(data,t)}</strong></div></Glass>
      <div className={styles.grid}>{tile(<Sparkles/>,t("mini.signin"),data.signin.summary.today_signed?t("mini.signed"):t("mini.signinRange",{min:data.signin.config.daily_min,max:data.signin.config.daily_max}),()=>void action("signin"),!data.signin_enabled||data.signin.summary.today_signed)}{tile(<Ticket/>,t("mini.redeem"),t("mini.redeemHint"),()=>setTab("benefits"))}{tile(<Compass/>,t("mini.lines"),t("mini.linesHint"),()=>setTab("account"))}{tile(<Clapperboard/>,t("mini.requests"),t("mini.requestsHint"),()=>setTab("requests"),!data.requests_enabled)}</div>
      <div className={styles.grid}>{tile(<Film/>,t("mini.announcements"),t("mini.announcementsHint"),()=>openDiscovery("announcements"))}{tile(<Sparkles/>,t("mini.rank"),t("mini.rankHint"),()=>openDiscovery("rank"))}{tile(<Film/>,t("mini.favorites"),t("mini.favoritesHint"),()=>openDiscovery("favorites"))}{tile(<ShoppingBag/>,t("mini.shop"),t("mini.shopHint"),()=>data.shop_url?external(data.shop_url):setTab("benefits"),!data.shop_url)}</div>
-     <Glass><h3>{t("mini.recent")}</h3>{data.signin.history.length?<div className={styles.history}>{data.signin.history.slice(0,5).map((entry,i)=><div key={`${entry.date}-${i}`}><span>{t("mini.signin")}<small>{entry.date}</small></span><strong>+{entry.total}</strong></div>)}</div>:<p className={styles.muted}>{t("mini.emptyHistory")}</p>}</Glass>
+     <RetentionPanel revision={revision} onChange={()=>{setRevision(v=>v+1);void execute()}}/><Glass><h3>{t("mini.recent")}</h3>{data.signin.history.length?<div className={styles.history}>{data.signin.history.slice(0,5).map((entry,i)=><div key={`${entry.date}-${i}`}><span>{t("mini.signin")}<small>{entry.date}</small></span><strong>+{entry.total}</strong></div>)}</div>:<p className={styles.muted}>{t("mini.emptyHistory")}</p>}</Glass>
     </>}
     {tab==="discover"&&<Discovery key={discovery} initial={discovery}/>}
     {tab==="benefits"&&<>

@@ -3332,6 +3332,12 @@ class ApiClient {
     }
   }
   async miniFavorite(item_id:string,favorite:boolean){return this.request("/miniapp/favorite",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"miniapp-action"},body:JSON.stringify({item_id,favorite})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniRetention<T>(signal?:AbortSignal){return this.request<T>("/miniapp/retention",{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniRetentionPreview<T>(mode:string){return this.request<T>("/miniapp/retention/preview",{method:"POST",headers:{"X-Twilight-Intent":"miniapp-action"},body:JSON.stringify({mode})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniRetentionConfirm(payload:Record<string,unknown>){return this.request("/miniapp/retention/confirm",{method:"POST",headers:{"X-Twilight-Intent":"miniapp-action"},body:JSON.stringify(payload)},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniRetentionWithdraw(){return this.request("/miniapp/retention/withdraw",{method:"POST",headers:{"X-Twilight-Intent":"miniapp-action"},body:"{}"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async adminRetention<T>(signal?:AbortSignal){return this.request<T>("/admin/retention",{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async adminRetentionEnabled(enabled:boolean,revision:number,password:string){return this.request("/admin/retention",{method:"PUT",headers:{"X-Twilight-Intent":"retention-admin"},body:JSON.stringify({enabled,revision,password})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
   async shopOrders(page=1,signal?:AbortSignal){return this.request<ShopOrders>(`/commerce/orders?page=${page}`,{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
   async shopLogin(code:string){return this.request("/commerce/login",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-action"},body:JSON.stringify({code})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
   async shopLogout(){return this.request("/commerce/logout",{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-action"},body:"{}"},{apiVersion:"v2",cacheRead:false,dedupe:false});}

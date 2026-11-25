@@ -1,5 +1,5 @@
 "use client";
-import {useCallback,useRef,useState,type FormEvent} from "react";
+import {useCallback,useEffect,useRef,useState,type FormEvent} from "react";
 import {ShoppingBag,ArrowUpRight,RefreshCw} from "lucide-react";
 import {api} from "@/lib/api";
 import {useAsyncResource} from "@/hooks/use-async-resource";
@@ -12,6 +12,7 @@ import s from "./shop.module.css";
 
 export default function ShopPage(){
  const {t}=useI18n();const [logged,setLogged]=useState(false),[code,setCode]=useState(""),[busy,setBusy]=useState(false),[notice,setNotice]=useState(""),[page,setPage]=useState(1);
+ useEffect(()=>{const controller=new AbortController();void api.shopOrders(1,controller.signal).then(r=>{if(r.success)setLogged(true)}).catch(()=>{});return()=>controller.abort()},[]);
  const keys=useRef(new Map<string,string>());
  const loadCatalog=useCallback(async(signal?:AbortSignal)=>{const r=await api.shopCatalog(signal);if(!r.success||!r.data)throw new Error(r.message);return r.data},[]);
  const catalog=useAsyncResource(loadCatalog,{throwOnError:false});

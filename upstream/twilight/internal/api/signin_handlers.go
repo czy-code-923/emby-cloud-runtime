@@ -56,8 +56,19 @@ func (a *App) handleSignin(w http.ResponseWriter, r *http.Request, _ Params) {
 	if a.requireSigninEnabled(w) {
 		return
 	}
+	policyEnabled := a.store().RetentionPolicy().Enabled
 	dailyPoints := signinDailyPoints(*a.cfg())
+	if policyEnabled {
+		n, e := rand.Int(rand.Reader, big.NewInt(11))
+		dailyPoints = 10
+		if e == nil {
+			dailyPoints += int(n.Int64())
+		}
+	}
 	si, createdToday, err := a.store().AddSigninWithOptions(current(r).User.UID, dailyPoints, func(streak int) int {
+		if policyEnabled {
+			return 0
+		}
 		return signinBonusForStreak(*a.cfg(), streak)
 	}, a.cfg().SigninResetAfterMiss)
 	if statusFromError(w, err) {
@@ -68,7 +79,7 @@ func (a *App) handleSignin(w http.ResponseWriter, r *http.Request, _ Params) {
 		dailyPoints = 0
 	} else if len(si.Records) > 0 {
 		last := si.Records[len(si.Records)-1]
-		if last.Date == time.Now().Format("2006-01-02") {
+		if last.Date == time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02") {
 			dailyPoints = last.Points
 			bonusPoints = last.BonusPoints
 		}
@@ -189,7 +200,7 @@ func signinConfigPayload(cfg config.Config) map[string]any {
 }
 
 func signinSummaryPayload(cfg config.Config, si store.Signin) map[string]any {
-	today := time.Now().Format("2006-01-02")
+	today := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")
 	longest := si.LongestStreak
 	if longest < si.Streak {
 		longest = si.Streak

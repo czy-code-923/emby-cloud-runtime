@@ -121,6 +121,7 @@ type PostgresTargetStatus struct {
 }
 
 type State struct {
+	Retention               RetentionState                         `json:"retention,omitempty"`
 	Shop                    ShopSettings                           `json:"shop,omitempty"`
 	ShopOrders              map[string]ShopOrder                   `json:"shop_orders,omitempty"`
 	TwoFactorAccounts       map[int64]TwoFactorAccount             `json:"two_factor_accounts,omitempty"` // Backup-only; runtime records live in a dedicated table.
@@ -175,12 +176,14 @@ type State struct {
 }
 
 type User struct {
-	SecurityCodeHash    string        `json:"security_code_hash,omitempty"`
-	MediaMaxDevices     *int          `json:"media_max_devices,omitempty"`
-	MediaMaxStreams     *int          `json:"media_max_streams,omitempty"`
-	MediaPolicyManaged  bool          `json:"media_policy_managed,omitempty"`
-	MediaDevices        []MediaDevice `json:"media_devices,omitempty"`
-	MediaRevokedDevices []string      `json:"media_revoked_devices,omitempty"`
+	RetentionAccessUntil int64         `json:"retention_access_until,omitempty"`
+	RetentionManaged     bool          `json:"retention_managed,omitempty"`
+	SecurityCodeHash     string        `json:"security_code_hash,omitempty"`
+	MediaMaxDevices      *int          `json:"media_max_devices,omitempty"`
+	MediaMaxStreams      *int          `json:"media_max_streams,omitempty"`
+	MediaPolicyManaged   bool          `json:"media_policy_managed,omitempty"`
+	MediaDevices         []MediaDevice `json:"media_devices,omitempty"`
+	MediaRevokedDevices  []string      `json:"media_revoked_devices,omitempty"`
 
 	UID              int64  `json:"uid"`
 	Username         string `json:"username"`
@@ -493,6 +496,8 @@ type Signin struct {
 }
 
 type SigninRecord struct {
+	RawAward    int    `json:"raw_award,omitempty"`
+	CapWithheld int    `json:"cap_withheld,omitempty"`
 	Date        string `json:"date"`
 	Points      int    `json:"points"`
 	BonusPoints int    `json:"bonus_points,omitempty"`
@@ -852,6 +857,13 @@ func (s *State) ensure() {
 	}
 	for uid, u := range s.Users {
 		changed := false
+		// Telegram identity creation is not an Emby grant. Repair earlier
+		// profiles only when no bound/pending/code entitlement exists.
+		if u.RegistrationSource == "telegram_profile" && u.EmbyID == "" && !u.PendingEmby && u.RegistrationCode == "" {
+			u.RegistrationSource = ""
+			u.EmbyGrantLocked = false
+			changed = true
+		}
 		if !u.EmbyGrantLocked && (u.PendingEmby || strings.TrimSpace(u.RegistrationSource) != "" || strings.TrimSpace(u.RegistrationCode) != "") {
 			u.EmbyGrantLocked = true
 			changed = true
@@ -1210,6 +1222,7 @@ func (s *Store) saveLockedForce() error {
 }
 
 func (s *Store) saveStateLocked(force bool) error {
+	s.reconcileRetentionEntitlementsLocked()
 	if beforeSaveHookForTest != nil {
 		beforeSaveHookForTest()
 	}
@@ -1238,6 +1251,7 @@ func (s *Store) saveStateLocked(force bool) error {
 // saveStateInTxLocked writes the current state through an existing
 // transaction. The caller updates stateVersion/stateRaw only after commit.
 func (s *Store) saveStateInTxLocked(ctx context.Context, tx *sql.Tx, force bool) ([]byte, int64, error) {
+	s.reconcileRetentionEntitlementsLocked()
 	s.state.ensure()
 	data, err := json.Marshal(s.state)
 	if err != nil {

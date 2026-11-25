@@ -33,7 +33,7 @@ func (s *Store) EnsureTelegramProfile(tgID int64, tgName, passwordHash string, l
 			return ErrConflict
 		}
 		now := time.Now().Unix()
-		result = User{UID: s.state.NextUserID, Username: name, TelegramID: tgID, TelegramUsername: tgName, PasswordHash: passwordHash, Role: RoleNormal, Active: true, ExpiredAt: -1, RegisterTime: now, CreatedAt: now, RegistrationSource: "telegram_profile"}
+		result = User{UID: s.state.NextUserID, Username: name, TelegramID: tgID, TelegramUsername: tgName, PasswordHash: passwordHash, Role: RoleNormal, Active: true, ExpiredAt: -1, RegisterTime: now, CreatedAt: now}
 		s.state.NextUserID++
 		s.state.Users[result.UID] = result
 		s.maintainUserIndexes(User{}, result, result.UID)

@@ -64,6 +64,8 @@ func (a *App) runSchedulerJob(r *http.Request, jobID string) (map[string]any, []
 	}
 	now := time.Now().Unix()
 	switch jobID {
+	case "retention_watch":
+		return a.runRetention(r.Context())
 	case "check_expired":
 		disabled := 0
 		embyDisabled := 0
@@ -129,6 +131,12 @@ func (a *App) runSchedulerJob(r *http.Request, jobID string) (map[string]any, []
 				continue
 			}
 			if u.Active && u.ExpiredAt > 0 && u.ExpiredAt < now {
+				if u.RetentionManaged {
+					if u.RetentionAccessUntil < now {
+						disableEmbyWithRetry(u)
+					}
+					continue
+				}
 				if autoRenewalActive && u.SigninAutoRenewal {
 					renewed, _, renewErr := a.spendSigninRenewal(u.UID, cfg.SigninRenewalCost, cfg.SigninRenewalDays, time.Unix(now, 0), true)
 					if renewErr == nil {

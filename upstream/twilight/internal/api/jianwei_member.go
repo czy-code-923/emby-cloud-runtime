@@ -67,7 +67,7 @@ func (a *App) memberAccount(user store.User) map[string]any {
 	return map[string]any{
 		"icon": a.publicServerIconURL(), "name": cfg.AppName,
 		"uid": user.UID, "username": user.Username, "emby_username": user.EmbyUsername,
-		"media_enabled": user.EmbyID != "" && !user.EmbyDisabled, "has_emby": user.EmbyID != "",
+		"media_enabled": user.EmbyID != "" && !user.EmbyDisabled && a.embyShouldEnableUser(user), "has_emby": user.EmbyID != "",
 		"expired_at": publicExpiryUnix(user.ExpiredAt), "points": si.Points,
 		"signin_enabled": cfg.SigninEnabled, "last_signin": si.LastSignin,
 		"can_register":   user.EmbyID == "" && (user.PendingEmby || cfg.EmbyDirectRegisterEnabled),

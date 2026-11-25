@@ -485,7 +485,11 @@ func embyAccessExpired(u store.User) bool {
 	if u.Role == store.RoleAdmin || u.Role == store.RoleWhitelist {
 		return false
 	}
-	return u.EmbyID != "" && u.ExpiredAt > 0 && !expiryIsPermanent(u.ExpiredAt) && u.ExpiredAt < time.Now().Unix()
+	end := u.ExpiredAt
+	if u.RetentionAccessUntil > end {
+		end = u.RetentionAccessUntil
+	}
+	return u.EmbyID != "" && u.ExpiredAt > 0 && !expiryIsPermanent(u.ExpiredAt) && end < time.Now().Unix()
 }
 
 func validateStrongPassword(password, label string) (bool, string) {

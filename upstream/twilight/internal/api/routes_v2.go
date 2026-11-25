@@ -7,6 +7,12 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodGet, "/api/v2/miniapp/retention", AuthPublic, a.miniMember(a.handleMemberRetention))
+	a.add(http.MethodPost, "/api/v2/miniapp/retention/preview", AuthPublic, a.miniMember(a.handleMemberRetentionPreview))
+	a.add(http.MethodPost, "/api/v2/miniapp/retention/confirm", AuthPublic, a.miniMember(a.handleMemberRetentionConfirm))
+	a.add(http.MethodPost, "/api/v2/miniapp/retention/withdraw", AuthPublic, a.miniMember(a.handleMemberRetentionWithdraw))
+	a.add(http.MethodGet, "/api/v2/admin/retention", AuthAdmin, a.handleAdminRetention)
+	a.add(http.MethodPut, "/api/v2/admin/retention", AuthAdmin, a.handleAdminRetention)
 	a.add(http.MethodGet, "/api/v2/miniapp/announcements", AuthPublic, a.miniMember(a.handleMemberAnnouncements))
 	a.add(http.MethodGet, "/api/v2/miniapp/rank", AuthPublic, a.miniMember(a.handleMemberRank))
 	a.add(http.MethodGet, "/api/v2/miniapp/favorites", AuthPublic, a.miniMember(a.handleMemberLibrary))

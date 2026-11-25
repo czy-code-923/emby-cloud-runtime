@@ -77,6 +77,7 @@ export const adminNavItems: SidebarNavItem[] = [
   { href: "/admin", labelKey: "navigation.adminHome", icon: LayoutDashboard },
   { href: "/admin/users", labelKey: "navigation.users", icon: Users },
   { href: "/admin/regcodes", labelKey: "navigation.regcodes", icon: FileText },
+  { href: "/admin/retention", labelKey: "retention.title", icon: Shield },
   { href: "/admin/commerce", labelKey: "commerce.adminTitle", icon: Coins },
   { href: "/admin/invite", labelKey: "navigation.inviteForest", icon: Network },
 

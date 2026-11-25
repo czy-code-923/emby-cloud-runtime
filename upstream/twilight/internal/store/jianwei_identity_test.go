@@ -21,6 +21,9 @@ func TestJianweiTelegramProfileIsIdempotentAndNeverGrantsMedia(t *testing.T) {
 	if err != nil || created || again.UID != first.UID {
 		t.Fatal("start replay created a second identity")
 	}
+	if again.EmbyGrantLocked || again.RegistrationSource != "" {
+		t.Fatal("Telegram identity was incorrectly treated as a consumed registration grant")
+	}
 	if _, _, err = s.EnsureTelegramProfile(98232, "second", "fixture", 1); err == nil {
 		t.Fatal("capacity limit bypassed")
 	}
