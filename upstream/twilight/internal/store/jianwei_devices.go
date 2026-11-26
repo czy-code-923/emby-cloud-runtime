@@ -1,6 +1,10 @@
 package store
 
-import "strings"
+import (
+	"reflect"
+	"sort"
+	"strings"
+)
 
 type MediaDevice struct {
 	ID   string `json:"id"`
@@ -59,4 +63,58 @@ func (s *Store) RemoveMediaDevice(uid int64, id string) error {
 		return nil
 	})
 	return err
+}
+
+// Normalize only mappings verified against the current Emby account's device
+// list. Preserve revocations, collapse duplicates and never grant a new slot.
+func (s *Store) NormalizeMediaDeviceIDs(uid int64, mappings map[string]string) error {
+	if len(mappings) > 1000 {
+		return ErrInvalid
+	}
+	for old, next := range mappings {
+		if old == "" || next == "" || len(old) > 200 || len(next) > 200 {
+			return ErrInvalid
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateAndSaveLocked(func() error {
+		u, found := s.state.Users[uid]
+		if !found {
+			return ErrNotFound
+		}
+		beforeDevices := append([]MediaDevice{}, u.MediaDevices...)
+		beforeRevoked := append([]string{}, u.MediaRevokedDevices...)
+		revoked := map[string]bool{}
+		for _, id := range u.MediaRevokedDevices {
+			revoked[id] = true
+			if next := mappings[id]; next != "" {
+				revoked[next] = true
+			}
+		}
+		if len(revoked) > 1000 {
+			return ErrConflict
+		}
+		u.MediaRevokedDevices = []string{}
+		for id := range revoked {
+			u.MediaRevokedDevices = append(u.MediaRevokedDevices, id)
+		}
+		sort.Strings(u.MediaRevokedDevices)
+		u.MediaDevices = []MediaDevice{}
+		seen := map[string]bool{}
+		for _, d := range beforeDevices {
+			if next := mappings[d.ID]; next != "" {
+				d.ID = next
+			}
+			if !seen[d.ID] && !revoked[d.ID] {
+				u.MediaDevices = append(u.MediaDevices, d)
+				seen[d.ID] = true
+			}
+		}
+		if reflect.DeepEqual(beforeDevices, u.MediaDevices) && reflect.DeepEqual(beforeRevoked, u.MediaRevokedDevices) {
+			return errNoChange
+		}
+		s.state.Users[uid] = u
+		return nil
+	})
 }

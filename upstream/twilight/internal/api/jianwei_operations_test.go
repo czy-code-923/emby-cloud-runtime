@@ -163,3 +163,40 @@ func TestJianweiPlaybackHostAuthorizationReadsCurrentRole(t *testing.T) {
 		t.Fatal("native server administrator exposed")
 	}
 }
+
+func TestJianweiEmbyDeviceImportUsesReportedIDAndOwnAccount(t *testing.T) {
+	a := newTestApp(t)
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Items":[{"Id":"7","ReportedDeviceId":"reported-own","Name":"Phone","LastUserId":"mine"},{"Id":"8","ReportedDeviceId":"reported-other","Name":"Other","LastUserId":"other"}]}`))
+	}))
+	defer remote.Close()
+	a.cfg().EmbyURL = remote.URL
+	a.cfg().EmbyToken = "fixture"
+	u, e := a.store().CreateUser(store.User{Username: "device-import", Role: store.RoleNormal, Active: true, EmbyID: "mine", ExpiredAt: time.Now().Unix() + 86400})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = a.store().ClaimMediaDevice(u.UID, "7", "Phone", func(store.User) int { return 5 }); e != nil {
+		t.Fatal(e)
+	}
+	success, message, _ := a.invokeMember(context.Background(), u, a.handleMemberDeviceSync, nil)
+	if !success {
+		t.Fatal(message)
+	}
+	after, _ := a.store().User(u.UID)
+	if len(after.MediaDevices) != 1 || after.MediaDevices[0].ID != "reported-own" {
+		t.Fatal(after.MediaDevices)
+	}
+	if e = a.store().RemoveMediaDevice(u.UID, "reported-own"); e != nil {
+		t.Fatal(e)
+	}
+	success, message, _ = a.invokeMember(context.Background(), after, a.handleMemberDeviceSync, nil)
+	if !success {
+		t.Fatal(message)
+	}
+	after, _ = a.store().User(u.UID)
+	if len(after.MediaDevices) != 0 {
+		t.Fatal("sync restored revoked device", after.MediaDevices)
+	}
+}

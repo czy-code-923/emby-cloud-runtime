@@ -319,3 +319,28 @@ func TestJianweiIncidentCannotDowngradePermanentUser(t *testing.T) {
 		t.Fatal(after.ExpiredAt)
 	}
 }
+
+func TestJianweiDeviceCanonicalizationKeepsRevocationAndQuota(t *testing.T) {
+	s, u, _ := retentionFixture(t)
+	for _, id := range []string{"7", "8", "reported-a"} {
+		if e := s.ClaimMediaDevice(u.UID, id, "phone", func(User) int { return 3 }); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if e := s.RemoveMediaDevice(u.UID, "8"); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.NormalizeMediaDeviceIDs(u.UID, map[string]string{"7": "reported-a", "8": "reported-b"}); e != nil {
+		t.Fatal(e)
+	}
+	after, _ := s.User(u.UID)
+	if len(after.MediaDevices) != 1 || after.MediaDevices[0].ID != "reported-a" {
+		t.Fatal("duplicate identifiers retained", after.MediaDevices)
+	}
+	if s.ClaimMediaDevice(u.UID, "reported-b", "phone", func(User) int { return 3 }) == nil {
+		t.Fatal("revoked device reenabled by import")
+	}
+	if e := s.ClaimMediaDevice(u.UID, "other-new", "other", func(User) int { return 1 }); e == nil {
+		t.Fatal("normalization bypassed quota")
+	}
+}

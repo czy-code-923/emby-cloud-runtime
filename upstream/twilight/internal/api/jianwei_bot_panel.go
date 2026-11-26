@@ -572,7 +572,7 @@ func (a *App) publishTelegramMemberCommands(ctx context.Context) error {
 func (a *App) telegramMemberCommandVisible(name string) bool {
 	cfg := a.cfg()
 	switch name {
-	case "retention_confirm", "points_redeem", "device_stop", "request_new", "account_security":
+	case "retention_confirm", "points_redeem", "device_sync", "device_stop", "request_new", "account_security":
 		return false
 	case "signin":
 		return cfg.SigninEnabled

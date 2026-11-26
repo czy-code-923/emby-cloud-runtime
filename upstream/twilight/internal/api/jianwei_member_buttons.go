@@ -202,7 +202,7 @@ func (a *App) telegramDeviceButtons(ctx context.Context, c telegramCommandCtx) {
 	}
 	d, _ := data.(map[string]any)
 	items, _ := d["items"].([]any)
-	rows := [][]map[string]any{}
+	rows := [][]map[string]any{{memberButton("同步登录设备", "/device_sync")}}
 	playing := fmt.Sprint(d["playing_streams"])
 	if available, _ := d["sessions_available"].(bool); !available {
 		playing = "暂不可用"
@@ -213,7 +213,7 @@ func (a *App) telegramDeviceButtons(ctx context.Context, c telegramCommandCtx) {
 			break
 		}
 		item, _ := raw.(map[string]any)
-		rows = append(rows, []map[string]any{memberButton("停用 · "+truncateString(asString(item["name"]), 22), "/device_stop "+memberDeviceKey(asString(item["id"])))})
+		rows = append(rows, []map[string]any{memberButton("停用 · "+truncateString(asString(item["name"]), 15)+" · "+truncateString(asString(item["id"]), 6), "/device_stop "+memberDeviceKey(asString(item["id"])))})
 	}
 	a.memberSendButtons(ctx, c.ChatID, message, rows)
 }
@@ -238,7 +238,18 @@ func init() {
 	for _, item := range []struct {
 		name, description string
 		handler           func(*App, context.Context, telegramCommandCtx)
-	}{{"device_stop", "选择本人设备", func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramMemberCommand(ctx, c) }}, {"service", "在线人数与观看人数", (*App).telegramMemberStatus}, {"points", "积分商店月卡季卡", (*App).telegramPoints}, {"points_redeem", "使用积分商店专属码", (*App).telegramPointsRedeem}} {
+	}{{"device_sync", "同步本人登录设备", func(a *App, ctx context.Context, c telegramCommandCtx) {
+		u, found := a.store().FindUserByTelegramID(c.FromID)
+		if !found || !u.Active {
+			return
+		}
+		success, message, _ := a.invokeMember(ctx, u, a.handleMemberDeviceSync, nil)
+		if !success {
+			a.memberSendButtons(ctx, c.ChatID, message, [][]map[string]any{{memberButton("返回设备", "/devices")}})
+			return
+		}
+		a.telegramDeviceButtons(ctx, c)
+	}}, {"device_stop", "选择本人设备", func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramMemberCommand(ctx, c) }}, {"service", "在线人数与观看人数", (*App).telegramMemberStatus}, {"points", "积分商店月卡季卡", (*App).telegramPoints}, {"points_redeem", "使用积分商店专属码", (*App).telegramPointsRedeem}} {
 		handler := item.handler
 		telegramCommandRegistry["/"+item.name] = telegramCommandSpec{name: item.name, label: "/" + item.name, description: item.description, usage: "/" + item.name, category: "user", order: 46, private: true, handler: handler}
 	}

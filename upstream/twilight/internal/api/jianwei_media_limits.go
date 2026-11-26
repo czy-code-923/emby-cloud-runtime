@@ -352,6 +352,7 @@ func (a *App) handleMemberDeviceSync(w http.ResponseWriter, r *http.Request, _ P
 	var all struct {
 		Items []struct {
 			ID         string `json:"Id"`
+			ReportedID string `json:"ReportedDeviceId"`
 			Name       string `json:"Name"`
 			LastUserID string `json:"LastUserId"`
 		} `json:"Items"`
@@ -360,12 +361,23 @@ func (a *App) handleMemberDeviceSync(w http.ResponseWriter, r *http.Request, _ P
 		fail(w, 502, "无法读取媒体服务器设备")
 		return
 	}
+	mappings := map[string]string{}
+	for _, device := range all.Items {
+		if device.LastUserID == u.EmbyID && device.ID != "" && device.ReportedID != "" && len(device.ReportedID) <= 200 {
+			mappings[device.ID] = device.ReportedID
+		}
+	}
+	if err := a.store().NormalizeMediaDeviceIDs(u.UID, mappings); err != nil {
+		fail(w, 409, "旧设备记录核对失败，请联系管理员")
+		return
+	}
 	added, skipped := 0, 0
 	for _, device := range all.Items {
 		if device.LastUserID != u.EmbyID || device.ID == "" {
 			continue
 		}
-		if e := a.store().ClaimMediaDevice(u.UID, device.ID, device.Name, func(v store.User) int { d, _ := mediaLimits(a.cfg(), v); return d }); e != nil {
+		id := firstNonEmpty(device.ReportedID, device.ID)
+		if e := a.store().ClaimMediaDevice(u.UID, id, device.Name, func(v store.User) int { d, _ := mediaLimits(a.cfg(), v); return d }); e != nil {
 			skipped++
 		} else {
 			added++
