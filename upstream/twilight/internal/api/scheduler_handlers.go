@@ -12,6 +12,7 @@ import (
 )
 
 var schedulerJobs = []map[string]any{
+	{"id": "publish_play_rank", "name": "发布播放排行榜", "description": "向已配置的群或频道定时发布脱敏作品榜；须开启专用开关并选择目标。", "manual_only": false, "enabled": true},
 	{"id": "retention_watch", "name": "保号与可信观影采集", "description": "每30秒读取 Emby 真实会话，排除暂停、跳转与长采样间隙；原子结算活动窗口并重试同步。", "manual_only": false, "enabled": true},
 	{"id": "sync_bangumi_watching", "name": "同步 Bangumi 观看记录", "description": "每 15 分钟同步已开启同步用户的完成记录；歧义记录由用户确认。", "manual_only": false, "enabled": true},
 	{"id": "check_expired", "name": "检查已过期用户", "description": "扫描已过期账号，先按签到配置尝试自动积分续期，再禁用未续期账号并清除过期会话。", "manual_only": false, "enabled": true},

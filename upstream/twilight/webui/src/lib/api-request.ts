@@ -437,6 +437,7 @@ async function parseApiResponse<T>(
 }
 
 export interface ApiRequestExtraOptions {
+  intent?:string;
   /** API major version. Callers default to v2; V1 must be opted into explicitly. */
   apiVersion?: "v1" | "v2";
   /** 自定义超时（毫秒）；传 0 / Infinity 表示不加超时（SSE / 长轮询场景）。 */
@@ -586,6 +587,7 @@ export async function apiRequestForm<T>(
   const headers: Record<string, string> = {
     "Accept": "application/json; charset=utf-8",
     "X-Twilight-Client": "webui",
+    ...(extra.intent?{"X-Twilight-Intent":extra.intent}:{}),
   };
   const apiVersion = extra.apiVersion ?? DEFAULT_API_VERSION;
   const url = `${API_BASE}/api/${apiVersion}${endpoint}`;

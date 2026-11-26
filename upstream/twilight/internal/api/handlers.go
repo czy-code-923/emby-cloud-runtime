@@ -1905,9 +1905,9 @@ func (a *App) embyStatusSnapshot(parent context.Context, includeSessions bool) m
 	return result
 }
 func (a *App) handleEmbyURLs(w http.ResponseWriter, r *http.Request, _ Params) {
-	u := current(r).User
+	u := effectiveMember(current(r).User)
 	// No Emby account and not pending: hide URLs
-	if u.Role == store.RoleNormal && u.EmbyID == "" && !u.PendingEmby {
+	if u.EmbyID == "" {
 		ok(w, "OK", map[string]any{"lines": []any{}, "whitelist_lines": []any{}, "requires_emby_account": true, "requires_renewal": false, "emby_disabled_by_expiry": false})
 		return
 	}

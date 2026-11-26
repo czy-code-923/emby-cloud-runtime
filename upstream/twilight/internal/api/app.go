@@ -65,6 +65,8 @@ type routePathIndexKey struct {
 }
 
 type App struct {
+	memberInputMu sync.Mutex
+	memberInputs  map[int64]memberInputFlow
 	mediaIdentity mediaIdentityCache
 	// runtime 持有 cfg / store / sessions / limiter / redis 这五个 hot reload
 	// 期间会被整体替换的运行时句柄。读端必须经 a.cfg() / a.store() 等访问器，

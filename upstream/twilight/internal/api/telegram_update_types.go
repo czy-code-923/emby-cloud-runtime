@@ -11,6 +11,9 @@ type telegramUpdate struct {
 }
 
 type telegramMessage struct {
+	Photo []struct {
+		FileID string `json:"file_id"`
+	} `json:"photo,omitempty"`
 	MessageID      int64                 `json:"message_id"`
 	From           telegramUser          `json:"from"`
 	SenderChat     telegramChat          `json:"sender_chat"`

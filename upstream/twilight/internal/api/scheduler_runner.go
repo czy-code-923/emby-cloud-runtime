@@ -64,6 +64,8 @@ func (a *App) runSchedulerJob(r *http.Request, jobID string) (map[string]any, []
 	}
 	now := time.Now().Unix()
 	switch jobID {
+	case "publish_play_rank":
+		return a.runRankPublish(r.Context())
 	case "retention_watch":
 		return a.runRetention(r.Context())
 	case "check_expired":

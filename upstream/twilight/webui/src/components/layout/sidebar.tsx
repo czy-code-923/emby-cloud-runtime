@@ -74,6 +74,8 @@ export const userNavItems: SidebarNavItem[] = [
 ];
 
 export const adminNavItems: SidebarNavItem[] = [
+  {href:"/admin/control",labelKey:"ops.control",icon:LayoutDashboard},
+  {href:"/admin/finance",labelKey:"ops.finance",icon:Coins},
   { href: "/admin", labelKey: "navigation.adminHome", icon: LayoutDashboard },
   { href: "/admin/users", labelKey: "navigation.users", icon: Users },
   { href: "/admin/regcodes", labelKey: "navigation.regcodes", icon: FileText },

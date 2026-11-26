@@ -26,18 +26,15 @@ func (s *Store) ClaimMediaDevice(uid int64, id, name string, limitFor func(User)
 			}
 		}
 		limit := limitFor(u)
-		if limit <= 0 {
-			return errNoChange
-		}
 		for index, device := range u.MediaDevices {
 			if device.ID == id {
-				if index < limit {
+				if limit <= 0 || index < limit {
 					return errNoChange
 				}
 				return ErrConflict
 			}
 		}
-		if len(u.MediaDevices) >= limit {
+		if (limit > 0 && len(u.MediaDevices) >= limit) || len(u.MediaDevices) >= 1000 {
 			return ErrConflict
 		}
 		u.MediaDevices = append(append([]MediaDevice{}, u.MediaDevices...), MediaDevice{ID: id, Name: strings.TrimSpace(name)})

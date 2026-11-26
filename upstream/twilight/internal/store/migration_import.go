@@ -207,6 +207,7 @@ func parseMigrationArchive(archive migration.Archive, configuredKey ...string) (
 	if err := ValidateShopBackup(result.state, configuredKey...); err != nil {
 		return parsedMigrationData{}, err
 	}
+	if err := ValidateFinanceBackup(&result.state); err != nil {return parsedMigrationData{}, err}
 	if err := ValidateRetentionBackup(&result.state); err != nil {
 		return parsedMigrationData{}, err
 	}

@@ -138,7 +138,7 @@ export default function AdminPlayRankPage() {
                 <p className="mt-0.5 text-sm text-muted-foreground">{t("playRank.adminDescription")}</p>
               </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2"><Button variant="outline" asChild><a href="/api/v2/admin/play-rank/export" download>{t("ops.rankExport")}</a></Button><Button variant="outline" asChild><a href="/admin/scheduler">{t("ops.rankSchedule")}</a></Button>
               <Select value={String(syncHours)} onValueChange={(value) => setSyncHours(Number(value))}>
                 <SelectTrigger className="h-8 w-[7.5rem] text-xs" aria-label={t("playRank.syncWindow")}>
                   <SelectValue />

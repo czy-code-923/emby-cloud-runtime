@@ -55,7 +55,7 @@ func (s *Store) embyOccupancyLocked(opt EmbyOccupancyOptions) int {
 	}
 	now := time.Now().Unix()
 	for id, order := range s.state.ShopOrders {
-		if id != opt.ExcludeShopOrder && order.Product.Kind == 1 && orderReserves(order, now) {
+		if id != opt.ExcludeShopOrder && (order.Product.Kind == 1 || (order.Product.Kind == 3 && s.state.Users[order.UID].EmbyID == "")) && orderReserves(order, now) {
 			if u, ok := s.state.Users[order.UID]; ok && order.UID != opt.ExcludeUID && opt.CountActiveUsers && u.Active {
 				continue
 			}

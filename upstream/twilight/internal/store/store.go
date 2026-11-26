@@ -121,6 +121,8 @@ type PostgresTargetStatus struct {
 }
 
 type State struct {
+	Finance                 FinanceState                           `json:"finance,omitempty"`
+	Console                 ConsoleState                           `json:"console,omitempty"`
 	Retention               RetentionState                         `json:"retention,omitempty"`
 	Shop                    ShopSettings                           `json:"shop,omitempty"`
 	ShopOrders              map[string]ShopOrder                   `json:"shop_orders,omitempty"`
@@ -176,6 +178,7 @@ type State struct {
 }
 
 type User struct {
+	WhitelistUntil       int64         `json:"whitelist_until,omitempty"`
 	RetentionAccessUntil int64         `json:"retention_access_until,omitempty"`
 	RetentionManaged     bool          `json:"retention_managed,omitempty"`
 	SecurityCodeHash     string        `json:"security_code_hash,omitempty"`
@@ -1222,6 +1225,7 @@ func (s *Store) saveLockedForce() error {
 }
 
 func (s *Store) saveStateLocked(force bool) error {
+	s.expireTemporaryRolesLocked()
 	s.reconcileRetentionEntitlementsLocked()
 	if beforeSaveHookForTest != nil {
 		beforeSaveHookForTest()
@@ -1251,6 +1255,7 @@ func (s *Store) saveStateLocked(force bool) error {
 // saveStateInTxLocked writes the current state through an existing
 // transaction. The caller updates stateVersion/stateRaw only after commit.
 func (s *Store) saveStateInTxLocked(ctx context.Context, tx *sql.Tx, force bool) ([]byte, int64, error) {
+	s.expireTemporaryRolesLocked()
 	s.reconcileRetentionEntitlementsLocked()
 	s.state.ensure()
 	data, err := json.Marshal(s.state)
@@ -5359,6 +5364,11 @@ func (s *Store) ConsumeRegCodeAndUpdateUser(code string, uid, telegramID int64, 
 		}
 		s.state.Users[uid] = u
 		s.maintainUserIndexes(old, u, uid)
+		kind := "code"
+		if consumed.Type == 3 {
+			kind = "code_whitelist"
+		}
+		s.recordEntitlementLocked("code:"+consumed.Code, kind, old, u, now)
 		updated = u
 		return nil
 	})

@@ -1691,16 +1691,16 @@ export interface NetworkProfileStatus {
  active_certificate?:{domain:string;expires_at:number;days_remaining:number;staging:boolean;issuer:string}|null;
 }
 export interface NetworkStatus extends NetworkProfileStatus {
- profiles:Record<"account"|"shop"|"playback",NetworkProfileStatus>;
- desired_origins:Record<"account"|"shop"|"playback",string>;
+ profiles:Record<string,NetworkProfileStatus>;
+ desired_origins:Record<string,string>;
  job:{phase:string;operation?:string;profile?:string;error?:string;updated_at?:number};
  automatic_renewal:{interval_hours:number;enabled:boolean;active:boolean};
 }
 
 export interface MiniAccount {
-	icon?:string; name?:string;
+	icon?:string; name?:string; role_label?:string;avatar?:string;
   uid:number; username:string; emby_username:string; media_enabled:boolean; has_emby:boolean;
   expired_at:number; points:number; signin_enabled:boolean; last_signin:string; can_register:boolean;
-  security_code_set:boolean;password_email_required:boolean; invite_enabled:boolean; requests_enabled:boolean; shop_url:string; banner:string; banner_url:string; role:number;
+  security_code_set:boolean;password_email_required:boolean; invite_enabled:boolean; requests_enabled:boolean; shop_url:string; banner:string; banner_url:string; banner_image?:string; role:number;
   signin:{summary:SigninSummary;config:SigninPublicConfig;history:SigninHistoryRecord[]};
 }

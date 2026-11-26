@@ -96,7 +96,7 @@ func telegramPostResult[T any](a *App, ctx context.Context, method string, body 
 		return zero, fmt.Errorf("%s", a.telegramSanitizeError(err))
 	}
 	result, err := telegramPostResultToEndpoint[T](ctx, endpoint, method, body, timeout)
-	if method == "editMessageText" && err != nil && strings.Contains(strings.ToLower(err.Error()), "message is not modified") {
+	if (method == "editMessageText" || method == "editMessageCaption" || method == "editMessageMedia") && err != nil && strings.Contains(strings.ToLower(err.Error()), "message is not modified") {
 		return zero, nil
 	}
 	if err != nil {

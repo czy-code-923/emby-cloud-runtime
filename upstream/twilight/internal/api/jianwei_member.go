@@ -43,6 +43,24 @@ func (a *App) miniMember(next HandlerFunc) HandlerFunc {
 	}
 }
 
+func memberRoleName(role int) string {
+	switch role {
+	case store.RoleAdmin:
+		return "管理员"
+	case store.RoleWhitelist:
+		return "白名单"
+	default:
+		return "用户"
+	}
+}
+
+func effectiveMember(u store.User) store.User {
+	if u.Role == store.RoleWhitelist && u.WhitelistUntil > 0 && u.WhitelistUntil <= time.Now().Unix() {
+		u.Role = store.RoleNormal
+	}
+	return u
+}
+
 func publicHTTPSURL(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
@@ -52,6 +70,7 @@ func publicHTTPSURL(raw string) string {
 }
 
 func (a *App) memberAccount(user store.User) map[string]any {
+	user = effectiveMember(user)
 	cfg := a.cfg()
 	si := a.store().Signin(user.UID)
 	shop := ""
@@ -68,11 +87,11 @@ func (a *App) memberAccount(user store.User) map[string]any {
 		"icon": a.publicServerIconURL(), "name": cfg.AppName,
 		"uid": user.UID, "username": user.Username, "emby_username": user.EmbyUsername,
 		"media_enabled": user.EmbyID != "" && !user.EmbyDisabled && a.embyShouldEnableUser(user), "has_emby": user.EmbyID != "",
-		"expired_at": publicExpiryUnix(user.ExpiredAt), "points": si.Points,
+		"expired_at": publicExpiryUnix(user.ExpiredAt), "points": a.store().Wallet(user.UID).Available, "wallet": a.store().Wallet(user.UID), "role_label": memberRoleName(user.Role), "avatar": miniAvatarURL(user),
 		"signin_enabled": cfg.SigninEnabled, "last_signin": si.LastSignin,
 		"can_register":   user.EmbyID == "" && (user.PendingEmby || cfg.EmbyDirectRegisterEnabled),
 		"invite_enabled": cfg.InviteEnabled, "requests_enabled": cfg.MediaRequestEnabled,
-		"shop_url": shop, "banner": banner, "banner_url": bannerURL,
+		"banner_image": publicHTTPSURL(cfg.TelegramBannerImageURL), "shop_url": shop, "banner": banner, "banner_url": bannerURL,
 		"signin": a.signinPagePayload(user, 12), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.passwordChangeEmailRequired(user, emailPurposeChangeEmby),
 	}
 }
@@ -128,4 +147,11 @@ func (a *App) handleMemberCreateRequest(w http.ResponseWriter, r *http.Request, 
 	raw, _ := json.Marshal(clean)
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	a.handleCreateMediaRequest(w, r, p)
+}
+
+func miniAvatarURL(u store.User) string {
+	if u.Avatar != "" {
+		return "/api/v2/miniapp/avatar"
+	}
+	return ""
 }

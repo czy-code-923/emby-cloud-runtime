@@ -13,7 +13,7 @@ import {Switch} from "@/components/ui/switch";
 
 export function CertificateManager(){
  const {t}=useI18n();const {toast}=useToast();const {confirm}=useConfirm();
- const [profile,setProfile]=useState<"account"|"shop"|"playback">("account");
+ const [profile,setProfile]=useState<string>("account");
  const [email,setEmail]=useState<string|null>(null);const [token,setToken]=useState("");const [password,setPassword]=useState("");
  const [accepted,setAccepted]=useState(false);const [staging,setStaging]=useState(false);const [busy,setBusy]=useState(false);
  const load=useCallback(async(signal?:AbortSignal)=>{const res=await api.networkStatus(signal);if(!res.success||!res.data)throw new Error(res.message);return res.data;},[]);
@@ -21,13 +21,13 @@ export function CertificateManager(){
  const running=data?.job.phase==="queued"||data?.job.phase==="running";
  useEffect(()=>{if(!running)return;const timer=setInterval(()=>{if(document.visibilityState==="visible")void execute();},4000);return()=>clearInterval(timer);},[running,execute]);
  const current=data?.profiles[profile];const origin=data?.desired_origins[profile]||"";
- const changeProfile=(value:"account"|"shop"|"playback")=>{setProfile(value);setEmail(null);setToken("");setPassword("");setAccepted(false);setStaging(false);};
+ const changeProfile=(value:string)=>{setProfile(value);setEmail(null);setToken("");setPassword("");setAccepted(false);setStaging(false);};
  const action=async(operation:"configure"|"issue"|"renew"|"publish")=>{
   if(busy||running||!password)return;
   if(operation==="publish"&&!await confirm({title:t("network.publishTitle"),description:t("network.publishConfirm"),tone:"warning",confirmLabel:t("network.publish")}))return;
   setBusy(true);
   try{
-   const res=await api.networkAction(operation,{profile,expected_revision:current?.desired.revision||0,password,...(operation==="configure"?{email:email??current?.desired.email??"",cloudflare_token:token,accept_terms:accepted,staging}:{})});
+   const res=await api.networkAction(operation,{profile,expected_revision:current?.desired.revision||0,password,...(operation==="configure"?{email:email??current?.desired.email??data?.profiles.account?.desired.email??"",cloudflare_token:token,accept_terms:accepted,staging}:{})});
    if(!res.success)throw new Error(res.message);
    if(operation==="configure")setToken("");
    toast({title:t("network.submitted"),variant:"success"});await execute();
@@ -36,10 +36,10 @@ export function CertificateManager(){
  };
  return <Card><CardContent className="space-y-5 p-5">
   <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-xl font-semibold">{t("network.title")}</h2><p className="mt-1 text-sm text-muted-foreground">{t("network.description")}</p></div><Button variant="outline" onClick={()=>void execute()} disabled={busy||isLoading}>{t("common.refresh")}</Button></div>
-  <div className="flex flex-wrap gap-2"><Button variant={profile==="account"?"default":"outline"} onClick={()=>changeProfile("account")} disabled={busy||running}>{t("network.account")}</Button><Button variant={profile==="shop"?"default":"outline"} onClick={()=>changeProfile("shop")} disabled={busy||running}>{t("network.shop")}</Button><Button variant={profile==="playback"?"default":"outline"} onClick={()=>changeProfile("playback")} disabled={busy||running}>{t("network.playback")}</Button></div>
+  <div className="flex flex-wrap gap-2"><Button variant={profile==="account"?"default":"outline"} onClick={()=>changeProfile("account")} disabled={busy||running}>{t("network.account")}</Button><Button variant={profile==="shop"?"default":"outline"} onClick={()=>changeProfile("shop")} disabled={busy||running}>{t("network.shop")}</Button><Button variant={profile==="playback"?"default":"outline"} onClick={()=>changeProfile("playback")} disabled={busy||running}>{t("network.playback")}</Button><select className="h-10 max-w-full rounded-md border bg-background px-2 text-sm" aria-label={t("network.playback")} value={profile} disabled={busy||running} onChange={e=>changeProfile(e.target.value)}>{Object.entries(data?.desired_origins||{}).map(([id,origin])=><option key={id} value={id}>{id} · {origin}</option>)}</select></div>
   {error?<p role="alert" className="text-sm text-destructive">{error}</p>:null}
   <dl className="grid gap-4 rounded-xl border bg-muted/20 p-4 text-sm sm:grid-cols-2"><div><dt className="text-muted-foreground">{t("network.desired")}</dt><dd className="mt-1 break-all font-medium">{origin||t("network.notConfigured")}</dd></div><div><dt className="text-muted-foreground">{t("network.applied")}</dt><dd className="mt-1 break-all font-medium">{current?.applied.origin||t("network.notPublished")}</dd></div><div><dt className="text-muted-foreground">{t("network.certificate")}</dt><dd className="mt-1">{current?.certificate?`${current.certificate.staging?t("network.testCertificate"):t("network.production")} · ${new Date(current.certificate.expires_at*1000).toLocaleString()}`:t("network.noCertificate")}</dd></div><div><dt className="text-muted-foreground">{t("network.renewal")}</dt><dd className="mt-1">{data?.automatic_renewal.enabled&&data.automatic_renewal.active?t("network.renewalDescription"):t("network.renewalInactive")}</dd></div></dl>
-  <div className="grid gap-4 sm:grid-cols-2"><div className="space-y-2"><Label htmlFor="certificate-email">{t("network.email")}</Label><Input id="certificate-email" type="email" value={email??current?.desired.email??""} onChange={e=>setEmail(e.target.value)} disabled={busy||running}/></div><div className="space-y-2"><Label htmlFor="cloudflare-token">{t("network.token")}</Label><Input id="cloudflare-token" type="password" autoComplete="off" maxLength={200} value={token} placeholder={current?.credential_saved?t("network.keepSecret"):t("network.enterSecret")} onChange={e=>setToken(e.target.value)} disabled={busy||running}/></div></div>
+  <div className="grid gap-4 sm:grid-cols-2"><div className="space-y-2"><Label htmlFor="certificate-email">{t("network.email")}</Label><Input id="certificate-email" type="email" value={email??current?.desired.email??data?.profiles.account?.desired.email??""} onChange={e=>setEmail(e.target.value)} disabled={busy||running}/></div><div className="space-y-2"><Label htmlFor="cloudflare-token">{t("network.token")}</Label><Input id="cloudflare-token" type="password" autoComplete="off" maxLength={200} value={token} placeholder={current?.credential_saved?t("network.keepSecret"):t("network.enterSecret")} onChange={e=>setToken(e.target.value)} disabled={busy||running}/></div></div>
   <p className="text-sm text-muted-foreground">{t("network.scopedToken")}</p>
   <div className="flex items-center justify-between gap-4"><Label htmlFor="certificate-staging">{t("network.staging")}</Label><Switch id="certificate-staging" checked={staging} onCheckedChange={setStaging} disabled={busy||running}/></div>
   <label className="flex items-start gap-3 text-sm"><input type="checkbox" className="mt-1 h-4 w-4 shrink-0" checked={accepted} onChange={e=>setAccepted(e.target.checked)} disabled={busy||running}/><span>{t("network.acceptTerms")} <a href="https://letsencrypt.org/repository/" target="_blank" rel="noreferrer" className="underline">{t("network.terms")}</a></span></label>

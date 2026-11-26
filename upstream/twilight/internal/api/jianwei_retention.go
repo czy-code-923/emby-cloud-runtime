@@ -237,7 +237,7 @@ func retentionNativeText(v store.RetentionView) string {
 		text += "\n本窗已结，下一窗尚未开始；不会重复扣款或复用旧观影。"
 	}
 	if m.NextSwitchAt > now {
-		text += "\n· 可更换于  |  " + format(m.NextSwitchAt)
+		text += fmt.Sprintf("\n· 可更换于  |  %s（剩余%d天%d小时）", format(m.NextSwitchAt), (m.NextSwitchAt-now)/86400, ((m.NextSwitchAt-now)%86400)/3600)
 	} else {
 		text += "\n· 方式切换  |  可选择；真正变更后冷却20天"
 	}
@@ -279,7 +279,7 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 		}
 	}
 	success, message, data := a.invokeMember(ctx, u, handler, body)
-	rows := [][]map[string]any{{{"text": "‹ 返回主面板", "callback_data": "jw:/panel"}}}
+	rows := [][]map[string]any{{memberButton("✦ 每日签到", "/signin"), memberButton("🛍 积分商店", "/points")}, {memberButton("‹ 返回主面板", "/panel")}}
 	if success && handlerNamePreview(c.Command, c.Args) {
 		d, _ := data.(map[string]any)
 		q, _ := d["quote"].(map[string]any)
@@ -299,7 +299,7 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 		if v, e := a.store().RetentionView(u.UID, time.Now().Unix()); e == nil {
 			message = retentionNativeText(v)
 			if v.Policy.Enabled && !v.Member.Member.Permanent && v.Member.Member.PlaybackEnd > 0 {
-				rows = append([][]map[string]any{{{"text": "月卡 · 300积分", "callback_data": "jw:/retention month"}, {"text": "季卡 · 850积分", "callback_data": "jw:/retention quarter"}, {"text": "年卡 · 3000积分", "callback_data": "jw:/retention year"}}}, rows...)
+
 				if v.Member.Member.Participation && time.Now().Unix() >= v.End && time.Now().Unix() < v.AccessUntil {
 					rows = append([][]map[string]any{{{"text": "查看本窗补救确认", "callback_data": "jw:/retention rescue"}}}, rows...)
 				}

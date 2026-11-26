@@ -17,7 +17,7 @@ func (s *Store) retentionSpecialPreviewLocked(u User, r RetentionMember, p reten
 	if !p.Enabled || r.Member.Permanent || u.EmbyDisabled && !u.EmbyAutoDisabled {
 		return RetentionQuote{}, retention.ErrUnavailable
 	}
-	balance := s.state.Signin[u.UID].Points
+	balance := s.availablePointsLocked(u.UID)
 	progress := s.retentionProgressLocked(r, now)
 	cost, days := retentionCard(p, action)
 	if action == "rescue" {
@@ -37,7 +37,7 @@ func (s *Store) retentionSpecialPreviewLocked(u User, r RetentionMember, p reten
 }
 func (s *Store) retentionSpecialConfirmLocked(u User, r RetentionMember, p retention.Policy, q RetentionQuote, token string, risk, consent bool, cap int, purchase bool, now int64) error {
 	si := s.state.Signin[u.UID]
-	if !p.Enabled || q.Selection.ExpiresAt <= now || r.Member.Version != q.Version || u.ExpiredAt != q.End || si.Points != q.Balance || s.state.Retention.Policy.Revision != q.PolicyRevision {
+	if !p.Enabled || q.Selection.ExpiresAt <= now || r.Member.Version != q.Version || u.ExpiredAt != q.End || s.availablePointsLocked(u.UID) != q.Balance || s.state.Retention.Policy.Revision != q.PolicyRevision {
 		return retention.ErrStale
 	}
 	var decision retention.Settlement
@@ -55,7 +55,7 @@ func (s *Store) retentionSpecialConfirmLocked(u User, r RetentionMember, p reten
 			return retention.ErrConsent
 		}
 		var err error
-		decision, err = retention.Evaluate(r.Member, retention.Wallet{Balance: si.Points}, progress, p, true, now)
+		decision, err = retention.Evaluate(r.Member, s.walletLocked(u.UID), progress, p, true, now)
 		if err != nil {
 			return err
 		}
@@ -85,7 +85,7 @@ func (s *Store) retentionSpecialConfirmLocked(u User, r RetentionMember, p reten
 			return retention.ErrConsent
 		}
 		cost, days := retentionCard(p, q.Action)
-		if cost <= 0 || cost != q.Selection.Cost || si.Points < cost {
+		if cost <= 0 || cost != q.Selection.Cost || s.availablePointsLocked(u.UID) < cost {
 			return ErrInsufficientPoints
 		}
 		var err error
@@ -96,11 +96,14 @@ func (s *Store) retentionSpecialConfirmLocked(u User, r RetentionMember, p reten
 		decision = retention.Settlement{WindowID: "card:" + token, OldEnd: r.Member.PlaybackEnd, NewEnd: m.PlaybackEnd, Mode: "EXEMPT_" + q.Action, Cost: cost, At: now}
 		m.LastSettlement = &decision
 	}
+	oldUser := u
 	before := si.Points
 	si.Points -= decision.Cost
 	s.state.Signin[u.UID] = si
 	u.ExpiredAt = m.PlaybackEnd
 	s.state.Users[u.UID] = u
+	s.recordEntitlementLocked(decision.WindowID, "points_direct", oldUser, u, now)
+	s.walletEntryLocked(u.UID, u.UID, "retention:"+decision.WindowID, "points_direct", "免保号或补救", -decision.Cost)
 	r.Member = m
 	r.QualifiedAt = 0
 	r.Policy = s.state.Retention.Policy

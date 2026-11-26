@@ -83,7 +83,7 @@ func (a *App) handleShopCatalog(w http.ResponseWriter, r *http.Request, _ Params
 			}
 		}
 	}
-	ok(w, "OK", map[string]any{"enabled": cfg.Enabled, "revision": cfg.Revision, "products": products, "brand": "见微 Emby", "currency": "CNY"})
+	ok(w, "OK", map[string]any{"enabled": cfg.Enabled, "revision": cfg.Revision, "products": products, "brand": "见微 Emby", "currency": "CNY", "channels": cfg.Channels, "default_channel": cfg.DefaultChannel, "donation_qr": cfg.DonationQR})
 }
 func (a *App) handleShopLogin(w http.ResponseWriter, r *http.Request, _ Params) {
 	if !a.shopIntent(w, r) {
@@ -131,7 +131,7 @@ func (a *App) handleShopLogout(w http.ResponseWriter, r *http.Request, _ Params)
 	ok(w, "已退出商店", nil)
 }
 func (a *App) shopOrderView(o store.ShopOrder, admin bool) map[string]any {
-	out := map[string]any{"id": o.ID, "revision": o.Revision, "product": o.Product, "channel": o.Channel, "receiving_account": o.ReceivingAccount, "instructions": o.Instructions, "status": o.Status, "created_at": o.CreatedAt, "updated_at": o.UpdatedAt, "pay_before": o.PayBefore, "note": o.Note, "admin_note": o.AdminNote}
+	out := map[string]any{"id": o.ID, "revision": o.Revision, "points_cost": o.PointsCost, "product": o.Product, "channel": o.Channel, "receiving_account": o.ReceivingAccount, "instructions": o.Instructions, "status": o.Status, "created_at": o.CreatedAt, "updated_at": o.UpdatedAt, "pay_before": o.PayBefore, "note": o.Note, "admin_note": o.AdminNote}
 	if o.CodeKey != "" {
 		if rc, ok := a.store().RegCode(o.CodeKey); ok {
 			out["redeemed"] = rc.UseCount > 0 || o.RedeemedAt > 0
@@ -145,6 +145,7 @@ func (a *App) shopOrderView(o store.ShopOrder, admin bool) map[string]any {
 	}
 	if admin {
 		out["uid"] = o.UID
+		out["payment_secret_present"] = o.PaymentSecretCipher != ""
 		out["received_cents"] = o.ReceivedCents
 		out["paid_at"] = o.PaidAt
 		out["checked_by"] = o.CheckedBy
@@ -196,7 +197,7 @@ func (a *App) handleShopOrderCreate(w http.ResponseWriter, r *http.Request, _ Pa
 		fail(w, 503, "下单暂不可用")
 		return
 	}
-	order, err := a.store().CreateShopOrder(u.UID, id, stringValue(body, "product_id"), stringValue(body, "request_key"), revision, a.cfg().EmbyUserLimit, a.cfg().EmbyDirectRegisterEnabled)
+	order, err := a.store().CreateShopOrder(u.UID, id, stringValue(body, "product_id"), stringValue(body, "request_key"), revision, a.cfg().EmbyUserLimit, a.cfg().EmbyDirectRegisterEnabled, stringValue(body, "channel_id"))
 	if statusFromError(w, err) {
 		return
 	}
@@ -205,7 +206,21 @@ func (a *App) handleShopOrderCreate(w http.ResponseWriter, r *http.Request, _ Pa
 }
 func (a *App) handleShopPaymentSubmit(w http.ResponseWriter, r *http.Request, p Params) {
 	body := decodeMap(r)
-	order, err := a.store().SubmitShopPayment(current(r).User.UID, p["order_id"], stringValue(body, "note"), boolValue(body, "cancel", false))
+	secret := stringValue(body, "payment_secret")
+	if len(secret) > 200 {
+		fail(w, 400, "口令过长")
+		return
+	}
+	cipher := ""
+	if secret != "" {
+		var e error
+		cipher, e = a.shopCipher("payment-secret:"+p["order_id"], secret, false)
+		if e != nil {
+			fail(w, 503, "付款信息暂不可保存")
+			return
+		}
+	}
+	order, err := a.store().SubmitShopPayment(current(r).User.UID, p["order_id"], stringValue(body, "note"), boolValue(body, "cancel", false), cipher)
 	if statusFromError(w, err) {
 		return
 	}
@@ -248,6 +263,16 @@ func (a *App) handleAdminShopConfig(w http.ResponseWriter, r *http.Request, _ Pa
 	if !valid {
 		return
 	}
+	for _, channel := range settings.Channels {
+		if channel.QRURL != "" && publicHTTPSURL(channel.QRURL) == "" {
+			fail(w, 400, "收款码图片必须为HTTPS地址")
+			return
+		}
+	}
+	if settings.DonationQR != "" && publicHTTPSURL(settings.DonationQR) == "" {
+		fail(w, 400, "赞赏码必须为HTTPS图片地址")
+		return
+	}
 	if err := a.store().SaveShopConfiguration(settings, revision); statusFromError(w, err) {
 		return
 	}
@@ -267,6 +292,25 @@ func (a *App) handleAdminShopReview(w http.ResponseWriter, r *http.Request, p Pa
 		return
 	}
 	action := stringValue(body, "action")
+	if action == "reveal_payment" {
+		if !a.allowRate(r.Context(), rateKey("payment-reveal:", current(r).User.UID), 5, time.Minute) {
+			fail(w, 429, "读取过于频繁")
+			return
+		}
+		if o.PaymentSecretCipher == "" {
+			fail(w, 404, "没有待核实口令")
+			return
+		}
+		secret, e := a.shopCipher("payment-secret:"+o.ID, o.PaymentSecretCipher, true)
+		if e != nil {
+			fail(w, 503, "付款信息解密失败，请检查密钥")
+			return
+		}
+		a.audit(r, "payment_secret_revealed", "finance", o.UID, map[string]any{"order_id": o.ID})
+		ok(w, "请核实本方到账；不要向群组转发口令", map[string]any{"payment_secret": secret})
+		return
+	}
+
 	revision, valid := shopInteger(w, body, "revision")
 	if !valid {
 		return
@@ -338,7 +382,11 @@ func (a *App) telegramShopCode(ctx context.Context, c telegramCommandCtx) {
 		_ = a.telegramSendMessage(ctx, c.ChatID, "暂时无法签发登录码")
 		return
 	}
-	_ = a.telegramSendMessage(ctx, c.ChatID, "见微独立商店登录码\n"+code+"\n5分钟内有效，仅能使用一次。仅输入到你确认的见微商店页面，不要转交他人。此码不是 Telegram 登录验证码。")
+	rows := [][]map[string]any{{{"text": "一键复制登录码", "copy_text": map[string]string{"text": code}}}}
+	if target := publicHTTPSURL(a.cfg().CommerceStoreURL); target != "" {
+		rows = append(rows, []map[string]any{{"text": "前往见微发卡商店 ↗", "url": target}})
+	}
+	a.memberSendButtons(ctx, c.ChatID, "见微独立商店登录码\n"+code+"\n5分钟内一次有效。此码不是Telegram登录验证码；旧客户端可长按复制。", rows)
 }
 
 func init() {

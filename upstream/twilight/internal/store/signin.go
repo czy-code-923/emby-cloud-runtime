@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"github.com/prejudice-studio/twilight/internal/retention"
 	"strings"
 	"time"
@@ -102,6 +103,7 @@ func (s *Store) AddSigninWithOptions(uid int64, dailyPoints int, bonusForStreak 
 		}
 		si.Records = records
 		s.state.Signin[uid] = si
+		s.walletEntryLocked(uid, uid, "signin:"+today+":"+fmt.Sprint(uid), "signin", "每日签到", totalPoints)
 		result, awarded = si, true
 		return nil
 	})
@@ -138,7 +140,7 @@ func (s *Store) SpendSigninPointsAndUpdateUser(uid int64, cost int, fn func(*Use
 		if cost <= 0 {
 			return ErrConflict
 		}
-		if si.Points < cost {
+		if s.availablePointsLocked(uid) < cost {
 			return ErrInsufficientPoints
 		}
 		old := u
@@ -157,6 +159,7 @@ func (s *Store) SpendSigninPointsAndUpdateUser(uid int64, cost int, fn func(*Use
 		s.maintainUserIndexes(old, u, uid)
 		updated = u
 		updatedSignin = si
+		s.walletEntryLocked(uid, uid, "legacy-renew:"+fmt.Sprint(time.Now().UnixNano()), "legacy_renewal", "手动积分续期", -cost)
 		return nil
 	})
 	if err != nil {

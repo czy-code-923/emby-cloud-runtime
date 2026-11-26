@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,7 +15,7 @@ func (a *App) handleNetworkStatus(w http.ResponseWriter, r *http.Request, _ Para
 		return
 	}
 	data["desired_origin"] = a.cfg().PublicBaseURL
-	data["desired_origins"] = map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL, "playback": a.cfg().EmbyPublicURL}
+	data["desired_origins"] = a.configuredIngressOrigins()
 	w.Header().Set("Cache-Control", "private, no-store")
 	ok(w, "OK", data)
 }
@@ -31,7 +33,8 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 	}
 	operation := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 	profile := stringValue(payload, "profile")
-	if profile != "account" && profile != "shop" && profile != "playback" {
+	configuredOrigins := a.configuredIngressOrigins()
+	if _, valid := configuredOrigins[profile]; !valid {
 		fail(w, 400, "请选择 Mini App、商店或播放入口")
 		return
 	}
@@ -40,7 +43,7 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 		fail(w, 409, "请刷新证书状态后重试")
 		return
 	}
-	origin := a.cfg().PublicBaseURL
+	origin := configuredOrigins[profile]
 	if profile == "shop" {
 		origin = a.cfg().CommerceStoreURL
 	}
@@ -65,7 +68,7 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 		}
 		body = map[string]any{"domain": domain.Hostname(), "email": stringValue(payload, "email"), "cloudflare_token": stringValue(payload, "cloudflare_token"), "accept_terms": accepted, "staging": staging, "profile": profile, "expected_revision": revision}
 	case "issue", "renew", "publish":
-		if operation == "publish" && profile != "playback" {
+		if operation == "publish" && !strings.HasPrefix(profile, "playback") {
 			snapshot, err := a.configEditSnapshot()
 			if err != nil {
 				fail(w, 503, "暂时无法读取配置版本")
@@ -101,8 +104,28 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 		fail(w, status, "证书操作未提交，请检查域名、凭据与任务状态")
 		return
 	}
-	data["desired_origins"] = map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL, "playback": a.cfg().EmbyPublicURL}
+	data["desired_origins"] = a.configuredIngressOrigins()
 	a.audit(r, "network_"+operation, "system", current(r).User.UID, map[string]any{"origin": a.cfg().PublicBaseURL})
 	w.Header().Set("Cache-Control", "private, no-store")
 	ok(w, "OK", data)
+}
+
+func (a *App) configuredIngressOrigins() map[string]string {
+	out := map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL, "playback": a.cfg().EmbyPublicURL}
+	all := append(append([]string{}, a.cfg().EmbyWhitelistURL), a.cfg().EmbyPublicURL)
+	for _, line := range a.cfg().EmbyURLList {
+		all = append(all, line.URL)
+	}
+	for _, line := range a.cfg().EmbyWhitelistURLList {
+		all = append(all, line.URL)
+	}
+	for _, raw := range all {
+		u, e := url.Parse(raw)
+		if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.Port() != "" && u.Port() != "443" || raw == a.cfg().EmbyPublicURL {
+			continue
+		}
+		sum := sha256.Sum256([]byte(strings.ToLower(u.Hostname())))
+		out[fmt.Sprintf("playback-%x", sum[:6])] = u.Scheme + "://" + u.Host
+	}
+	return out
 }

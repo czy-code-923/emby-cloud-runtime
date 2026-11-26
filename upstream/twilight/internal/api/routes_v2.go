@@ -7,6 +7,21 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodGet, "/api/v2/miniapp/avatar", AuthPublic, a.miniMember(a.handleMiniAvatar))
+	a.add(http.MethodGet, "/api/v2/commerce/assets/:filename", AuthPublic, a.handleCommerceImage)
+	a.add(http.MethodPost, "/api/v2/admin/commerce/image", AuthAdmin, a.handleCommerceImageUpload)
+	a.add(http.MethodGet, "/api/v2/admin/play-rank/export", AuthAdmin, a.handleRankExport)
+	a.add(http.MethodGet, "/api/v2/miniapp/service", AuthPublic, a.miniMember(a.handleMemberStatus))
+	a.add(http.MethodPost, "/api/v2/miniapp/device-sync", AuthPublic, a.miniMember(a.handleMemberDeviceSync))
+	a.add(http.MethodGet, "/api/v2/admin/finance", AuthAdmin, a.handleFinance)
+	a.add(http.MethodPost, "/api/v2/admin/finance/actions", AuthAdmin, a.handleFinanceAction)
+	a.add(http.MethodGet, "/api/v2/admin/control", AuthAdmin, a.handleControl)
+	a.add(http.MethodPost, "/api/v2/admin/control/preview", AuthAdmin, a.handleControlPreview)
+	a.add(http.MethodPost, "/api/v2/admin/control/apply", AuthAdmin, a.handleControlApply)
+	a.add(http.MethodGet, "/api/v2/miniapp/points", AuthPublic, a.miniMember(a.handlePointsCatalog))
+	a.add(http.MethodPost, "/api/v2/miniapp/points", AuthPublic, a.miniMember(a.handlePointsPurchase))
+	a.add(http.MethodGet, "/api/v2/miniapp/orders", AuthPublic, a.miniMember(a.handleShopOrders))
+	a.add(http.MethodPost, "/api/v2/miniapp/shop-code", AuthPublic, a.miniMember(a.handleMemberShopCode))
 	a.add(http.MethodGet, "/api/v2/miniapp/retention", AuthPublic, a.miniMember(a.handleMemberRetention))
 	a.add(http.MethodPost, "/api/v2/miniapp/retention/preview", AuthPublic, a.miniMember(a.handleMemberRetentionPreview))
 	a.add(http.MethodPost, "/api/v2/miniapp/retention/confirm", AuthPublic, a.miniMember(a.handleMemberRetentionConfirm))

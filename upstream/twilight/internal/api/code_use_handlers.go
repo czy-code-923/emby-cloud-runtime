@@ -58,7 +58,9 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 		days = int(numeric(preview["days"]))
 	}
 	codeType := int(numeric(preview["type"]))
-	grantsEmby := codeGrantsEmbyRegistration(source, codeType)
+	paidReg, _ := a.store().RegCode(code)
+	paidWhitelist := source == "regcode" && codeType == 3 && paidReg.Source == "commerce"
+	grantsEmby := codeGrantsEmbyRegistration(source, codeType) && !(paidWhitelist && p.User.EmbyID != "")
 	if source == "regcode" && codeType == 2 && rejectSelfServiceRenewalWithoutEmby(w, p.User) {
 		return
 	}
@@ -183,6 +185,25 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 				u.PendingEmby = u.EmbyID == ""
 				u.PendingEmbyDays = &days
 			case 3:
+				if paidWhitelist {
+					if u.Role == store.RoleAdmin || (u.Role == store.RoleWhitelist && u.WhitelistUntil == 0) {
+						return store.ErrConflict
+					}
+					if u.Role != store.RoleAdmin {
+						u.Role = store.RoleWhitelist
+						base := u.ExpiredAt
+						if base < time.Now().Unix() {
+							base = time.Now().Unix()
+						}
+						u.ExpiredAt = base + int64(days)*86400
+						u.WhitelistUntil = u.ExpiredAt
+					}
+					if u.EmbyID == "" {
+						u.PendingEmby = true
+						u.PendingEmbyDays = &days
+					}
+					break
+				}
 				if u.Role == store.RoleUnrecognized || u.Role == store.RoleNormal {
 					u.Role = store.RoleWhitelist
 				}
@@ -204,14 +225,14 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 		}
 		if source == "invite" {
 			markRegistrationGrant(u, registrationSourceInvite, code)
-		} else if source == "regcode" && (reg.Type == 1 || reg.Type == 3) {
+		} else if source == "regcode" && (reg.Type == 1 || reg.Type == 3) && u.EmbyID == "" {
 			markRegistrationGrant(u, registrationSourceRegCode, reg.Code)
 		}
 		if source == "invite" {
 			// invite 续期：上限 = 邀请人剩余天数。统一走 renewExpiryAndReactivate
 			// 让"过期 invitee 重新使用 invite 码"路径自动重新激活账号。
 			renewExpiryAndReactivate(u, boundedInviteExpiry(addDaysToExpiry(u.ExpiredAt, days, time.Now()), inviterForUse.ExpiredAt))
-		} else if u.Role != store.RoleWhitelist && u.Role != store.RoleAdmin {
+		} else if (u.Role != store.RoleWhitelist && u.Role != store.RoleAdmin) || (source == "regcode" && reg.Type == 2 && u.Role == store.RoleWhitelist && u.WhitelistUntil > 0) {
 			// 管理员保持原到期（通常为永久），不因兑换卡码被改成有限期。
 			renewExpiryAndReactivate(u, addDaysToExpiry(u.ExpiredAt, days, time.Now()))
 		}

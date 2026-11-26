@@ -14,7 +14,7 @@ func ValidateShopBackup(state State, configuredKey ...string) error {
 	receipts := map[string]bool{}
 	codes := map[string]bool{}
 	for id, o := range state.ShopOrders {
-		if id != o.ID || o.UID <= 0 || o.Revision < 1 || o.Product.Days < 1 || o.Product.PriceCents < 1 || (o.Product.Kind != 1 && o.Product.Kind != 2) {
+		if id != o.ID || o.UID <= 0 || o.Revision < 1 || o.Product.Days < 1 || (o.Product.PriceCents < 1 && o.PointsCost <= 0) || (o.Product.Kind != 1 && o.Product.Kind != 2 && o.Product.Kind != 3) {
 			return fmt.Errorf("invalid commerce order backup")
 		}
 		switch o.Status {

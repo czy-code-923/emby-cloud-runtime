@@ -302,6 +302,9 @@ func (a *App) handleTelegramUpdate(ctx context.Context, update *telegramUpdate) 
 	}
 	// 拦截非命令文本：delAccount 两步验证（Web密码→Emby密码）
 	isCommand := text[0] == '/'
+	if !isCommand && privateChat && a.consumeMemberInput(ctx, message) {
+		return
+	}
 	if !isCommand && a.telegramConsumeDelAccountPending(ctx, chatID, fromID, text) {
 		return
 	}

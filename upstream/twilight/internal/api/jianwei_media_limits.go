@@ -17,6 +17,7 @@ import (
 )
 
 func mediaLimits(cfg *config.Config, u store.User) (devices, streams int) {
+	u = effectiveMember(u)
 	if !cfg.MediaLimitsEnabled {
 		return 0, 0
 	}
@@ -197,6 +198,7 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 		cache.mu.Unlock()
 	}
 	u, found := a.store().FindUserByEmbyID(entry.id)
+	u = effectiveMember(u)
 	if !found || !u.Active || u.EmbyDisabled || !a.embyShouldEnableUser(u) {
 		fail(w, 403, "媒体账户未开通或已停用")
 		return
@@ -206,6 +208,28 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 	// token without device enrollment still cannot claim a device slot.
 	if device == "" {
 		device = entry.device
+	}
+	host := strings.ToLower(r.Header.Get("X-JW-Host"))
+	if host != "" {
+		allowed := false
+		for _, raw := range append([]string{a.cfg().EmbyPublicURL}, lineURLs(a.cfg().EmbyURLList)...) {
+			v, e := url.Parse(raw)
+			if e == nil && strings.EqualFold(v.Host, host) {
+				allowed = true
+			}
+		}
+		if u.Role == store.RoleWhitelist || u.Role == store.RoleAdmin {
+			for _, raw := range append([]string{a.cfg().EmbyWhitelistURL}, lineURLs(a.cfg().EmbyWhitelistURLList)...) {
+				v, e := url.Parse(raw)
+				if e == nil && strings.EqualFold(v.Host, host) {
+					allowed = true
+				}
+			}
+		}
+		if !allowed {
+			fail(w, 403, "当前账号无权使用此线路")
+			return
+		}
 	}
 	devices, streams := mediaLimits(a.cfg(), u)
 	stamp := fmt.Sprintf("%d:%d:%v", u.UID, streams, a.cfg().MediaLimitsEnabled)
@@ -278,7 +302,60 @@ func (a *App) handleMemberDeviceRegistry(w http.ResponseWriter, r *http.Request,
 	if items == nil {
 		items = []store.MediaDevice{}
 	}
-	ok(w, "OK", map[string]any{"items": items, "max_devices": devices, "max_streams": streams, "enabled": a.cfg().MediaLimitsEnabled})
+	playing := 0
+	online := []map[string]any{}
+	sessions, e := a.embySessionsSnapshot(r.Context(), false)
+	if e == nil {
+		for _, session := range sessions {
+			if u.EmbyID == "" || asString(session["UserId"]) != u.EmbyID {
+				continue
+			}
+			_, watching := embySessionNowPlaying(session)
+			state, _ := session["PlayState"].(map[string]any)
+			paused, _ := state["IsPaused"].(bool)
+			if watching && !paused {
+				playing++
+			}
+			online = append(online, map[string]any{"device_id": asString(session["DeviceId"]), "name": asString(session["DeviceName"]), "client": asString(session["Client"]), "playing": watching && !paused})
+		}
+	}
+	ok(w, "OK", map[string]any{"items": items, "online": online, "playing_streams": playing, "sessions_available": e == nil, "used_devices": len(items), "max_devices": devices, "max_streams": streams, "enabled": a.cfg().MediaLimitsEnabled})
+}
+
+func (a *App) handleMemberDeviceSync(w http.ResponseWriter, r *http.Request, _ Params) {
+	u := current(r).User
+	if u.EmbyID == "" {
+		fail(w, 409, "请先开通Emby")
+		return
+	}
+	if !a.allowRate(r.Context(), rateKey("device-sync:", u.UID), 3, time.Minute) {
+		fail(w, 429, "请稍后同步")
+		return
+	}
+	var all struct {
+		Items []struct {
+			ID         string `json:"Id"`
+			Name       string `json:"Name"`
+			LastUserID string `json:"LastUserId"`
+		} `json:"Items"`
+	}
+	if e := a.embyGet(r.Context(), "/Devices", &all); e != nil {
+		fail(w, 502, "无法读取媒体服务器设备")
+		return
+	}
+	added, skipped := 0, 0
+	for _, device := range all.Items {
+		if device.LastUserID != u.EmbyID || device.ID == "" {
+			continue
+		}
+		if e := a.store().ClaimMediaDevice(u.UID, device.ID, device.Name, func(v store.User) int { d, _ := mediaLimits(a.cfg(), v); return d }); e != nil {
+			skipped++
+		} else {
+			added++
+		}
+	}
+	a.audit(r, "member_devices_synced", "user", u.UID, map[string]any{"matched": added, "skipped": skipped})
+	ok(w, "已核对本人登录设备；超额或已停用设备不会自动恢复", map[string]any{"matched": added, "skipped": skipped})
 }
 
 func (a *App) handleMemberReleaseDevice(w http.ResponseWriter, r *http.Request, _ Params) {
@@ -306,6 +383,16 @@ func (a *App) handleMemberReleaseDevice(w http.ResponseWriter, r *http.Request, 
 	a.mediaIdentity.mu.Lock()
 	a.mediaIdentity.items = nil
 	a.mediaIdentity.mu.Unlock()
+	if sessions, e := a.embySessionsSnapshot(r.Context(), true); e == nil {
+		for _, session := range sessions {
+			if asString(session["UserId"]) == u.EmbyID && asString(session["DeviceId"]) == id {
+				sid := asString(session["Id"])
+				if memberItemID.MatchString(sid) {
+					_ = a.embyPost(r.Context(), "/Sessions/"+sid+"/Playing/Stop", map[string]any{}, nil)
+				}
+			}
+		}
+	}
 	a.audit(r, "release_media_device", "user", u.UID, map[string]any{"device": id})
 	ok(w, "已禁止此设备访问并释放名额", nil)
 }
@@ -324,4 +411,12 @@ func parseMediaLimit(payload map[string]any, key string) (*int, bool, error) {
 	}
 	v := int(n)
 	return &v, true, nil
+}
+
+func lineURLs(lines []config.Line) []string {
+	out := []string{}
+	for _, line := range lines {
+		out = append(out, line.URL)
+	}
+	return out
 }

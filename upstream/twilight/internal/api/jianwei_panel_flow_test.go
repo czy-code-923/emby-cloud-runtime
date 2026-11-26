@@ -43,7 +43,7 @@ func TestJianweiNativeMenuHonorsIndependentFeatureSwitches(t *testing.T) {
 		t.Fatal("panel did not reach Bot transport")
 	}
 	panel, _ := json.Marshal(messages[0]["reply_markup"])
-	if !strings.Contains(string(panel), "jw:/signin") || strings.Contains(string(panel), "jw:/renew") || strings.Contains(string(panel), "jw:/invite") || strings.Contains(string(panel), "jw:/request") {
+	if !strings.Contains(string(panel), "jw:/retention") || strings.Contains(string(panel), "jw:/renew") || strings.Contains(string(panel), "jw:/invite") || strings.Contains(string(panel), "jw:/request") {
 		t.Fatal("panel advertised a disabled feature", string(panel))
 	}
 	if err := a.publishTelegramMemberCommands(context.Background()); err != nil {

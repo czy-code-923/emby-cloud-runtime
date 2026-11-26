@@ -158,8 +158,11 @@ type Config struct {
 	// PlayRank* 控制「播放排行榜」：Enabled 是总开关（关掉后管理员后台之外全部拒绝），
 	// UserVisible 决定普通用户能否查看。排行榜只对已登录账号开放，没有任何匿名入口——
 	// 无账号访客不参与 Emby 数据，不能读取榜单。
-	PlayRankEnabled     bool
-	PlayRankUserVisible bool
+	PlayRankPublishEnabled bool
+	PlayRankPublishTarget  string
+	PlayRankPublishTime    string
+	PlayRankEnabled        bool
+	PlayRankUserVisible    bool
 	// PlaybackReportingEnabled 允许用 Emby 的 Playback Reporting 插件作为播放记录
 	// 数据源。插件可用时用它记的 PlayDuration - PauseDuration（净时长，扣掉暂停），
 	// 比活动日志配对出的墙上时钟差准；插件没装或探测失败时自动回退活动日志，
@@ -173,6 +176,9 @@ type Config struct {
 	EmbyWhitelistURL               string
 	WebAdminOnly                   bool
 	TelegramShopEnabled            bool
+	TelegramPanelImageEnabled      bool
+	TelegramPanelImageURL          string
+	TelegramBannerImageURL         string
 	TelegramBannerEnabled          bool
 	TelegramBannerText             string
 	TelegramBannerURL              string
@@ -474,6 +480,9 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	cfg.EmbyURL = reader.stringValue(cfg.EmbyURL, "Emby.emby_url", "emby_url")
 	cfg.EmbyToken = reader.stringValue(cfg.EmbyToken, "Emby.emby_token", "emby_token")
 	cfg.EmbyStatsEnabled = reader.boolValue(cfg.EmbyStatsEnabled, "Emby.emby_stats_enabled", "emby_stats_enabled")
+	cfg.PlayRankPublishEnabled = reader.boolValue(cfg.PlayRankPublishEnabled, "Emby.play_rank_publish_enabled")
+	cfg.PlayRankPublishTarget = reader.stringValue(cfg.PlayRankPublishTarget, "Emby.play_rank_publish_target")
+	cfg.PlayRankPublishTime = reader.stringValue(cfg.PlayRankPublishTime, "Emby.play_rank_publish_time")
 	cfg.PlayRankEnabled = reader.boolValue(cfg.PlayRankEnabled, "Emby.play_rank_enabled", "play_rank_enabled")
 	cfg.PlayRankUserVisible = reader.boolValue(cfg.PlayRankUserVisible, "Emby.play_rank_user_visible", "play_rank_user_visible")
 	cfg.EmbyUsername = reader.stringValue(cfg.EmbyUsername, "Emby.emby_username", "emby_username")
@@ -484,6 +493,9 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	cfg.EmbyWhitelistURLList = parseLinesList(reader.stringListValue(nil, "Emby.emby_url_list_for_whitelist", "emby_url_list_for_whitelist"))
 	cfg.WebAdminOnly = reader.boolValue(cfg.WebAdminOnly, "Global.admin_only")
 	cfg.TelegramShopEnabled = reader.boolValue(cfg.TelegramShopEnabled, "Telegram.shop_enabled")
+	cfg.TelegramPanelImageEnabled = reader.boolValue(cfg.TelegramPanelImageEnabled, "Telegram.panel_image_enabled")
+	cfg.TelegramPanelImageURL = reader.stringValue(cfg.TelegramPanelImageURL, "Telegram.panel_image_url")
+	cfg.TelegramBannerImageURL = reader.stringValue(cfg.TelegramBannerImageURL, "Telegram.banner_image_url")
 	cfg.TelegramBannerEnabled = reader.boolValue(cfg.TelegramBannerEnabled, "Telegram.banner_enabled")
 	cfg.TelegramBannerText = reader.stringValue(cfg.TelegramBannerText, "Telegram.banner_text")
 	cfg.TelegramBannerURL = reader.stringValue(cfg.TelegramBannerURL, "Telegram.banner_url")
@@ -736,28 +748,29 @@ func defaultConfigPath() string {
 
 func defaults() Config {
 	return Config{
-		AppName:              "Twilight",
-		Version:              BuildVersion,
-		Host:                 "0.0.0.0",
-		Port:                 5000,
-		DatabaseDir:          "db",
-		DatabaseDriver:       "postgres",
-		PostgresHost:         "127.0.0.1",
-		PostgresPort:         5432,
-		PostgresUser:         "twilight",
-		PostgresDatabase:     "twilight",
-		PostgresSSLMode:      "prefer",
-		PostgresMaxOpenConns: 8,
-		PostgresMaxIdleConns: 4,
-		UploadDir:            "uploads",
-		MaxUploadSize:        5 * 1024 * 1024,
-		LogLevel:             "info",
-		RuntimeLogLimit:      1000,
-		RuntimeMemoryLimitMB: 128,
-		CORSOrigins:          []string{"http://localhost:3000", "http://127.0.0.1:3000"},
-		AllowCredential:      true,
-		TrustProxyHeaders:    false,
-		EmbyStatsEnabled:     true,
+		AppName:                   "Twilight",
+		TelegramPanelImageEnabled: true,
+		Version:                   BuildVersion,
+		Host:                      "0.0.0.0",
+		Port:                      5000,
+		DatabaseDir:               "db",
+		DatabaseDriver:            "postgres",
+		PostgresHost:              "127.0.0.1",
+		PostgresPort:              5432,
+		PostgresUser:              "twilight",
+		PostgresDatabase:          "twilight",
+		PostgresSSLMode:           "prefer",
+		PostgresMaxOpenConns:      8,
+		PostgresMaxIdleConns:      4,
+		UploadDir:                 "uploads",
+		MaxUploadSize:             5 * 1024 * 1024,
+		LogLevel:                  "info",
+		RuntimeLogLimit:           1000,
+		RuntimeMemoryLimitMB:      128,
+		CORSOrigins:               []string{"http://localhost:3000", "http://127.0.0.1:3000"},
+		AllowCredential:           true,
+		TrustProxyHeaders:         false,
+		EmbyStatsEnabled:          true,
 		// 排行榜默认对登录用户开放：榜单是聚合统计而非观看明细，脱敏后可以给普通
 		// 用户看，但只对已登录账号开放，无账号访客没有任何读取路径。
 		PlayRankEnabled:     true,

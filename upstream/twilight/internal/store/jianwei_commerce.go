@@ -19,38 +19,55 @@ type ShopProduct struct {
 	Stock      int    `json:"stock"` // -1 unlimited; otherwise includes pending reservations.
 }
 type ShopSettings struct {
-	Revision         int64         `json:"revision"`
-	Enabled          bool          `json:"enabled"`
-	Instructions     string        `json:"instructions"`
-	ReceivingAccount string        `json:"receiving_account"`
-	Channel          string        `json:"channel"`
-	Products         []ShopProduct `json:"products"`
+	Channels         []PaymentChannel `json:"channels,omitempty"`
+	DefaultChannel   string           `json:"default_channel,omitempty"`
+	DonationQR       string           `json:"donation_qr,omitempty"`
+	Revision         int64            `json:"revision"`
+	Enabled          bool             `json:"enabled"`
+	Instructions     string           `json:"instructions"`
+	ReceivingAccount string           `json:"receiving_account"`
+	Channel          string           `json:"channel"`
+	Products         []ShopProduct    `json:"products"`
+}
+type PaymentChannel struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Kind         string `json:"kind"`
+	Enabled      bool   `json:"enabled"`
+	Account      string `json:"account"`
+	Instructions string `json:"instructions"`
+	QRURL        string `json:"qr_url"`
+	Version      int64  `json:"version"`
 }
 type ShopOrder struct {
-	ID               string      `json:"id"`
-	UID              int64       `json:"uid"`
-	Revision         int64       `json:"revision"`
-	RequestKey       string      `json:"request_key"`
-	Product          ShopProduct `json:"product"`
-	Channel          string      `json:"channel"`
-	ReceivingAccount string      `json:"receiving_account"`
-	Instructions     string      `json:"instructions"`
-	Status           string      `json:"status"`
-	CreatedAt        int64       `json:"created_at"`
-	UpdatedAt        int64       `json:"updated_at"`
-	PayBefore        int64       `json:"pay_before"`
-	CapacityReserved bool        `json:"capacity_reserved"`
-	Note             string      `json:"note,omitempty"`
-	AdminNote        string      `json:"admin_note,omitempty"`
-	ReceiptHash      string      `json:"receipt_hash,omitempty"`
-	ReceivedCents    int64       `json:"received_cents,omitempty"`
-	PaidAt           int64       `json:"paid_at,omitempty"`
-	CheckedBy        int64       `json:"checked_by,omitempty"`
-	CodeKey          string      `json:"code_key,omitempty"`
-	CodeCipher       string      `json:"code_cipher,omitempty"`
-	RefundReference  string      `json:"refund_reference,omitempty"`
-	RefundAt         int64       `json:"refund_at,omitempty"`
-	RedeemedAt       int64       `json:"redeemed_at,omitempty"`
+	PaymentQR           string      `json:"payment_qr,omitempty"`
+	PaymentKind         string      `json:"payment_kind,omitempty"`
+	PaymentSecretCipher string      `json:"payment_secret_cipher,omitempty"`
+	PointsCost          int         `json:"points_cost,omitempty"`
+	ID                  string      `json:"id"`
+	UID                 int64       `json:"uid"`
+	Revision            int64       `json:"revision"`
+	RequestKey          string      `json:"request_key"`
+	Product             ShopProduct `json:"product"`
+	Channel             string      `json:"channel"`
+	ReceivingAccount    string      `json:"receiving_account"`
+	Instructions        string      `json:"instructions"`
+	Status              string      `json:"status"`
+	CreatedAt           int64       `json:"created_at"`
+	UpdatedAt           int64       `json:"updated_at"`
+	PayBefore           int64       `json:"pay_before"`
+	CapacityReserved    bool        `json:"capacity_reserved"`
+	Note                string      `json:"note,omitempty"`
+	AdminNote           string      `json:"admin_note,omitempty"`
+	ReceiptHash         string      `json:"receipt_hash,omitempty"`
+	ReceivedCents       int64       `json:"received_cents,omitempty"`
+	PaidAt              int64       `json:"paid_at,omitempty"`
+	CheckedBy           int64       `json:"checked_by,omitempty"`
+	CodeKey             string      `json:"code_key,omitempty"`
+	CodeCipher          string      `json:"code_cipher,omitempty"`
+	RefundReference     string      `json:"refund_reference,omitempty"`
+	RefundAt            int64       `json:"refund_at,omitempty"`
+	RedeemedAt          int64       `json:"redeemed_at,omitempty"`
 }
 
 func (s *Store) ShopConfiguration() ShopSettings {
@@ -60,6 +77,7 @@ func (s *Store) ShopConfiguration() ShopSettings {
 	// Empty installations expose a JSON array, never null. Both catalogue
 	// editors and snapshots can legitimately have no products yet.
 	v.Products = append([]ShopProduct{}, v.Products...)
+	v.Channels = append([]PaymentChannel{}, v.Channels...)
 	return v
 }
 func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) error {
@@ -68,12 +86,31 @@ func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) err
 	}
 	ids := map[string]bool{}
 	for _, p := range settings.Products {
-		if p.ID == "" || len(p.ID) > 40 || ids[p.ID] || strings.TrimSpace(p.Name) == "" || len(p.Name) > 120 || p.Days < 1 || p.Days > 3650 || p.PriceCents < 1 || p.PriceCents > 10000000 || (p.Kind != 1 && p.Kind != 2) || p.Stock < -1 {
+		if p.ID == "" || len(p.ID) > 40 || ids[p.ID] || strings.TrimSpace(p.Name) == "" || len(p.Name) > 120 || p.Days < 1 || p.Days > 3650 || p.PriceCents < 0 || (p.Enabled && p.PriceCents < 1) || p.PriceCents > 10000000 || (p.Kind != 1 && p.Kind != 2 && p.Kind != 3) || p.Stock < -1 {
 			return ErrInvalid
 		}
 		ids[p.ID] = true
 	}
-	if settings.Enabled && (strings.TrimSpace(settings.Instructions) == "" || strings.TrimSpace(settings.Channel) == "" || strings.TrimSpace(settings.ReceivingAccount) == "" || len(settings.Products) == 0) {
+	if len(settings.Channels) > 8 {
+		return ErrInvalid
+	}
+	channels := map[string]bool{}
+	ready := false
+	for _, c := range settings.Channels {
+		if c.ID == "" || channels[c.ID] || len(c.ID) > 40 || len(c.Name) > 80 || len(c.Account) > 100 || len(c.Instructions) > 4000 || len(c.QRURL) > 1000 || (c.Kind != "alipay_phrase" && c.Kind != "alipay_qr" && c.Kind != "wechat_qr") {
+			return ErrInvalid
+		}
+		channels[c.ID] = true
+		if c.Enabled && strings.TrimSpace(c.Account) != "" && strings.TrimSpace(c.Instructions) != "" && (c.Kind == "alipay_phrase" || c.QRURL != "") {
+			if settings.DefaultChannel == c.ID {
+				ready = true
+			}
+		}
+	}
+	if settings.Enabled && len(settings.Channels) > 0 && !ready {
+		return ErrInvalid
+	}
+	if settings.Enabled && ((!ready && (strings.TrimSpace(settings.Instructions) == "" || strings.TrimSpace(settings.Channel) == "" || strings.TrimSpace(settings.ReceivingAccount) == "")) || len(settings.Products) == 0) {
 		return ErrInvalid
 	}
 	s.mu.Lock()
@@ -84,6 +121,7 @@ func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) err
 		}
 		settings.Revision = expected + 1
 		settings.Products = cloneSlice(settings.Products)
+		settings.Channels = cloneSlice(settings.Channels)
 		s.state.Shop = settings
 		return nil
 	})
@@ -114,7 +152,7 @@ func (s *Store) ShopOrder(id string) (ShopOrder, bool) {
 func orderReserves(o ShopOrder, now int64) bool {
 	return o.CapacityReserved && (o.Status == "review" || o.Status == "hold" || (o.Status == "pending" && o.PayBefore > now))
 }
-func (s *Store) CreateShopOrder(uid int64, id, productID, requestKey string, revision int64, limit int, countActive bool) (ShopOrder, error) {
+func (s *Store) CreateShopOrder(uid int64, id, productID, requestKey string, revision int64, limit int, countActive bool, selectedChannel ...string) (ShopOrder, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var result ShopOrder
@@ -148,6 +186,9 @@ func (s *Store) CreateShopOrder(uid int64, id, productID, requestKey string, rev
 		if product.ID == "" {
 			return ErrNotFound
 		}
+		if product.Kind == 3 && (u.Role == RoleAdmin || u.Role == RoleWhitelist && u.WhitelistUntil == 0) {
+			return ErrInvalid
+		}
 		if product.Kind == 1 && (u.EmbyID != "" || u.PendingEmby || u.EmbyGrantLocked) {
 			return ErrConflict
 		}
@@ -173,19 +214,39 @@ func (s *Store) CreateShopOrder(uid int64, id, productID, requestKey string, rev
 		if pending >= 2 || (product.Stock >= 0 && reserved+sold >= product.Stock) {
 			return ErrConflict
 		}
-		if product.Kind == 1 && limit > 0 && s.embyOccupancyLocked(EmbyOccupancyOptions{CountActiveUsers: countActive, ExcludeUID: uid}) >= limit {
+		if (product.Kind == 1 || (product.Kind == 3 && u.EmbyID == "")) && limit > 0 && s.embyOccupancyLocked(EmbyOccupancyOptions{CountActiveUsers: countActive, ExcludeUID: uid}) >= limit {
 			return ErrEmbyCapacityReached
 		}
 		if _, exists := s.state.ShopOrders[id]; exists {
 			return ErrConflict
 		}
 		result = ShopOrder{ID: id, UID: uid, Revision: 1, RequestKey: requestKey, Product: product, Channel: cfg.Channel, ReceivingAccount: cfg.ReceivingAccount, Instructions: cfg.Instructions, Status: "pending", CreatedAt: now, UpdatedAt: now, PayBefore: now + 900, CapacityReserved: true}
+		if len(cfg.Channels) > 0 {
+			target := cfg.DefaultChannel
+			if len(selectedChannel) > 0 && selectedChannel[0] != "" {
+				target = selectedChannel[0]
+			}
+			found := false
+			for _, channel := range cfg.Channels {
+				if channel.ID == target && channel.Enabled {
+					result.Channel = channel.ID
+					result.ReceivingAccount = channel.Account
+					result.Instructions = channel.Instructions
+					result.PaymentKind = channel.Kind
+					result.PaymentQR = channel.QRURL
+					found = true
+				}
+			}
+			if !found {
+				return ErrInvalid
+			}
+		}
 		s.state.ShopOrders[id] = result
 		return nil
 	})
 	return result, err
 }
-func (s *Store) SubmitShopPayment(uid int64, id, note string, cancel bool) (ShopOrder, error) {
+func (s *Store) SubmitShopPayment(uid int64, id, note string, cancel bool, secretCipher ...string) (ShopOrder, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var result ShopOrder
@@ -213,6 +274,12 @@ func (s *Store) SubmitShopPayment(uid int64, id, note string, cancel bool) (Shop
 			o.Status = "review"
 		}
 		o.Note = note
+		if len(secretCipher) > 0 && secretCipher[0] != "" {
+			if len(secretCipher[0]) > 2000 {
+				return ErrInvalid
+			}
+			o.PaymentSecretCipher = secretCipher[0]
+		}
 		o.Revision++
 		o.UpdatedAt = time.Now().Unix()
 		s.state.ShopOrders[id] = o
@@ -261,6 +328,9 @@ func (s *Store) ConfirmShopPayment(id string, revision, admin, received, paidAt 
 		o.CheckedBy = admin
 		o.AdminNote = note
 		ready := ok && u.Active && u.TelegramID > 0
+		if o.Product.Kind == 3 && (u.Role == RoleAdmin || u.Role == RoleWhitelist && u.WhitelistUntil == 0) {
+			ready = false
+		}
 		// Recheck stock after a late payment lost its reservation. A paid hold
 		// records the real receipt without over-selling or silently dropping it.
 		stock := o.Product.Stock
@@ -278,7 +348,7 @@ func (s *Store) ConfirmShopPayment(id string, revision, admin, received, paidAt 
 		if stock >= 0 && occupied >= stock {
 			ready = false
 		}
-		if o.Product.Kind == 1 {
+		if o.Product.Kind == 1 || (o.Product.Kind == 3 && u.EmbyID == "" && !u.PendingEmby) {
 			ready = ready && u.EmbyID == "" && !u.PendingEmby && !u.EmbyGrantLocked
 			if limit > 0 && s.embyOccupancyLocked(EmbyOccupancyOptions{CountActiveUsers: countActive, ExcludeShopOrder: id, ExcludeUID: o.UID}) >= limit {
 				ready = false
@@ -330,6 +400,9 @@ func (s *Store) ReviewShopOrder(id, action, note, refundReference string, revisi
 			result = o
 			return errNoChange
 		}
+		if strings.TrimSpace(note) == "" && (action == "refund_pending" || action == "refund_complete") {
+			return ErrInvalid
+		}
 		if o.Revision != revision || len(note) > 1000 {
 			return ErrConflict
 		}
@@ -345,12 +418,17 @@ func (s *Store) ReviewShopOrder(id, action, note, refundReference string, revisi
 			}
 			o.Status = "closed_unpaid"
 		case "refund_pending":
-			if o.RedeemedAt > 0 || (o.Status != "issued" && o.Status != "paid_hold") {
+			if o.Status != "issued" && o.Status != "paid_hold" {
 				return ErrConflict
+			}
+			if o.RedeemedAt > 0 {
+				if err := s.refundSourceLocked(&o, time.Now().Unix()); err != nil {
+					return err
+				}
 			}
 			if o.CodeKey != "" {
 				rc, ok := s.state.RegCodes[o.CodeKey]
-				if !ok || rc.UseCount > 0 {
+				if !ok || (rc.UseCount > 0 && o.RedeemedAt == 0) {
 					return ErrConflict
 				}
 				rc.Active = false
@@ -370,6 +448,13 @@ func (s *Store) ReviewShopOrder(id, action, note, refundReference string, revisi
 			o.Status = "refunded"
 			o.RefundReference = refundReference
 			o.RefundAt = time.Now().Unix()
+			if o.PointsCost > 0 {
+				si := s.state.Signin[o.UID]
+				si.UID = o.UID
+				si.Points += o.PointsCost
+				s.state.Signin[o.UID] = si
+				s.walletEntryLocked(o.UID, admin, "points-refund:"+o.ID, "points_refund", note, o.PointsCost)
+			}
 		case "extend_code":
 			if o.RedeemedAt > 0 || o.Status != "issued" || strings.TrimSpace(note) == "" {
 				return ErrConflict

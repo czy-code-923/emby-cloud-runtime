@@ -78,6 +78,7 @@ type RetentionView struct {
 	Seconds     int64             `json:"watch_seconds"`
 	SigninDays  int               `json:"signin_days"`
 	Balance     int               `json:"balance"`
+	Frozen      int               `json:"frozen"`
 	Selectable  bool              `json:"selectable"`
 	AccessUntil int64             `json:"access_until"`
 	LastPoll    int64             `json:"last_poll"`
@@ -249,7 +250,7 @@ func (s *Store) retentionViewLocked(uid, now int64) (RetentionView, error) {
 	} else if now-s.state.Retention.LastPoll > 90 {
 		quality = "stale"
 	}
-	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.state.Signin[uid].Points, Selectable: u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: quality, Username: u.Username, EmbyName: u.EmbyUsername, Ledger: ledger}, nil
+	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.availablePointsLocked(uid), Frozen: s.state.Finance.Holds[uid], Selectable: u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: quality, Username: u.Username, EmbyName: u.EmbyUsername, Ledger: ledger}, nil
 }
 func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (RetentionQuote, error) {
 	s.mu.Lock()
@@ -279,7 +280,7 @@ func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (Re
 			s.state.Retention.Members[uid] = r
 			return nil
 		}
-		selection, err := retention.Preview(r.Member, retention.Wallet{Balance: s.state.Signin[uid].Points}, s.retentionProgressLocked(r, now), p, target, now)
+		selection, err := retention.Preview(r.Member, s.walletLocked(uid), s.retentionProgressLocked(r, now), p, target, now)
 		if err != nil {
 			return err
 		}
@@ -322,7 +323,7 @@ func (s *Store) RetentionConfirm(uid int64, token string, risk, consent bool, ca
 			delete(s.state.Retention.Quotes, token)
 			return nil
 		}
-		m, err := retention.Confirm(r.Member, retention.Wallet{Balance: s.state.Signin[uid].Points}, s.retentionProgressLocked(r, now), p, q.Selection, risk, consent, cap, now)
+		m, err := retention.Confirm(r.Member, s.walletLocked(uid), s.retentionProgressLocked(r, now), p, q.Selection, risk, consent, cap, now)
 		if err != nil {
 			return err
 		}
@@ -365,13 +366,13 @@ func (s *Store) evaluateRetentionLocked(uid int64, rescue bool, now int64) bool 
 	}
 	si := s.state.Signin[uid]
 	progress := s.retentionProgressLocked(r, now)
-	ready := (r.Member.Mode == retention.ModeA && si.Points >= p.Cost) || (r.Member.Mode == retention.ModeB && progress.Seconds >= p.WatchSeconds)
+	ready := (r.Member.Mode == retention.ModeA && s.availablePointsLocked(uid) >= p.Cost) || (r.Member.Mode == retention.ModeB && progress.Seconds >= p.WatchSeconds)
 	if ready && r.QualifiedAt == 0 && (now < r.Member.PlaybackEnd || (r.Member.Mode == retention.ModeB && now < r.Member.PlaybackEnd+retention.Day)) {
 		r.QualifiedAt = min(now, r.Member.PlaybackEnd-1)
 		progress.QualifiedAt = r.QualifiedAt
 	}
 	s.state.Retention.Members[uid] = r
-	decision, err := retention.Evaluate(r.Member, retention.Wallet{Balance: si.Points}, progress, p, rescue, now)
+	decision, err := retention.Evaluate(r.Member, s.walletLocked(uid), progress, p, rescue, now)
 	if err != nil {
 		return false
 	}
@@ -382,11 +383,14 @@ func (s *Store) evaluateRetentionLocked(uid int64, rescue bool, now int64) bool 
 	if err != nil {
 		return false
 	}
+	oldUser := u
 	before := si.Points
 	si.Points -= decision.Cost
 	s.state.Signin[uid] = si
 	u.ExpiredAt = decision.NewEnd
 	s.state.Users[uid] = u
+	s.recordEntitlementLocked(decision.WindowID, "activity", oldUser, u, now)
+	s.walletEntryLocked(uid, uid, "retention:"+decision.WindowID, "retention", "活动保号", -decision.Cost)
 	r.Member = m
 	r.QualifiedAt = 0
 	r.Policy = s.state.Retention.Policy

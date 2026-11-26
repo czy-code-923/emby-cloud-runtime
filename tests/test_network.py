@@ -47,3 +47,19 @@ class NetworkTest(unittest.TestCase):
   self.assertEqual(self.network.read('applied-account.json')['domain'],'prior.example.com')
   self.assertEqual(self.network.read('job.json')['phase'],'interrupted')
   self.assertFalse((self.network.root/'pending-publish.json').exists())
+
+ def test_additional_playback_profiles_have_independent_certificates_and_reuse_saved_scope(self):
+  base={'domain':'account.example.com','profile':'account','email':'ops@example.com','cloudflare_token':'fixture-token-not-a-real-secret','accept_terms':True,'staging':False,'expected_revision':0}
+  self.network.configure(base)
+  alias={**base,'profile':'playback-012345abcdef','domain':'play.example.com','cloudflare_token':''}
+  status=self.network.configure(alias)
+  self.assertTrue(status['profiles'][alias['profile']]['credential_saved'])
+  self.assertTrue((self.network.root/'credentials/play.example.com.ini').exists())
+  self.assertEqual(status['profiles']['account']['desired']['domain'],'account.example.com')
+  with self.assertRaises(ValueError):self.network.configure({**alias,'profile':'playback-../../escape'})
+ def test_additional_playback_ingress_uses_same_auth_and_host_boundary(self):
+  config=self.network.render_ingress({'playback-012345abcdef':{'domain':'white.example.com'}})
+  self.assertIn('forward_auth',config)
+  self.assertIn('header_up X-JW-Host {http.request.host}',config)
+  self.assertIn('Private administration entrance required',config)
+  self.assertNotIn('/api/v2/commerce/*',config)

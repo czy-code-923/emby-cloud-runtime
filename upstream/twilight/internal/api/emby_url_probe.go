@@ -102,11 +102,11 @@ func (a *App) handleEmbyURLProbe(w http.ResponseWriter, r *http.Request, _ Param
 	}
 	// 用 /web/favicon.ico 而不是根路径：根路径在 Emby 上是 302→/web/index.html
 	// 的较重路径，favicon.ico 是静态资源，更贴近"网络可达 + RTT"的语义。
-	probeURL := target + "/web/favicon.ico?tw_ping=" + time.Now().Format("150405.000")
+	probeURL := target + "/System/Info/Public?tw_ping=" + time.Now().Format("150405.000")
 
 	ctx, cancel := context.WithTimeout(r.Context(), embyProbeTimeout)
 	defer cancel()
-	req, reqErr := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if reqErr != nil {
 		ok(w, "OK", map[string]any{"status": "error", "latency_ms": 0})
 		return

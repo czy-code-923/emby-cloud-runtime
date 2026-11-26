@@ -21,6 +21,9 @@ def validate_domain(value):
         raise ValueError('Use an ASCII DNS hostname, without a scheme, port, wildcard or path')
     return value
 
+def valid_profile(value):
+    return value in {'account','shop','playback'} or bool(re.fullmatch(r'playback-[0-9a-f]{12}',str(value)))
+
 class Network:
     def __init__(self,manager):
         self.manager=manager
@@ -28,6 +31,14 @@ class Network:
         self.root.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.guard=threading.Lock()
         self.thread=None
+
+    def profile_ids(self):
+        extra=set()
+        for prefix in ('desired-','applied-'):
+            for path in self.root.glob(prefix+'playback-*.json'):
+                name=path.name[len(prefix):-5]
+                if valid_profile(name): extra.add(name)
+        return ['account','shop','playback']+sorted(extra)[:16]
 
     def read(self,name,default=None):
         try:return json.loads((self.root/name).read_text())
@@ -49,9 +60,10 @@ class Network:
 
     def configure(self,body):
         profile=body.get('profile','account')
-        if profile not in {'account','shop','playback'}:raise ValueError('Unsupported ingress profile')
+        if not valid_profile(profile):raise ValueError('Unsupported ingress profile')
         allowed={'domain','email','cloudflare_token','accept_terms','staging','profile','expected_revision'}
         if set(body)-allowed:raise ValueError('Unsupported configuration field')
+        if profile.startswith('playback-') and profile not in self.profile_ids() and len(self.profile_ids())>=19:raise ValueError('At most 16 additional playback entrances are supported')
         domain=validate_domain(body.get('domain',''))
         email=str(body.get('email','')).strip()
         if not re.fullmatch(r'[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,63}',email):raise ValueError('A valid certificate contact email is required')
@@ -71,6 +83,11 @@ class Network:
                 previous=credential_dir/(validate_domain(current['domain'])+'.ini')
                 if previous.exists():
                     credentials.write_bytes(previous.read_bytes());credentials.chmod(0o600)
+            if not credentials.exists() and profile.startswith('playback-'):
+                parent=self.read('desired-playback.json') or self.read('desired-account.json')
+                if parent.get('domain'):
+                    previous=credential_dir/(validate_domain(parent['domain'])+'.ini')
+                    if previous.exists():credentials.write_bytes(previous.read_bytes());credentials.chmod(0o600)
             if not credentials.exists():raise ValueError('Save a Cloudflare scoped DNS API token first')
             self.write('desired-'+profile+'.json',{'revision':current.get('revision',0)+1,'domain':domain,'email':email,'accept_terms':body['accept_terms'],'staging':body['staging'],'updated_at':int(time.time())})
         return self.status()
@@ -92,7 +109,7 @@ class Network:
                 'certificate':self.certificate(desired.get('domain'),desired.get('staging',False)),'active_certificate':self.certificate(applied.get('domain'))}
 
     def status(self):
-        profiles={profile:self.profile_status(profile) for profile in ['account','shop','playback']}
+        profiles={profile:self.profile_status(profile) for profile in self.profile_ids()}
         renewal={'interval_hours':12,'enabled':False,'active':False}
         if Path('/run/systemd/system').exists():
             try:
@@ -103,7 +120,7 @@ class Network:
         return {**profiles['account'],'profiles':profiles,'job':self.read('job.json',{'phase':'idle'}),'automatic_renewal':renewal}
 
     def start(self,operation,profile,revision):
-        if profile not in {"account","shop","playback"}:raise ValueError("Unsupported ingress profile")
+        if not valid_profile(profile):raise ValueError("Unsupported ingress profile")
         if type(revision) is not int or revision<0:raise ValueError('A configuration revision is required')
         if operation not in {'issue','renew','publish'}:raise ValueError('Unsupported certificate operation')
         with self.guard:
@@ -191,9 +208,9 @@ class Network:
         certificate=self.certificate(domain,desired['staging'])
         if not certificate or certificate['staging'] or certificate['expires_at']<=time.time()+3600:raise ValueError('A valid production certificate is required')
         applied=self.read('applied-'+profile+'.json')
-        if not any(self.read('applied-'+key+'.json') for key in ['account','shop','playback']):
+        if not any(self.read('applied-'+key+'.json') for key in self.profile_ids()):
             with socket.socket() as listener:listener.bind(('0.0.0.0',443))
-        sites={key:self.read('applied-'+key+'.json') for key in ['account','shop','playback']}
+        sites={key:self.read('applied-'+key+'.json') for key in self.profile_ids()}
         sites[profile]={'domain':domain,'origin':'https://'+domain}
         if len({item['domain'] for item in sites.values() if item})!=sum(bool(item) for item in sites.values()):raise ValueError('Account and shop require separate hostnames')
         config=self.render_ingress(sites)
@@ -202,7 +219,7 @@ class Network:
         if not re.fullmatch(r'(?:docker\.io/(?:library/)?)?caddy@sha256:[0-9a-f]{64}',edge_image):raise ValueError('A pinned gateway image is required')
         path=self.root/'Caddyfile';previous=path.read_text() if path.exists() else None
         env_path=self.manager.root/'.env';previous_env=env_path.read_text()
-        snapshot={'env':previous_env,'config':previous,'applied':{key:self.read('applied-'+key+'.json') for key in ['account','shop','playback']}}
+        snapshot={'env':previous_env,'config':previous,'applied':{key:self.read('applied-'+key+'.json') for key in self.profile_ids()}}
         self.write('pending-publish.json',snapshot)
         try:
             path.write_text(config);path.chmod(0o600)
@@ -232,7 +249,7 @@ class Network:
             if not site:continue
             domain=validate_domain(site['domain'])
             config+='https://'+domain+' {\n tls /etc/letsencrypt/live/jw-'+domain+'/fullchain.pem /etc/letsencrypt/live/jw-'+domain+'/privkey.pem\n'
-            if profile=='playback':
+            if profile.startswith('playback'):
                 # Fixed upstreams and a secret injected by Compose; the public client
                 # can never choose the gateway identity or authentication target.
                 config+=''' route {
@@ -242,6 +259,7 @@ class Network:
    uri /api/v2/internal/emby-access
    header_up -Origin
    header_up X-JW-Gateway {$BOT_INTERNAL_SECRET}
+   header_up X-JW-Host {http.request.host}
    header_up X-JW-URI {http.request.uri}
    header_up X-JW-Method {http.request.method}
    header_up X-JW-Client-IP {http.request.remote.host}
@@ -263,7 +281,7 @@ class Network:
         context=ssl.create_default_context()
         with socket.create_connection(('127.0.0.1',443),timeout=10) as raw:
             with context.wrap_socket(raw,server_hostname=domain) as tls:
-                health_path='/System/Info/Public' if profile=='playback' else '/api/v2/system/health'
+                health_path='/System/Info/Public' if profile.startswith('playback') else '/api/v2/system/health'
                 tls.sendall(('GET '+health_path+' HTTP/1.1\r\nHost: '+domain+'\r\nConnection: close\r\n\r\n').encode())
                 response=http.client.HTTPResponse(tls);response.begin()
                 if response.status!=200:raise ValueError('Origin health check failed')

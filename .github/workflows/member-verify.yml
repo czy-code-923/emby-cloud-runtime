@@ -1,0 +1,40 @@
+name: Verify member operations
+on:
+  push:
+    branches: ["codex/access-ui"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  member-transactions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: twilight_test
+          POSTGRES_PASSWORD: ci_disposable_only
+          POSTGRES_DB: twilight_test
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U twilight_test -d twilight_test" --health-interval 5s --health-retries 12
+    env:
+      TWILIGHT_TEST_DSN: postgres://twilight_test:ci_disposable_only@127.0.0.1:5432/twilight_test?sslmode=disable
+      TWILIGHT_DATABASE_URL: postgres://twilight_test:ci_disposable_only@127.0.0.1:5432/twilight_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: upstream/twilight/go.mod
+          cache-dependency-path: upstream/twilight/go.sum
+      - name: Deployment and frontend route contracts
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          cd upstream/twilight
+          python3 scripts/check-frontend-v2-coverage.py
+      - name: Real PostgreSQL member transaction and authorization tests
+        working-directory: upstream/twilight
+        run: |
+          go build ./...
+          go vet ./...
+          go test -p 1 ./internal/retention ./internal/config ./internal/store ./internal/api -run 'Test.*(Jianwei|RegCode|Regcode|Invite|ConfigRevision)' -count=1 -timeout=20m
