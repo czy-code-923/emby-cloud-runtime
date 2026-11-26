@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/prejudice-studio/twilight/internal/security"
 	"github.com/prejudice-studio/twilight/internal/store"
@@ -34,9 +35,9 @@ func controlModules() []controlModule {
 		{"devices_sessions", "设备与会话", "/admin/device-audit", []string{"DeviceLimit"}, "登录设备、播放会话、配额和停用"},
 		{"abuse_rules", "防滥用策略", "/admin/security", []string{"Security", "RateLimit"}, "鉴权保持强制，准入与频率策略"},
 		{"abuse_events", "安全事件", "/admin/violations", []string{}, "审计、异常与设备检查"},
-		{"capacity", "资源与容量", "/admin/status", []string{"Global", "DeviceLimit"}, "资源上限、注册和同播容量"},
+		{"capacity", "资源与容量", "/admin/test", []string{"Global", "DeviceLimit"}, "资源上限、注册和同播容量"},
 		{"network_tls", "域名与证书", "/admin/entries", []string{"Emby", "Global"}, "多播放入口、证书与发布回执"},
-		{"backup_migration", "备份与迁移", "/admin/migration", []string{"Database"}, "加密备份、预检和迁移；主备切换为外部运维"},
+		{"backup_migration", "备份与迁移", "/admin/database", []string{"Database"}, "加密备份、预检和迁移；主备切换为外部运维"},
 		{"external_points", "外部积分", "/admin/finance", []string{}, "仅管理内账；外部游戏奖励适配器未接入"},
 		{"system_releases", "配置发布与审计", "/admin/control", []string{"Global", "API"}, "草稿、影响、版本绑定发布及配置回滚"},
 		{"notifications", "通知与投递", "/admin/tickets", []string{"Notification", "Email", "Telegram"}, "通知配置、站内待办与订单状态"},
@@ -118,6 +119,11 @@ func (a *App) handleControlPreview(w http.ResponseWriter, r *http.Request, _ Par
 	before := map[string]any{}
 	desired := map[string]any{}
 	count := 0
+	serialized, _ := json.Marshal(sections)
+	if len(serialized) > 65536 {
+		fail(w, 400, "草稿过大，请按模块拆分")
+		return
+	}
 	for section, raw := range sections {
 		if !moduleSection(m, section) {
 			fail(w, 403, "字段不属于当前模块")
@@ -191,6 +197,38 @@ func (a *App) handleControlApply(w http.ResponseWriter, r *http.Request, _ Param
 		fail(w, 404, "草稿不存在")
 		return
 	}
+	module, exists := moduleByID(d.Module)
+	if !exists {
+		fail(w, 400, "模块已失效")
+		return
+	}
+	for section, raw := range d.Sections {
+		if !moduleSection(module, section) {
+			fail(w, 403, "草稿模块范围不匹配")
+			return
+		}
+		fields, valid := raw.(map[string]any)
+		if !valid {
+			fail(w, 400, "草稿结构无效")
+			return
+		}
+		for key := range fields {
+			allowed := false
+			for _, def := range configSectionDefs() {
+				if def.Key == section {
+					for _, f := range def.Fields {
+						if f.Key == key && consoleFieldAllowed(section, f) {
+							allowed = true
+						}
+					}
+				}
+			}
+			if !allowed {
+				fail(w, 403, "草稿含受保护字段")
+				return
+			}
+		}
+	}
 	rev, valid := shopInteger(w, body, "revision")
 	if !valid {
 		return
@@ -208,6 +246,19 @@ func (a *App) handleControlApply(w http.ResponseWriter, r *http.Request, _ Param
 		fail(w, 503, "配置不可用")
 		return
 	}
+	if action == "reconcile" {
+		if d.Status != "applying" || time.Now().Unix()-controlDraftUpdatedAt(d) < 120 {
+			fail(w, 409, "仅执行超过2分钟的中断回执可核对，请勿中断正常发布")
+			return
+		}
+		message := "执行上下文已失效；已核对当前配置版本，请重新预览，不会自动重放或回滚业务数据"
+		if statusFromError(w, a.store().TransitionConsoleDraft(d.ID, rev, "applying", "failed", snapshot.revision, message)) {
+			return
+		}
+		a.audit(r, "control_reconciled", "system", 0, map[string]any{"id": d.ID, "current_revision": snapshot.revision})
+		ok(w, message, nil)
+		return
+	}
 	expected := d.Expected
 	sections := d.Sections
 	from := "draft"
@@ -215,7 +266,11 @@ func (a *App) handleControlApply(w http.ResponseWriter, r *http.Request, _ Param
 	if action == "rollback" {
 		expected = d.Applied
 		sections = d.Before
-		from = "applied"
+		from = d.Status
+		if from != "applied" && from != "overridden" {
+			fail(w, 409, "该状态不能回滚")
+			return
+		}
 		to = "rolled_back"
 	} else if action != "publish" {
 		fail(w, 400, "操作无效")
@@ -264,4 +319,11 @@ func (a *App) handleControlApply(w http.ResponseWriter, r *http.Request, _ Param
 		return
 	}
 	ok(w, "配置操作完成，请查看应用状态", map[string]any{"status": to, "revision": applied, "effective": effective})
+}
+
+func controlDraftUpdatedAt(d store.ConsoleDraft) int64 {
+	if d.UpdatedAt > d.At {
+		return d.UpdatedAt
+	}
+	return d.At
 }

@@ -141,6 +141,7 @@ func (a *App) handleAdminRetention(w http.ResponseWriter, r *http.Request, _ Par
 }
 
 func (a *App) runRetention(ctx context.Context) (map[string]any, []string, error) {
+	a.runShopDeliveries(ctx)
 	if !a.store().RetentionPolicy().Enabled {
 		return map[string]any{"success": true, "enabled": false}, nil, nil
 	}
@@ -149,6 +150,7 @@ func (a *App) runRetention(ctx context.Context) (map[string]any, []string, error
 	// or optional reporting plugins are unavailable.
 	sessions, err := a.embySessionsSnapshot(ctx, true)
 	if err != nil {
+		_ = a.store().ProtectSamplingIncident(now)
 		return map[string]any{"success": false}, nil, err
 	}
 	observations := []store.RetentionObservation{}
@@ -235,6 +237,9 @@ func retentionNativeText(v store.RetentionView) string {
 	}
 	if v.Start > now {
 		text += "\n本窗已结，下一窗尚未开始；不会重复扣款或复用旧观影。"
+	}
+	if m.HoldUntil > now {
+		text += "\n· 事故保护至 | " + format(m.HoldUntil) + "；已暂停活动结算，等待管理员核实补偿。"
 	}
 	if m.NextSwitchAt > now {
 		text += fmt.Sprintf("\n· 可更换于  |  %s（剩余%d天%d小时）", format(m.NextSwitchAt), (m.NextSwitchAt-now)/86400, ((m.NextSwitchAt-now)%86400)/3600)

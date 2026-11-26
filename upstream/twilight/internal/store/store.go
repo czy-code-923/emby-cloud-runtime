@@ -2327,6 +2327,7 @@ func (s *Store) UpdateUser(uid int64, fn func(*User) error) (User, error) {
 		if old.TelegramID != u.TelegramID {
 			s.finishTelegramRebindRequestsLocked(uid)
 		}
+		s.completeCommerceProvisioningLocked(old, u)
 		s.state.Users[uid] = u
 		s.maintainUserIndexes(old, u, uid)
 		updated = u
@@ -3097,6 +3098,10 @@ func (s *Store) DeleteUser(uid int64) error {
 // caller owns the store lock and must persist the result together with any
 // dedicated-table cleanup in one transaction.
 func (s *Store) deleteUserStateLocked(uid int64) error {
+	if s.financialLiabilityLocked(uid) {
+		return ErrConflict
+	}
+	delete(s.state.Finance.Holds, uid)
 	u, ok := s.state.Users[uid]
 	if !ok {
 		return ErrNotFound
@@ -4441,8 +4446,14 @@ func (s *Store) RepairRegistrationResidue() (RegistrationResidueRepair, error) {
 				days   int
 			}{source: source, code: code, days: days}
 		}
+		revokedPaid := map[string]bool{}
+		for _, o := range s.state.ShopOrders {
+			if o.Status == "refund_pending" || o.Status == "refunded" {
+				revokedPaid[o.CodeKey] = true
+			}
+		}
 		for _, reg := range s.state.RegCodes {
-			if reg.IsDecoy || (reg.Type != 1 && reg.Type != 3) {
+			if revokedPaid[reg.Code] || reg.IsDecoy || (reg.Type != 1 && reg.Type != 3) {
 				continue
 			}
 			days := normalizeRegistrationGrantDays(reg.Days)

@@ -142,6 +142,10 @@ func (a *App) handleBatchDeleteUsers(w http.ResponseWriter, r *http.Request, _ P
 			addBatchOutcomeWithCode(result, uid, ErrUserProtected, fmt.Errorf("cannot batch delete protected account: %s", a.protectedUserReason(target)))
 			continue
 		}
+		if a.store().FinancialLiability(uid) {
+			addBatchOutcome(result, uid, fmt.Errorf("存在冻结积分或未结清交易"))
+			continue
+		}
 		if deleteEmby && target.EmbyID != "" {
 			if !a.embyConfigured() {
 				addBatchOutcomeWithCode(result, uid, ErrEmbyNotConfigured, fmt.Errorf("delete_emby: emby not configured"))

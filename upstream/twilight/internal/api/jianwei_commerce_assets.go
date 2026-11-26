@@ -91,9 +91,18 @@ func (a *App) handleCommerceImage(w http.ResponseWriter, r *http.Request, p Para
 func (a *App) handleMiniAvatar(w http.ResponseWriter, r *http.Request, _ Params) {
 	u := current(r).User
 	name := filepath.Base(u.Avatar)
-	if name == "." || name == "" {
+	if !uploadFilenamePattern.MatchString(name) || u.Avatar != "/api/v1/users/assets/avatar/"+name {
 		http.NotFound(w, r)
 		return
 	}
-	a.handleAsset(w, r, Params{"kind": "avatar", "filename": name})
+	file, valid := resolveUploadAssetPath(a.cfg().UploadDir, "avatar", name)
+	if !valid {
+		http.NotFound(w, r)
+		return
+	}
+	// This URL identifies the current viewer, never an immutable shared asset.
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Vary", "Cookie")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeFile(w, r, file)
 }

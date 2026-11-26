@@ -145,6 +145,7 @@ func (a *App) shopOrderView(o store.ShopOrder, admin bool) map[string]any {
 	}
 	if admin {
 		out["uid"] = o.UID
+		out["refund_preview"] = a.store().ShopRefundPreview(o.ID)
 		out["payment_secret_present"] = o.PaymentSecretCipher != ""
 		out["received_cents"] = o.ReceivedCents
 		out["paid_at"] = o.PaidAt

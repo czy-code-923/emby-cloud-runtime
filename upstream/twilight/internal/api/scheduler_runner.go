@@ -634,7 +634,7 @@ func (a *App) runSchedulerJob(r *http.Request, jobID string) (map[string]any, []
 			if err := r.Context().Err(); err != nil {
 				return map[string]any{"success": false, "terminated": true, "candidates": candidates, "cleared": cleared, "failed": failed, "dry_run": dryRun}, []string{"job terminated"}, err
 			}
-			if a.userIsProtected(u) || u.EmbyID != "" || !u.PendingEmby {
+			if a.userIsProtected(u) || u.EmbyID != "" || !u.PendingEmby || a.store().FinancialLiability(u.UID) {
 				continue
 			}
 			grantedAt := u.PendingEmbyGrantedAt

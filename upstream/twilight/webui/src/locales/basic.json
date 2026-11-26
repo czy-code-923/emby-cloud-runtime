@@ -3995,6 +3995,11 @@
     "initChannels": "载入三种收款渠道",
     "revealPayment": "密码复核后查看付款口令",
     "donationHelp": "自愿赞赏不发放商品或播放权益，与购买订单分开。",
-    "uploadQR": "上传收款码图片"
+    "uploadQR": "上传收款码图片",
+    "incidentProtected": "观影采样事故保护中，暂停活动结算，等待管理员核实补偿。保护至",
+    "recoverReceipt": "核对中断回执",
+    "myOrders": "我的卡码",
+    "myOrdersHelp": "仅显示本人最近20笔订单；未使用的已发卡码可继续兑换。",
+    "noOrders": "暂无订单"
   }
 }

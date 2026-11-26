@@ -179,3 +179,69 @@ func TestJianweiReconciliationPersistsRealDifferenceAndNoDuplicate(t *testing.T)
 		t.Fatal("duplicate statement", e)
 	}
 }
+
+func TestJianweiFrozenAndUndeliveredObligationsPreventDeletion(t *testing.T) {
+	s, u, now := retentionFixture(t)
+	if e := s.AdjustWallet(u.UID, 1, 0, "deletion-credit-0001", "credit", "fixture", 1000); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.AdjustWallet(u.UID, 1, s.Wallet(u.UID).Revision, "deletion-freeze-0001", "freeze", "fixture", 100); e != nil {
+		t.Fatal(e)
+	}
+	if !s.FinancialLiability(u.UID) || s.DeleteUser(u.UID) == nil {
+		t.Fatal("frozen account deleted")
+	}
+	if e := s.AdjustWallet(u.UID, 1, s.Wallet(u.UID).Revision, "deletion-release-001", "release", "fixture", 100); e != nil {
+		t.Fatal(e)
+	}
+	o, e := s.CreatePointsOrder(u.UID, "delivery-order-00001", "month", "delivery-request-001", strings.Repeat("f", 64), "encrypted-code", now, 300)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !s.FinancialLiability(u.UID) || s.DeleteUser(u.UID) == nil {
+		t.Fatal("undelivered code lost with account")
+	}
+	claimed, tg, found, e := s.ClaimShopDelivery()
+	if e != nil || !found || claimed.ID != o.ID || tg != u.TelegramID {
+		t.Fatal(claimed, tg, found, e)
+	}
+	_, _, found, e = s.ClaimShopDelivery()
+	if e != nil || found {
+		t.Fatal("delivery lease allowed duplicate", found, e)
+	}
+	if e = s.MarkShopDelivered(o.ID, u.UID); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.MarkShopDelivered(o.ID, u.UID); e != nil {
+		t.Fatal(e)
+	}
+	if s.Wallet(u.UID).Balance != 700 || len(s.ShopOrders(u.UID, false)) != 1 {
+		t.Fatal("notification debited or reminted")
+	}
+}
+func TestJianweiFinanceBackupRejectsTamperedIncidentAndStatement(t *testing.T) {
+	state := State{Finance: FinanceState{Incidents: map[string]ServiceIncident{"incident-tamper-0001": {ID: "incident-tamper-0001", Revision: 1, Status: "open", UIDs: []int64{1}, Start: 1, End: 2, HoldUntil: 3, Points: -1}}}}
+	if ValidateFinanceBackup(&state) == nil {
+		t.Fatal("negative compensation imported")
+	}
+	state.Finance.Incidents = nil
+	state.Finance.Reconciliations = map[string]Reconciliation{"statement-tamper-001": {ID: "statement-tamper-001", Date: "2026-11-26", At: 1, ActualReceived: 100, Difference: 0}}
+	if ValidateFinanceBackup(&state) == nil {
+		t.Fatal("incorrect money difference imported")
+	}
+}
+func TestJianweiDisabledZeroPriceTemplatesCannotOpenShop(t *testing.T) {
+	s, _, _ := retentionFixture(t)
+	cfg := s.ShopConfiguration()
+	if len(cfg.Products) != 9 || cfg.Enabled {
+		t.Fatal("default catalogue", cfg)
+	}
+	cfg.Enabled = true
+	cfg.DefaultChannel = "alipay_phrase"
+	cfg.Channels[0].Enabled = true
+	cfg.Channels[0].Account = "fixture"
+	cfg.Channels[0].Instructions = "fixture"
+	if s.SaveShopConfiguration(cfg, cfg.Revision) == nil {
+		t.Fatal("shop opened without priced products")
+	}
+}

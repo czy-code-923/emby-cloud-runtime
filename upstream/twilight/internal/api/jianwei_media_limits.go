@@ -140,6 +140,23 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 	if strings.HasPrefix(path, "/emby/") {
 		path = strings.TrimPrefix(path, "/emby")
 	}
+	if a.cfg().BlockEmbyOfficialClients {
+		client := r.Header.Get("X-Emby-Client")
+		for _, header := range []string{r.Header.Get("Authorization"), r.Header.Get("X-Emby-Authorization")} {
+			for _, part := range strings.Split(header, ",") {
+				key, value, found := strings.Cut(strings.TrimSpace(part), "=")
+				key = strings.TrimPrefix(strings.ToLower(key), "mediabrowser ")
+				key = strings.TrimPrefix(key, "emby ")
+				if found && key == "client" {
+					client = strings.Trim(value, "\"")
+				}
+			}
+		}
+		if strings.HasPrefix(strings.ToLower(client), "emby") {
+			fail(w, 403, "请使用支持见微线路的第三方客户端")
+			return
+		}
+	}
 	// Anonymous clients need server discovery and password authentication only.
 	if path == "/system/info/public" || path == "/users/authenticatebyname" {
 		method := r.Header.Get("X-JW-Method")
@@ -209,19 +226,19 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 	if device == "" {
 		device = entry.device
 	}
-	host := strings.ToLower(r.Header.Get("X-JW-Host"))
+	host := normalizedPlaybackHost(&url.URL{Scheme: "https", Host: r.Header.Get("X-JW-Host")})
 	if host != "" {
 		allowed := false
 		for _, raw := range append([]string{a.cfg().EmbyPublicURL}, lineURLs(a.cfg().EmbyURLList)...) {
 			v, e := url.Parse(raw)
-			if e == nil && strings.EqualFold(v.Host, host) {
+			if e == nil && strings.EqualFold(normalizedPlaybackHost(v), host) {
 				allowed = true
 			}
 		}
 		if u.Role == store.RoleWhitelist || u.Role == store.RoleAdmin {
 			for _, raw := range append([]string{a.cfg().EmbyWhitelistURL}, lineURLs(a.cfg().EmbyWhitelistURLList)...) {
 				v, e := url.Parse(raw)
-				if e == nil && strings.EqualFold(v.Host, host) {
+				if e == nil && strings.EqualFold(normalizedPlaybackHost(v), host) {
 					allowed = true
 				}
 			}
@@ -419,4 +436,16 @@ func lineURLs(lines []config.Line) []string {
 		out = append(out, line.URL)
 	}
 	return out
+}
+
+func normalizedPlaybackHost(v *url.URL) string {
+	if v == nil || v.Host == "" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSuffix(v.Hostname(), "."))
+	port := v.Port()
+	if port == "" || (v.Scheme == "https" && port == "443") || (v.Scheme == "http" && port == "80") {
+		return host
+	}
+	return host + ":" + port
 }

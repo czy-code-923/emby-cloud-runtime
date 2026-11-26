@@ -77,7 +77,19 @@ func (a *App) handleFinanceAction(w http.ResponseWriter, r *http.Request, _ Para
 		if action == "incident_close" {
 			op = "close"
 		}
-		err = a.store().ResolveIncident(stringValue(body, "id"), op, revision, actor)
+		amounts := []int{}
+		if _, set := body["days"]; set {
+			days, good := shopInteger(w, body, "days")
+			if !good {
+				return
+			}
+			points, good := shopInteger(w, body, "points")
+			if !good {
+				return
+			}
+			amounts = []int{int(days), int(points)}
+		}
+		err = a.store().ResolveIncident(stringValue(body, "id"), op, revision, actor, amounts...)
 	case "reconcile":
 		raw, _ := json.Marshal(body["reconciliation"])
 		var v store.Reconciliation
@@ -113,7 +125,7 @@ func (a *App) handlePointsCatalog(w http.ResponseWriter, r *http.Request, _ Para
 		}
 		items = append(items, map[string]any{"id": sku, "name": map[string]string{"month": "月卡", "quarter": "季卡", "year": "年卡"}[sku], "points": points, "days": days})
 	}
-	ok(w, "OK", map[string]any{"enabled": p.Enabled, "wallet": a.store().Wallet(u.UID), "items": items})
+	ok(w, "OK", map[string]any{"enabled": p.Enabled, "can_purchase": u.EmbyID != "" && u.Active && u.ExpiredAt >= 0 && u.Role != store.RoleAdmin, "wallet": a.store().Wallet(u.UID), "items": items})
 }
 func (a *App) handlePointsPurchase(w http.ResponseWriter, r *http.Request, _ Params) {
 	b := decodeMap(r)

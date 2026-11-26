@@ -809,6 +809,10 @@ func (a *App) delAccountLooksLikeEmailCode(s string) bool {
 // telegramExecuteDelAccount 执行账号删除操作（从本地删除 + 远端 Emby 解绑 + 清除会话）。
 // reason 为可选的删除原因，会记入审计日志。
 func (a *App) telegramExecuteDelAccount(ctx context.Context, chatID int64, u store.User, reason string) {
+	if a.store().FinancialLiability(u.UID) {
+		_ = a.telegramSendMessage(ctx, chatID, "请联系管理员先处理冻结余额、已付款未交付订单或退款待办，再注销账号。")
+		return
+	}
 	if a.userIsProtected(u) {
 		_ = a.telegramSendMessage(ctx, chatID, "受保护账号不允许通过 Telegram 删除。")
 		return

@@ -26,7 +26,7 @@ def main():
  sys.path.insert(0,str(root/'scripts'));from manager import Manager
  manager=Manager(root);network=manager.network()
  if a.refresh_ingress:
-  for profile in ('account','shop','playback'):
+  for profile in network.profile_ids():
    state=network.profile_status(profile)
    if not state['applied']:continue
    if state['desired'].get('domain')!=state['applied'].get('domain'):raise RuntimeError('Unapplied domain change; refusing automatic publication')
@@ -41,15 +41,15 @@ def main():
   if status not in (200,204):raise RuntimeError('Emby name update was not confirmed')
  info=manager.status();state=network.status()
  report={'version':info['installed_version'],'job_phase':info['job'].get('phase'),'configuration':{},'entrances':{},'private_ports':{}}
- for section,keys in {'Global':['admin_only','public_base_url','commerce_store_url'],'Telegram':['mini_app_url','shop_enabled','banner_enabled','auto_provision'],'Emby':['emby_public_url'],'SAR':['signin_enabled','signin_auto_renewal_enabled','emby_user_limit'],'MediaRequest':['enabled'],'Database':['migration_panel_enabled'],'DeviceLimit':['media_limits_enabled','media_normal_devices','media_normal_streams','media_whitelist_devices','media_whitelist_streams','media_admin_devices','media_admin_streams']}.items():
+ for section,keys in {'Global':['admin_only','public_base_url','commerce_store_url'],'Telegram':['mini_app_url','shop_enabled','banner_enabled','auto_provision'],'Emby':['emby_public_url','block_official_clients'],'SAR':['signin_enabled','signin_auto_renewal_enabled','emby_user_limit'],'MediaRequest':['enabled'],'Database':['migration_panel_enabled'],'DeviceLimit':['media_limits_enabled','media_normal_devices','media_normal_streams','media_whitelist_devices','media_whitelist_streams','media_admin_devices','media_admin_streams']}.items():
   report['configuration'][section]={k:cfg.get(section,{}).get(k) for k in keys}
  for profile,s in state['profiles'].items():
   host=s['applied'].get('domain');entry={'host':host,'certificate_days':(s.get('active_certificate') or {}).get('days_remaining'),'admin_exposed':s['applied'].get('admin_exposed')}
   if host:
    network.probe_origin(host,profile)
-   path='/System/Info/Public' if profile=='playback' else '/api/v2/system/health'
+   path='/System/Info/Public' if profile.startswith('playback') else '/api/v2/system/health'
    entry['https_health']=http('https://'+host+path)[0]
-   entry['management_blocked']=http('https://'+host+('/web/index.html' if profile=='playback' else '/admin'))[0]==403
+   entry['management_blocked']=http('https://'+host+('/web/index.html' if profile.startswith('playback') else '/admin'))[0]==403
   report['entrances'][profile]=entry
  for port in (13000,13001,18096):
   result=subprocess.run(['ss','-ltnH','sport = :'+str(port)],capture_output=True,text=True,timeout=10)

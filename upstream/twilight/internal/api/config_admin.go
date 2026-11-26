@@ -1085,6 +1085,7 @@ func configSectionDefs() []configSectionDef {
 			{Key: "emby_stats_enabled", Label: "Emby库统计", Type: "bool", Description: "在首页仪表盘 Emby 卡片显示电影/剧集/集数统计"},
 			{Key: "emby_public_url", Label: "Emby 客户端普通播放地址", Type: "string", Description: "例如 https://jwemby.iczy.top；供 Emby 客户端登录与播放，不是网页管理地址。留空不公布默认线路。"},
 			{Key: "emby_whitelist_url", Label: "白名单单线路地址", Type: "string", Description: "仅管理员与白名单用户可见的单一线路地址；留空则只使用上面的白名单线路列表"},
+			{Key: "block_official_clients", Label: "拒绝声明为Emby官方客户端的请求", Type: "bool", Description: "通过声明的客户端名尽力识别；名称可被伪造，不作为身份鉴权替代。网页管理始终由网关拒绝"},
 			{Key: "play_rank_publish_enabled", Label: "定时发布排行榜", Type: "bool", Description: "默认关闭；只向明确配置的群或频道发送脱敏作品排行"},
 			{Key: "play_rank_publish_target", Label: "排行发布群或频道ID", Type: "string", Description: "必须与Telegram已配置的group_id或channel_id精确匹配"},
 			{Key: "play_rank_publish_time", Label: "排行发布时间", Type: "string", Description: "北京时间HH:MM，默认20:00；频率可在任务管理调整"},
@@ -1342,8 +1343,8 @@ func configValues(cfg config.Config) map[string]map[string]any {
 			"emby_url": cfg.EmbyURL, "emby_token": cfg.EmbyToken, "emby_username": cfg.EmbyUsername, "emby_password": cfg.EmbyPassword,
 			"emby_url_list": linesToStrings(cfg.EmbyURLList), "emby_url_list_for_whitelist": linesToStrings(cfg.EmbyWhitelistURLList),
 			"emby_stats_enabled": cfg.EmbyStatsEnabled, "emby_public_url": cfg.EmbyPublicURL,
-			"emby_whitelist_url":        cfg.EmbyWhitelistURL,
-			"play_rank_publish_enabled": cfg.PlayRankPublishEnabled, "play_rank_publish_target": cfg.PlayRankPublishTarget, "play_rank_publish_time": cfg.PlayRankPublishTime, "play_rank_enabled": cfg.PlayRankEnabled, "play_rank_user_visible": cfg.PlayRankUserVisible,
+			"emby_whitelist_url":     cfg.EmbyWhitelistURL,
+			"block_official_clients": cfg.BlockEmbyOfficialClients, "play_rank_publish_enabled": cfg.PlayRankPublishEnabled, "play_rank_publish_target": cfg.PlayRankPublishTarget, "play_rank_publish_time": cfg.PlayRankPublishTime, "play_rank_enabled": cfg.PlayRankEnabled, "play_rank_user_visible": cfg.PlayRankUserVisible,
 			"playback_reporting_enabled": cfg.PlaybackReportingEnabled,
 		},
 		"Telegram": {

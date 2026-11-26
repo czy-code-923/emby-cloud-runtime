@@ -8,7 +8,7 @@ import (
 // Paid-code delivery must survive an import with the original encryption key.
 // Reject an incompatible key before replacing any business data.
 func ValidateShopBackup(state State, configuredKey ...string) error {
-	if len(state.Shop.Products) > 24 || len(state.ShopOrders) > 100000 {
+	if len(state.Shop.Products) > 24 || len(state.Shop.Channels) > 8 || len(state.ShopOrders) > 100000 {
 		return fmt.Errorf("invalid commerce backup size")
 	}
 	receipts := map[string]bool{}
@@ -46,6 +46,15 @@ func ValidateShopBackup(state State, configuredKey ...string) error {
 			digest, err := security.ShopDigest(key, "code", code)
 			if err != nil || digest != o.CodeKey {
 				return fmt.Errorf("invalid encrypted commerce delivery")
+			}
+		}
+		if o.PaymentSecretCipher != "" {
+			key, err := security.TwoFactorKey(configuredKey...)
+			if err != nil {
+				return err
+			}
+			if _, err = security.ShopCipher(key, "payment-secret:"+id, o.PaymentSecretCipher, true); err != nil {
+				return fmt.Errorf("payment secret encryption key does not match backup")
 			}
 		}
 	}

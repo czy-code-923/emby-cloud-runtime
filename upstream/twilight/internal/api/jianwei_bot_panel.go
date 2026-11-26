@@ -105,7 +105,7 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 	} else {
 		rows = append(rows, []map[string]any{button("🧭 账号与线路", "/lines"), button("📱 设备管理", "/devices")})
 	}
-	rows = append(rows, []map[string]any{button("✦ 签到与保号", "/retention"), button("🛍 积分商店", "/points")}, []map[string]any{button("🔑 修改密码", "/password"), button("🔐 安全码", "/security")})
+	rows = append(rows, []map[string]any{button("✦ 签到与保号", "/retention"), button("🛍 积分商店", "/points")}, []map[string]any{button("🎟 使用卡码", "/redeem"), button("🔐 账户安全", "/account_security")})
 	if cfg.MediaRequestEnabled {
 		rows = append(rows, []map[string]any{button("🎬 求片与进度", "/request")})
 	}
@@ -152,7 +152,7 @@ func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegr
 		confirmation := len(parts) == 2 && parts[0] == "/retention_confirm" && len(parts[1]) == 24 && memberRedeemPayload.MatchString(parts[1])
 		memberChoice := (parts[0] == "/points" && (len(parts) == 2 || len(parts) == 3)) || ((parts[0] == "/device_stop" || parts[0] == "/points_redeem") && len(parts) == 2)
 		favorite := len(parts) == 2 && (parts[0] == "/favorite" || parts[0] == "/unfavorite") && memberItemID.MatchString(parts[1])
-		if len(callback.Data) > 64 || (!paging && !selection && !confirmation && !favorite && !memberChoice) {
+		if len(callback.Data) > 64 || (!paging && !selection && !confirmation && !favorite && !memberChoice && !(len(parts) == 2 && parts[0] == "/invite" && parts[1] == "create")) {
 			return true
 		}
 		command = parts[0]
@@ -491,7 +491,43 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 			}
 		}
 	}
-	_ = a.telegramSendMessage(ctx, c.ChatID, truncateString(message, 3500))
+	rows := [][]map[string]any{}
+	if c.Command == "/request" && len(c.Args) == 0 && a.cfg().MediaRequestEnabled {
+		rows = append(rows, []map[string]any{memberButton("提交新的求片", "/request_new")})
+	}
+	if c.Command == "/invite" && len(c.Args) == 0 && a.cfg().InviteEnabled {
+		rows = append(rows, []map[string]any{memberButton("创建邀请码", "/invite create")})
+	}
+	if success && c.Command == "/security" {
+		rows = append(rows, []map[string]any{memberButton("继续修改密码", "/password"), memberButton("我的设备", "/devices")})
+	}
+	if success && c.Command == "/redeem" {
+		fresh, _ := a.store().User(user.UID)
+		if fresh.EmbyID == "" && fresh.PendingEmby {
+			rows = append(rows, []map[string]any{memberButton("继续开通Emby", "/register")})
+		} else {
+			rows = append(rows, []map[string]any{memberButton("查看账号与线路", "/lines"), memberButton("查看保号", "/retention")})
+		}
+	}
+	if c.Command == "/lines" {
+		if user.EmbyUsername != "" {
+			rows = append(rows, []map[string]any{{"text": "复制Emby账号", "copy_text": map[string]string{"text": user.EmbyUsername}}, memberButton("修改密码", "/password")})
+		}
+		if d, ok := data.(map[string]any); ok {
+			for _, key := range []string{"lines", "whitelist_lines"} {
+				if list, ok := d[key].([]any); ok {
+					for _, raw := range list {
+						item, _ := raw.(map[string]any)
+						target := asString(item["url"])
+						if len([]rune(target)) > 0 && len([]rune(target)) <= 256 {
+							rows = append(rows, []map[string]any{{"text": "复制 · " + asString(item["name"]), "copy_text": map[string]string{"text": target}}})
+						}
+					}
+				}
+			}
+		}
+	}
+	a.memberSendButtons(ctx, c.ChatID, truncateString(message, 3500), rows)
 }
 
 func memberInviteText(data any) string {
@@ -536,7 +572,7 @@ func (a *App) publishTelegramMemberCommands(ctx context.Context) error {
 func (a *App) telegramMemberCommandVisible(name string) bool {
 	cfg := a.cfg()
 	switch name {
-	case "retention_confirm", "points_redeem", "device_stop":
+	case "retention_confirm", "points_redeem", "device_stop", "request_new", "account_security":
 		return false
 	case "signin":
 		return cfg.SigninEnabled

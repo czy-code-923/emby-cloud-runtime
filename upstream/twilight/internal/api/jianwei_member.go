@@ -55,7 +55,7 @@ func memberRoleName(role int) string {
 }
 
 func effectiveMember(u store.User) store.User {
-	if u.Role == store.RoleWhitelist && u.WhitelistUntil > 0 && u.WhitelistUntil <= time.Now().Unix() {
+	if u.Role == store.RoleWhitelist && u.WhitelistUntil > 0 && u.WhitelistUntil <= time.Now().Unix() && !u.PendingEmby {
 		u.Role = store.RoleNormal
 	}
 	return u

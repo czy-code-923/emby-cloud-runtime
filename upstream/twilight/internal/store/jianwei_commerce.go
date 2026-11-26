@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +41,9 @@ type PaymentChannel struct {
 	Version      int64  `json:"version"`
 }
 type ShopOrder struct {
+	EntitlementSourceID string      `json:"entitlement_source_id,omitempty"`
+	NotifiedAt          int64       `json:"notified_at,omitempty"`
+	NotifyLeaseUntil    int64       `json:"notify_lease_until,omitempty"`
 	PaymentQR           string      `json:"payment_qr,omitempty"`
 	PaymentKind         string      `json:"payment_kind,omitempty"`
 	PaymentSecretCipher string      `json:"payment_secret_cipher,omitempty"`
@@ -78,6 +82,20 @@ func (s *Store) ShopConfiguration() ShopSettings {
 	// editors and snapshots can legitimately have no products yet.
 	v.Products = append([]ShopProduct{}, v.Products...)
 	v.Channels = append([]PaymentChannel{}, v.Channels...)
+	if len(v.Products) == 0 && !v.Enabled {
+		for _, days := range []int{30, 90, 365} {
+			for _, kind := range []int{1, 2, 3} {
+				name := map[int]string{1: "注册卡", 2: "续期卡", 3: "限期白名单卡"}[kind]
+				v.Products = append(v.Products, ShopProduct{ID: fmt.Sprintf("card-%d-%d", kind, days), Name: fmt.Sprintf("%s · %d天", name, days), Kind: kind, Days: days, PriceCents: 0, Stock: -1, Enabled: false})
+			}
+		}
+	}
+	if len(v.Channels) == 0 && !v.Enabled && v.Channel == "" {
+		v.DefaultChannel = "alipay_phrase"
+		for _, item := range []struct{ id, name string }{{"alipay_phrase", "支付宝口令"}, {"alipay_qr", "支付宝个人静态码"}, {"wechat_qr", "微信个人静态码"}} {
+			v.Channels = append(v.Channels, PaymentChannel{ID: item.id, Kind: item.id, Name: item.name, Version: 1})
+		}
+	}
 	return v
 }
 func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) error {
@@ -85,11 +103,15 @@ func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) err
 		return ErrInvalid
 	}
 	ids := map[string]bool{}
+	readyProduct := false
 	for _, p := range settings.Products {
 		if p.ID == "" || len(p.ID) > 40 || ids[p.ID] || strings.TrimSpace(p.Name) == "" || len(p.Name) > 120 || p.Days < 1 || p.Days > 3650 || p.PriceCents < 0 || (p.Enabled && p.PriceCents < 1) || p.PriceCents > 10000000 || (p.Kind != 1 && p.Kind != 2 && p.Kind != 3) || p.Stock < -1 {
 			return ErrInvalid
 		}
 		ids[p.ID] = true
+		if p.Enabled && p.PriceCents > 0 {
+			readyProduct = true
+		}
 	}
 	if len(settings.Channels) > 8 {
 		return ErrInvalid
@@ -110,7 +132,7 @@ func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) err
 	if settings.Enabled && len(settings.Channels) > 0 && !ready {
 		return ErrInvalid
 	}
-	if settings.Enabled && ((!ready && (strings.TrimSpace(settings.Instructions) == "" || strings.TrimSpace(settings.Channel) == "" || strings.TrimSpace(settings.ReceivingAccount) == "")) || len(settings.Products) == 0) {
+	if settings.Enabled && ((!ready && (strings.TrimSpace(settings.Instructions) == "" || strings.TrimSpace(settings.Channel) == "" || strings.TrimSpace(settings.ReceivingAccount) == "")) || !readyProduct) {
 		return ErrInvalid
 	}
 	s.mu.Lock()
@@ -192,7 +214,7 @@ func (s *Store) CreateShopOrder(uid int64, id, productID, requestKey string, rev
 		if product.Kind == 1 && (u.EmbyID != "" || u.PendingEmby || u.EmbyGrantLocked) {
 			return ErrConflict
 		}
-		if product.Kind == 2 && u.EmbyID == "" {
+		if product.Kind == 2 && (u.EmbyID == "" || u.Role == RoleAdmin || u.ExpiredAt < 0) {
 			return ErrInvalid
 		}
 		now := time.Now().Unix()

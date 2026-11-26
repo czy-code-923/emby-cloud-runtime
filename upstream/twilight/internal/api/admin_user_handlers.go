@@ -308,6 +308,10 @@ func (a *App) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request, para
 			skipped = append(skipped, map[string]any{"uid": targetUID, "reason": a.protectedUserReason(target)})
 			continue
 		}
+		if a.store().FinancialLiability(targetUID) {
+			failed = append(failed, map[string]any{"uid": targetUID, "reason": "请先处理冻结余额、已付款未交付订单或退款待办"})
+			continue
+		}
 		if mode == "emby_only" {
 			if target.EmbyID != "" {
 				if !a.embyConfigured() {

@@ -953,10 +953,13 @@ func (a *App) consumePendingEmbyEntitlementOnBind(u *store.User, before store.Us
 	if u.Role == store.RoleUnrecognized {
 		u.Role = store.RoleNormal
 	}
-	if u.Role == store.RoleAdmin || u.Role == store.RoleWhitelist || days < 0 {
+	if u.Role == store.RoleAdmin || (u.Role == store.RoleWhitelist && u.WhitelistUntil == 0) || days < 0 {
 		u.ExpiredAt = permanentExpiryUnix
 	} else {
 		u.ExpiredAt = expiryFromDays(days, time.Now())
+		if u.Role == store.RoleWhitelist && u.WhitelistUntil > 0 {
+			u.WhitelistUntil = u.ExpiredAt
+		}
 	}
 	if u.Role != store.RoleAdmin && u.Role != store.RoleWhitelist {
 		u.ExpiredAt = boundedInviteExpiry(u.ExpiredAt, inviteCap)
@@ -1045,10 +1048,13 @@ func (a *App) handleRegisterEmby(w http.ResponseWriter, r *http.Request, params 
 		if u.Role == store.RoleUnrecognized {
 			u.Role = store.RoleNormal
 		}
-		if u.Role == store.RoleAdmin || u.Role == store.RoleWhitelist || days < 0 {
+		if u.Role == store.RoleAdmin || (u.Role == store.RoleWhitelist && u.WhitelistUntil == 0) || days < 0 {
 			u.ExpiredAt = permanentExpiryUnix
 		} else {
 			u.ExpiredAt = expiryFromDays(days, time.Now())
+			if u.Role == store.RoleWhitelist && u.WhitelistUntil > 0 {
+				u.WhitelistUntil = u.ExpiredAt
+			}
 		}
 		if hadPendingEmby && u.Role != store.RoleAdmin && u.Role != store.RoleWhitelist {
 			u.ExpiredAt = boundedInviteExpiry(u.ExpiredAt, inviteCap)

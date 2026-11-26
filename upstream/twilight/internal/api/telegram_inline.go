@@ -1198,6 +1198,9 @@ func (a *App) telegramProtectedTarget(u store.User) bool {
 }
 
 func (a *App) telegramDeleteTargetEmby(ctx context.Context, target store.User) (store.User, error) {
+	if a.store().FinancialLiability(target.UID) {
+		return target, fmt.Errorf("请先处理冻结余额、已付款未交付订单或退款待办")
+	}
 	if target.EmbyID == "" {
 		return target, fmt.Errorf("target user has no Emby account")
 	}

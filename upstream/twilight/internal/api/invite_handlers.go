@@ -354,6 +354,9 @@ func (a *App) deleteEmbyAndDetachInviteUser(w http.ResponseWriter, r *http.Reque
 }
 
 func (a *App) detachInviteUserCleanup(ctx context.Context, child store.User, deleteEmby bool) (store.User, bool, error) {
+	if deleteEmby && a.store().FinancialLiability(child.UID) {
+		return store.User{}, false, fmt.Errorf("请先处理冻结余额、已付款未交付订单或退款待办")
+	}
 	deletedEmby := false
 	updated := child
 	if deleteEmby {

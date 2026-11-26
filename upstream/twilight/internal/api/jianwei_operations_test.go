@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +72,15 @@ func TestJianweiRegistrationAndExpiredWhitelistCannotReadAllRoutes(t *testing.T)
 		a.handleEmbyURLs(w, req, nil)
 		if strings.Contains(w.Body.String(), "white.example.test") || u.EmbyID == "" && strings.Contains(w.Body.String(), "normal.example.test") {
 			t.Fatal("unearned route access", w.Body.String())
+		}
+	}
+}
+
+func TestJianweiPlaybackHostNormalizesOnlyDefaultPort(t *testing.T) {
+	for raw, expected := range map[string]string{"https://WHITE.Example.test:443/": "white.example.test", "https://white.example.test:8443": "white.example.test:8443", "http://normal.example.test:80": "normal.example.test"} {
+		v, e := url.Parse(raw)
+		if e != nil || normalizedPlaybackHost(v) != expected {
+			t.Fatal(raw, normalizedPlaybackHost(v), e)
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"github.com/prejudice-studio/twilight/internal/store"
 	"net/http"
 	"strings"
 	"time"
@@ -166,7 +167,7 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 		nonce := fmt.Sprintf("%016x", time.Now().UnixNano())
 		text += "\n\n确认兑换？本次将扣除对应可用积分。"
 		rows = append(rows, []map[string]any{memberButton("确认扣分并发码", "/points confirm "+sku+":"+nonce+":"+fmt.Sprint(map[string]int{"month": p.MonthPoints, "quarter": p.QuarterPoints, "year": p.YearPoints}[sku])), memberButton("取消", "/points")})
-	} else {
+	} else if u.EmbyID != "" && u.ExpiredAt >= 0 && u.Role != store.RoleAdmin {
 		rows = append(rows, []map[string]any{memberButton("兑换月卡", "/points month"), memberButton("兑换季卡", "/points quarter"), memberButton("兑换年卡", "/points year")})
 	}
 	a.memberSendButtons(ctx, c.ChatID, text, rows)
@@ -202,7 +203,11 @@ func (a *App) telegramDeviceButtons(ctx context.Context, c telegramCommandCtx) {
 	d, _ := data.(map[string]any)
 	items, _ := d["items"].([]any)
 	rows := [][]map[string]any{}
-	message = fmt.Sprintf("我的设备\n\n登录登记：%v / %v 台\n正在播放：%v / %v 路\n0 表示不限；设备在通过播放网关访问后登记。", len(items), d["max_devices"], d["playing_streams"], d["max_streams"])
+	playing := fmt.Sprint(d["playing_streams"])
+	if available, _ := d["sessions_available"].(bool); !available {
+		playing = "暂不可用"
+	}
+	message = fmt.Sprintf("我的设备\n\n登录登记：%v / %v 台\n正在播放：%v / %v 路\n0 表示不限；设备在通过播放网关访问后登记。", len(items), d["max_devices"], playing, d["max_streams"])
 	for i, raw := range items {
 		if i >= 20 {
 			break
@@ -213,6 +218,23 @@ func (a *App) telegramDeviceButtons(ctx context.Context, c telegramCommandCtx) {
 	a.memberSendButtons(ctx, c.ChatID, message, rows)
 }
 func init() {
+	telegramCommandRegistry["/request_new"] = telegramCommandSpec{name: "request_new", label: "/request_new", description: "填写求片", category: "user", private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) {
+		if a.cfg().MediaRequestEnabled {
+			a.beginMemberInput(ctx, c, "/request", "", "请输入片名，可附年份或季数。")
+		}
+	}}
+	telegramCommandRegistry["/account_security"] = telegramCommandSpec{name: "account_security", label: "/account_security", description: "账户安全", category: "user", private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) {
+		u, ok := a.store().FindUserByTelegramID(c.FromID)
+		if !ok || !u.Active {
+			return
+		}
+		status := "尚未设置安全码"
+		if u.SecurityCodeHash != "" {
+			status = "安全码已设置"
+		}
+		a.memberSendButtons(ctx, c.ChatID, "账户安全\n\n"+status+"。密码无法反查；可通过安全码验证后修改。", [][]map[string]any{{memberButton("设置 / 修改安全码", "/security"), memberButton("修改Emby密码", "/password")}})
+	}}
+
 	for _, item := range []struct {
 		name, description string
 		handler           func(*App, context.Context, telegramCommandCtx)

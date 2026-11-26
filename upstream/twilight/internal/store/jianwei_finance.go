@@ -116,6 +116,16 @@ func (s *Store) walletLocked(uid int64) retention.Wallet {
 }
 func (s *Store) walletEntryLocked(uid, actor int64, id, kind, reason string, delta int) {
 	s.state.Finance.ensure()
+	found := false
+	for _, entry := range s.state.Finance.Ledger {
+		if entry.UID == uid {
+			found = true
+			break
+		}
+	}
+	if !found && s.state.Signin[uid].Points-delta > 0 {
+		s.state.Finance.Ledger = append(s.state.Finance.Ledger, WalletEntry{ID: fmt.Sprintf("opening:%d", uid), UID: uid, Kind: "opening", Delta: s.state.Signin[uid].Points - delta, Balance: s.state.Signin[uid].Points - delta, At: time.Now().Unix(), Reason: "升级前既有余额结转"})
+	}
 	s.state.Finance.Revision++
 	s.state.Finance.Ledger = append(s.state.Finance.Ledger, WalletEntry{ID: id, UID: uid, Actor: actor, Kind: kind, Delta: delta, Balance: s.state.Signin[uid].Points, Frozen: s.state.Finance.Holds[uid], At: time.Now().Unix(), Reason: reason})
 }
@@ -165,7 +175,7 @@ func (s *Store) FinanceOverview() (int64, []WalletView, []WalletEntry, []Service
 	return s.state.Finance.Revision, wallets, ledger, incidents, recs
 }
 func (s *Store) AdjustWallet(uid, actor, revision int64, id, kind, reason string, amount int) error {
-	if len(id) < 16 || len(id) > 80 || strings.TrimSpace(reason) == "" || len(reason) > 500 || amount < 0 || amount > 10000000 {
+	if len(id) < 16 || len(id) > 80 || strings.TrimSpace(reason) == "" || len(reason) > 500 || amount <= 0 || amount > 10000000 {
 		return ErrInvalid
 	}
 	hash := financeDigest([]any{uid, kind, reason, amount})
@@ -265,7 +275,10 @@ func (s *Store) CreateIncident(v ServiceIncident, expected int64) error {
 		return nil
 	})
 }
-func (s *Store) ResolveIncident(id, action string, revision, actor int64) error {
+func (s *Store) ResolveIncident(id, action string, revision, actor int64, amounts ...int) error {
+	if len(amounts) > 0 && (len(amounts) != 2 || amounts[0] < 0 || amounts[0] > 30 || amounts[1] < 0 || amounts[1] > 10000) {
+		return ErrInvalid
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mutateAndSaveLocked(func() error {
@@ -274,11 +287,18 @@ func (s *Store) ResolveIncident(id, action string, revision, actor int64) error 
 		if !ok {
 			return ErrNotFound
 		}
+		if action == "compensate" && v.Status == "compensated" && len(amounts) == 2 && (v.Days != amounts[0] || v.Points != amounts[1]) {
+			return ErrConflict
+		}
 		if (action == "compensate" && v.Status == "compensated") || (action == "close" && v.Status == "closed") {
 			return errNoChange
 		}
 		if v.Revision != revision || v.Status != "open" || (action != "compensate" && action != "close") {
 			return ErrConflict
+		}
+		if action == "compensate" && len(amounts) == 2 {
+			v.Days = amounts[0]
+			v.Points = amounts[1]
 		}
 		now := time.Now().Unix()
 		for _, uid := range v.UIDs {
@@ -345,7 +365,10 @@ func (s *Store) recordEntitlementLocked(id, kind string, before, after User, now
 // Refund only the unconsumed duration belonging to this exact source. A newer
 // unknown administrative edit is a conflict, never an excuse to subtract days.
 func (s *Store) refundSourceLocked(o *ShopOrder, now int64) error {
-	id := "code:" + o.CodeKey
+	id := o.EntitlementSourceID
+	if id == "" {
+		id = "code:" + o.CodeKey
+	}
 	source, ok := s.state.Finance.Sources[id]
 	u, exists := s.state.Users[o.UID]
 	if !ok || !exists || source.UID != o.UID || source.RevokedAt > 0 || u.ExpiredAt < 0 {
@@ -354,6 +377,10 @@ func (s *Store) refundSourceLocked(o *ShopOrder, now int64) error {
 	if u.EmbyID == "" && u.PendingEmby && u.RegistrationCode == o.CodeKey {
 		u.PendingEmby = false
 		u.PendingEmbyDays = nil
+		u.ExpiredAt = source.Before
+		u.EmbyGrantLocked = false
+		u.RegistrationSource = ""
+		u.RegistrationCode = ""
 		if source.RoleBefore != RoleWhitelist && u.Role == RoleWhitelist {
 			u.Role = source.RoleBefore
 			u.WhitelistUntil = 0
@@ -417,7 +444,7 @@ func (s *Store) CreatePointsOrder(uid int64, id, sku, requestKey, codeKey, ciphe
 			}
 		}
 		u, ok := s.state.Users[uid]
-		if !ok || !u.Active || u.EmbyID == "" || u.EmbyDisabled && !u.EmbyAutoDisabled {
+		if !ok || !u.Active || u.EmbyID == "" || u.ExpiredAt < 0 || u.Role == RoleAdmin || u.EmbyDisabled && !u.EmbyAutoDisabled {
 			return ErrEmbyRequired
 		}
 		if len(requestKey) < 16 || len(requestKey) > 80 || len(id) < 16 || len(codeKey) != 64 || cipher == "" {
@@ -526,7 +553,7 @@ func (s *Store) ConfirmReconciliation(v Reconciliation, expected int64) error {
 func ValidateFinanceBackup(state *State) error {
 	f := &state.Finance
 	f.ensure()
-	if len(f.Ledger) > 1000000 || len(f.Incidents) > 10000 || len(f.Sources) > 1000000 || len(f.Operations) > 1000000 {
+	if len(f.Ledger) > 1000000 || len(f.Incidents) > 10000 || len(f.Sources) > 1000000 || len(f.Operations) > 1000000 || len(f.Reconciliations) > 100000 || f.Revision < 0 {
 		return fmt.Errorf("finance backup exceeds resource budget")
 	}
 	for uid, frozen := range f.Holds {
@@ -546,13 +573,34 @@ func ValidateFinanceBackup(state *State) error {
 			return fmt.Errorf("invalid entitlement lineage")
 		}
 	}
+	for id, v := range f.Incidents {
+		if id != v.ID || len(id) < 16 || len(id) > 80 || v.Revision < 1 || len(v.UIDs) == 0 || len(v.UIDs) > 500 || v.Start <= 0 || v.End < v.Start || v.HoldUntil < v.Start || v.Days < 0 || v.Days > 30 || v.Points < 0 || v.Points > 10000 || len(v.Title) > 120 || len(v.Reason) > 1000 || (v.Status != "open" && v.Status != "compensated" && v.Status != "closed") {
+			return fmt.Errorf("invalid service incident")
+		}
+		seenUID := map[int64]bool{}
+		for _, uid := range v.UIDs {
+			if uid <= 0 || seenUID[uid] {
+				return fmt.Errorf("invalid incident target")
+			}
+			seenUID[uid] = true
+		}
+	}
+	for id, v := range f.Reconciliations {
+		if id != v.ID || len(id) < 16 || len(id) > 80 || len(v.Channel) > 80 || len(v.Note) > 1000 || len(v.OrderIDs) > 100000 || v.At <= 0 || v.ActualReceived < 0 || v.ActualRefund < 0 || v.ExpectedReceived < 0 || v.ExpectedRefund < 0 || v.Difference != (v.ActualReceived-v.ActualRefund)-(v.ExpectedReceived-v.ExpectedRefund) {
+			return fmt.Errorf("invalid reconciliation")
+		}
+		if _, err := time.Parse("2006-01-02", v.Date); err != nil {
+			return fmt.Errorf("invalid reconciliation date")
+		}
+	}
+
 	return nil
 }
 
 func (s *Store) expireTemporaryRolesLocked() {
 	now := time.Now().Unix()
 	for uid, u := range s.state.Users {
-		if u.Role == RoleWhitelist && u.WhitelistUntil > 0 && u.WhitelistUntil <= now {
+		if u.Role == RoleWhitelist && u.WhitelistUntil > 0 && u.WhitelistUntil <= now && !u.PendingEmby {
 			u.Role = RoleNormal
 			u.WhitelistUntil = 0
 			s.state.Users[uid] = u

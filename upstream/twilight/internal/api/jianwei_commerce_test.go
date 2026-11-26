@@ -16,8 +16,8 @@ import (
 func TestJianweiShopCookieIsolationOwnershipAndCipher(t *testing.T) {
 	a := newTestApp(t)
 	initial, err := json.Marshal(a.store().ShopConfiguration())
-	if err != nil || !strings.Contains(string(initial), `"products":[]`) {
-		t.Fatal("empty catalogue must be an array for the first-run editor", string(initial), err)
+	if err != nil || !strings.Contains(string(initial), `"products":[`) || strings.Contains(string(initial), `"products":null`) {
+		t.Fatal("first-run templates must remain a bounded array", string(initial), err)
 	}
 	a.cfg().TelegramMode = true
 	a.cfg().TelegramBotToken = "shop-test-bot"

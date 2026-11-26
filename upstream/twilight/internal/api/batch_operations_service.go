@@ -161,6 +161,10 @@ func (a *App) batchDeleteUsers(ctx context.Context, req batchOperationRequest, c
 			continue
 		}
 
+		if a.store().FinancialLiability(uid) {
+			result.Failed = append(result.Failed, batchFailure{UID: uid, Code: ErrBadRequest, Message: "请先处理冻结余额、已付款未交付订单或退款待办"})
+			continue
+		}
 		if req.DeleteEmby && target.EmbyID != "" {
 			if !a.embyConfigured() {
 				result.Failed = append(result.Failed, batchFailure{
