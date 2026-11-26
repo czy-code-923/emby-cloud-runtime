@@ -5,7 +5,7 @@ COPY upstream/twilight/webui/package.json upstream/twilight/webui/pnpm-lock.yaml
 RUN pnpm install --frozen-lockfile
 COPY upstream/twilight/webui/ ./
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN node --test scripts/test-locale-consistency.cjs scripts/test-invite-api.cjs && pnpm typecheck && pnpm build
+RUN node --test scripts/test-locale-consistency.cjs scripts/test-invite-api.cjs scripts/test-money.cjs && pnpm typecheck && pnpm build
 FROM node:22-bookworm-slim
 WORKDIR /app
 COPY --from=build --chown=node:node /src/.next/standalone ./

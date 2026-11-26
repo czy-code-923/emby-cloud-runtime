@@ -131,7 +131,7 @@ func (a *App) handleShopLogout(w http.ResponseWriter, r *http.Request, _ Params)
 	ok(w, "已退出商店", nil)
 }
 func (a *App) shopOrderView(o store.ShopOrder, admin bool) map[string]any {
-	out := map[string]any{"id": o.ID, "revision": o.Revision, "points_cost": o.PointsCost, "product": o.Product, "channel": o.Channel, "receiving_account": o.ReceivingAccount, "instructions": o.Instructions, "status": o.Status, "created_at": o.CreatedAt, "updated_at": o.UpdatedAt, "pay_before": o.PayBefore, "note": o.Note, "admin_note": o.AdminNote}
+	out := map[string]any{"id": o.ID, "revision": o.Revision, "points_cost": o.PointsCost, "product": o.Product, "payment_kind": o.PaymentKind, "payment_qr": o.PaymentQR, "channel": o.Channel, "receiving_account": o.ReceivingAccount, "instructions": o.Instructions, "status": o.Status, "created_at": o.CreatedAt, "updated_at": o.UpdatedAt, "pay_before": o.PayBefore, "note": o.Note, "admin_note": o.AdminNote}
 	if o.CodeKey != "" {
 		if rc, ok := a.store().RegCode(o.CodeKey); ok {
 			out["redeemed"] = rc.UseCount > 0 || o.RedeemedAt > 0

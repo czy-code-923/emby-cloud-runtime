@@ -4019,5 +4019,24 @@
     "noOrders": "暂无订单",
     "unavailable": "暂不可用",
     "copyHelp": "当前客户端未能复制，请长按上方登录码复制。"
+  },
+  "v6": {
+    "moneyInvalid": "Enter 0–100000 CNY with up to two decimal places; listed products must have a positive price.",
+    "priceYuan": "Price (CNY)",
+    "receivedYuan": "Amount received (CNY)",
+    "stockHelp": "Enter prices in CNY, e.g. 19.99; accounting uses integer cents. Stock includes sold and reserved units; -1 is unlimited. Existing orders retain their original details.",
+    "imageInvalid": "Choose a PNG or JPEG image up to 2 MB.",
+    "imageHelp": "Choose an image to preview. Enter your administrator password and save to upload the image with the payment and product settings.",
+    "qrPreview": "Payment QR preview",
+    "pendingUpload": "Waiting to upload",
+    "savingImages": "Uploading and saving…",
+    "uploadAndSave": "Upload images and save settings",
+    "shopPriceInvalid": "Check prices: use CNY with up to two decimal places. Listed products cannot have a zero price.",
+    "shopNoProduct": "List at least one priced product before opening the shop.",
+    "shopDefaultRequired": "Enable a payment channel and select it as the default.",
+    "shopReceiverRequired": "Complete the recipient and payment instructions for the default payment channel.",
+    "shopQRRequired": "Choose a payment QR image or enter its HTTPS URL for the default static QR channel.",
+    "paymentSnapshot": "Payment details for this order",
+    "paymentKind": "Payment method"
   }
 }

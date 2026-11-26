@@ -4019,5 +4019,24 @@
     "noOrders": "暂无订单",
     "unavailable": "暂不可用",
     "copyHelp": "当前客户端未能复制，请长按上方登录码复制。"
+  },
+  "v6": {
+    "moneyInvalid": "请输入0至100000元，最多两位小数；上架商品须大于0元。",
+    "priceYuan": "售价（元）",
+    "receivedYuan": "实收金额（元）",
+    "stockHelp": "价格按元填写，例如19.99；系统按分准确记账。库存为含已售和预留的总份数，-1表示不限。历史订单保留原商品与收款信息。",
+    "imageInvalid": "请选择2MB以内的PNG或JPEG图片。",
+    "imageHelp": "先选择图片预览，填写管理员密码后点击保存；收款码、渠道和商品一起保存。",
+    "qrPreview": "收款码预览",
+    "pendingUpload": "待保存上传",
+    "savingImages": "正在上传与保存…",
+    "uploadAndSave": "上传图片并保存设置",
+    "shopPriceInvalid": "请检查商品价格：按元输入，最多两位小数；上架商品不能是0元。",
+    "shopNoProduct": "请至少上架一项已填写价格的商品，再开放下单。",
+    "shopDefaultRequired": "请启用一个收款渠道，并将它选为默认收款渠道。",
+    "shopReceiverRequired": "默认收款渠道还缺收款人标识或付款说明，请先补全。",
+    "shopQRRequired": "默认静态码渠道还没有收款码，请选择图片或填写HTTPS图片地址。",
+    "paymentSnapshot": "本订单收款信息",
+    "paymentKind": "支付方式"
   }
 }
