@@ -58,7 +58,11 @@ func TestJianweiPhotoCallbacksStayOnOriginatingCaption(t *testing.T) {
 		t.Fatal("photo callback sent another message", method)
 	}
 	raw, _ := json.Marshal(body)
-	if !strings.Contains(string(raw), `"caption":"账号与线路"`) || !strings.Contains(string(raw), `"message_id":91`) {
+	var edited map[string]any
+	if err := json.Unmarshal(raw, &edited); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(asString(edited["caption"]), "账号与线路\n") || intValue(edited, "message_id", 0) != 91 {
 		t.Fatal("caption target mismatch")
 	}
 }
