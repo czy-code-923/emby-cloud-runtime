@@ -33,6 +33,7 @@ function isAbortError(error: unknown): boolean {
 }
 
 function BGMConfigCard() {
+ const {t}=useI18n();
   const features = useSystemStore((s) => s.info?.features);
   const fetchInfo = useSystemStore((s) => s.fetchInfo);
 
@@ -52,7 +53,7 @@ function BGMConfigCard() {
       <CardHeader className="pb-3">
         <CardTitle className="text-base flex items-center gap-2">
           <Settings2 className="h-4 w-4" />
-          Bangumi 功能配置
+          {t("v6.metadataBangumi")}
         </CardTitle>
       </CardHeader>
       <CardContent>
@@ -74,7 +75,7 @@ function BGMConfigCard() {
                   ? "管理关闭：仅自动同步可用，用户无法管理收藏。"
                   : "两个功能均已开启。"}
           </span>
-          <Link href="/admin/config" className="ml-auto text-xs text-primary hover:underline shrink-0">
+          <Link href="/admin/metadata" className="ml-auto text-xs text-primary hover:underline shrink-0">
             前往配置管理 →
           </Link>
         </div>

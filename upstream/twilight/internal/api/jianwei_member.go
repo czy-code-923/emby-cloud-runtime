@@ -142,7 +142,7 @@ func (a *App) handleMemberCreateRequest(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	clean := map[string]any{"title": title, "note": truncateString(stringValue(payload, "note"), 1000)}
-	for _, key := range []string{"source", "media_id", "media_type", "season", "year", "media_info", "original_title"} {
+	for _, key := range []string{"source", "media_id", "media_type", "season", "year", "poster", "poster_url", "overview", "original_title"} {
 		if value, ok := payload[key]; ok {
 			clean[key] = value
 		}

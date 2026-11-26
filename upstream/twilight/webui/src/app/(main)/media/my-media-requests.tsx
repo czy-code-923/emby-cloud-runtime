@@ -1,5 +1,6 @@
 "use client";
 
+import {RequestProgress} from "@/app/miniapp/requests";
 import { Copy, ExternalLink, Fingerprint, ListTodo, Loader2, RefreshCw, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button, IconButton } from "@/components/ui/button";
@@ -23,10 +24,11 @@ interface MyMediaRequestsProps {
 
 function StatusBadge({ status }: { status: string }) {
   const { t } = useI18n();
-  switch (status) {
+  switch (status.toUpperCase()) {
     case "UNHANDLED": return <Badge variant="secondary">{t("media.statusUnhandled")}</Badge>;
     case "ACCEPTED": return <Badge variant="info">{t("media.statusAccepted")}</Badge>;
     case "DOWNLOADING": return <Badge variant="warning">{t("media.statusDownloading")}</Badge>;
+    case "FAILED":return <Badge variant="destructive">{t("mini.status.failed")}</Badge>;
     case "REJECTED": return <Badge variant="destructive">{t("media.statusRejected")}</Badge>;
     case "COMPLETED": return <Badge variant="success">{t("media.statusCompleted")}</Badge>;
     default: return <Badge variant="secondary">{status}</Badge>;
@@ -38,7 +40,7 @@ export function MyMediaRequests(props: MyMediaRequestsProps) {
   return (
     <section className="space-y-4">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
-        <div><h2 className="text-xl font-semibold">{t("media.requestsTitle")}</h2><p className="text-sm text-muted-foreground">{t("media.requestsDescription")}</p></div>
+        <div><h2 className="text-xl font-medium">{t("media.requestsTitle")}</h2><p className="text-sm text-muted-foreground">{t("media.requestsDescription")}</p></div>
         <Button variant="outline" size="sm" onClick={props.onRefresh} disabled={props.loading}><RefreshCw className={props.loading ? "mr-2 h-4 w-4 animate-spin" : "mr-2 h-4 w-4"} />{t("common.refresh")}</Button>
       </header>
 
@@ -59,13 +61,14 @@ export function MyMediaRequests(props: MyMediaRequestsProps) {
                 <div className="min-w-0 flex-1">
                   <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
                     <div className="min-w-0">
-                      {url ? <a href={url} target="_blank" rel="noopener noreferrer" className="inline-flex min-w-0 items-center gap-1 font-semibold hover:text-primary"><span className="break-words">{title}</span><ExternalLink className="h-3.5 w-3.5 shrink-0" /></a> : <h3 className="break-words font-semibold">{title}</h3>}
-                      <p className="mt-1 text-xs text-muted-foreground">{request.source.toUpperCase()}#{String(request.media_id)} · {formatRelativeTime(request.timestamp * 1000)}</p>
+                      {url ? <a href={url} target="_blank" rel="noopener noreferrer" className="inline-flex min-w-0 items-center gap-1 font-medium hover:text-primary"><span className="break-words">{title}</span><ExternalLink className="h-3.5 w-3.5 shrink-0" /></a> : <h3 className="break-words font-medium">{title}</h3>}
+                      <p className="mt-1 text-xs text-muted-foreground">{Number(request.media_id)<1e12?`${request.source.toUpperCase()}#${String(request.media_id)}`:""} · {formatRelativeTime(request.timestamp * 1000)}</p>
                     </div>
                     <StatusBadge status={request.status} />
                   </div>
                   {request.season && <p className="mt-2 text-xs text-muted-foreground">{t("media.season", { season: request.season })}</p>}
-                  {request.admin_note && <p className="mt-2 break-words border-l-2 border-info/40 pl-3 text-sm text-muted-foreground">{t("media.adminReply", { note: request.admin_note })}</p>}
+                  {request.tracking?.stage&&<RequestProgress request={request}/>}
+                  {!request.tracking?.stage&&request.admin_note && <p className="mt-2 break-words border-l-2 border-info/40 pl-3 text-sm text-muted-foreground">{t("media.adminReply", { note: request.admin_note })}</p>}
                   <div className="mt-3 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
                     <Fingerprint className="h-3.5 w-3.5 shrink-0" /><code className="min-w-0 truncate">{request.require_key}</code>
                     <IconButton variant="ghost" className="h-8 w-8 shrink-0" aria-label={t("media.copyKey")} onClick={() => props.onCopy(request.require_key)}><Copy className="h-3.5 w-3.5" /></IconButton>

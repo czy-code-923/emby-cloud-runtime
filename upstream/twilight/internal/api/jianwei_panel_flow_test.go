@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/prejudice-studio/twilight/internal/config"
 	"github.com/prejudice-studio/twilight/internal/retention"
@@ -41,6 +42,10 @@ func TestJianweiNativeMenuHonorsIndependentFeatureSwitches(t *testing.T) {
 	a.telegramMemberPanel(context.Background(), u.TelegramID, u)
 	if len(messages) != 1 {
 		t.Fatal("panel did not reach Bot transport")
+	}
+	text := asString(messages[0]["text"]) + asString(messages[0]["caption"])
+	if strings.Contains(text, "4321") || strings.Contains(text, "panel-fixture") {
+		t.Fatal("home leaked account information before query")
 	}
 	panel, _ := json.Marshal(messages[0]["reply_markup"])
 	if !strings.Contains(string(panel), "jw:/retention") || strings.Contains(string(panel), "jw:/renew") || strings.Contains(string(panel), "jw:/invite") || strings.Contains(string(panel), "jw:/request") {
@@ -85,5 +90,25 @@ func TestJianweiSigninRetryKeepsOriginalDailyReceipt(t *testing.T) {
 	}
 	if retry["total_today"] != 0 {
 		t.Fatal("retry appears to have granted a second award")
+	}
+}
+
+func TestJianweiCaptionBoundsAndCompactProtectedRetention(t *testing.T) {
+	for _, rows := range []int{1, 3, 6, 10} {
+		caption := memberPanelCaption("<b>见微</b>\n"+strings.Repeat("🍒测试", 800), rows, true)
+		if len(utf16.Encode([]rune(caption))) > 1024 || strings.Contains(caption, "<b>") {
+			t.Fatal("invalid Telegram caption", rows)
+		}
+	}
+	primary := memberPanelCaption("见微\n欢迎回来", 6, false)
+	secondary := memberPanelCaption("见微\n账户设置", 2, false)
+	if strings.Count(primary, "\n") >= strings.Count(secondary, "\n") {
+		t.Fatal("secondary layout lacks information space")
+	}
+	v := store.RetentionView{}
+	v.Member.Member.Permanent = true
+	text := retentionNativeText(v)
+	if !strings.Contains(text, "无需保号") || strings.Contains(text, "窗口起止") {
+		t.Fatal("protected account has irrelevant retention controls", text)
 	}
 }

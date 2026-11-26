@@ -37,7 +37,7 @@ func (a *App) handleMemberRank(w http.ResponseWriter, r *http.Request, _ Params)
 	items := []map[string]any{}
 	if media, ok := data["media"].([]map[string]any); ok {
 		for _, m := range media {
-			items = append(items, map[string]any{"title": m["title"], "plays": m["plays"], "duration": m["duration"], "viewers": m["viewers"]})
+			items = append(items, map[string]any{"poster_url": memberMediaImageURL(asString(m["item_id"])), "title": m["title"], "plays": m["plays"], "duration": m["duration"], "viewers": m["viewers"]})
 		}
 	}
 	ok(w, "OK", map[string]any{"items": items, "range": "week", "updated_at": data["updated_at"]})
@@ -92,7 +92,7 @@ func (a *App) handleMemberLibrary(w http.ResponseWriter, r *http.Request, _ Para
 		if i >= size {
 			break
 		}
-		items = append(items, map[string]any{"id": item.ID, "title": item.Name, "type": item.Type, "year": item.ProductionYear, "favorite": item.UserData.IsFavorite})
+		items = append(items, map[string]any{"poster_url": memberMediaImageURL(item.ID), "id": item.ID, "title": item.Name, "type": item.Type, "year": item.ProductionYear, "favorite": item.UserData.IsFavorite})
 	}
 	ok(w, "OK", map[string]any{"items": items, "page": page, "total": result.TotalRecordCount, "has_next": page*size < result.TotalRecordCount})
 }
@@ -274,4 +274,31 @@ func init() {
 		name := "/" + item.name
 		telegramCommandRegistry[name] = telegramCommandSpec{name: item.name, label: name, description: item.description, usage: name, category: "user", order: 52 + i, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramDiscovery(ctx, c) }}
 	}
+}
+
+func memberMediaImageURL(id string) string {
+	if !validEmbyItemID(id) {
+		return ""
+	}
+	return "/api/v2/miniapp/media/" + url.PathEscape(id) + "/image"
+}
+func (a *App) handleMemberMediaImage(w http.ResponseWriter, r *http.Request, p Params) {
+	u := current(r).User
+	id := strings.TrimSpace(p["item_id"])
+	if u.EmbyID == "" || !validEmbyItemID(id) {
+		fail(w, 404, "媒体图片不存在")
+		return
+	}
+	if !a.allowRate(r.Context(), rateKey("member-images:", u.UID), 90, time.Minute) {
+		fail(w, 429, "图片请求过于频繁")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	var item memberLibraryItem
+	if err := a.embyGet(ctx, "/Users/"+url.PathEscape(u.EmbyID)+"/Items/"+url.PathEscape(id), &item); err != nil || item.ID != id {
+		fail(w, 404, "未找到可访问的媒体图片")
+		return
+	}
+	a.handleEmbyItemImage(w, r.WithContext(ctx), p)
 }

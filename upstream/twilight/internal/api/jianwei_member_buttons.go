@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/prejudice-studio/twilight/internal/store"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -164,10 +165,23 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 		if sku != "month" && sku != "quarter" && sku != "year" {
 			return
 		}
+		cost := map[string]int{"month": p.MonthPoints, "quarter": p.QuarterPoints, "year": p.YearPoints}[sku]
+		if !p.Enabled {
+			a.memberSendButtons(ctx, c.ChatID, "积分商店尚未开启，没有扣除积分。", nil)
+			return
+		}
+		if w.Available < cost {
+			a.memberSendButtons(ctx, c.ChatID, fmt.Sprintf("可用积分%d，本卡需要%d积分，还差%d积分；没有扣分。", w.Available, cost, cost-w.Available), [][]map[string]any{{memberButton("每日签到", "/signin"), memberButton("返回积分商店", "/points")}})
+			return
+		}
 		nonce := fmt.Sprintf("%016x", time.Now().UnixNano())
+		if u.EmbyID == "" || u.ExpiredAt < 0 || u.Role == store.RoleAdmin {
+			a.memberSendButtons(ctx, c.ChatID, "当前账户尚未开通或已长期有效，无需兑换普通续期卡；没有扣除积分。", [][]map[string]any{{memberButton("返回积分商店", "/points")}})
+			return
+		}
 		text += "\n\n确认兑换？本次将扣除对应可用积分。"
 		rows = append(rows, []map[string]any{memberButton("确认扣分并发码", "/points confirm "+sku+":"+nonce+":"+fmt.Sprint(map[string]int{"month": p.MonthPoints, "quarter": p.QuarterPoints, "year": p.YearPoints}[sku])), memberButton("取消", "/points")})
-	} else if u.EmbyID != "" && u.ExpiredAt >= 0 && u.Role != store.RoleAdmin {
+	} else {
 		rows = append(rows, []map[string]any{memberButton("兑换月卡", "/points month"), memberButton("兑换季卡", "/points quarter"), memberButton("兑换年卡", "/points year")})
 	}
 	a.memberSendButtons(ctx, c.ChatID, text, rows)
@@ -207,14 +221,34 @@ func (a *App) telegramDeviceButtons(ctx context.Context, c telegramCommandCtx) {
 	if available, _ := d["sessions_available"].(bool); !available {
 		playing = "暂不可用"
 	}
-	message = fmt.Sprintf("我的设备\n\n登录登记：%v / %v 台\n正在播放：%v / %v 路\n0 表示不限；设备在通过播放网关访问后登记。", len(items), d["max_devices"], playing, d["max_streams"])
-	for i, raw := range items {
-		if i >= 20 {
-			break
-		}
-		item, _ := raw.(map[string]any)
-		rows = append(rows, []map[string]any{memberButton("停用 · "+truncateString(asString(item["name"]), 15)+" · "+truncateString(asString(item["id"]), 6), "/device_stop "+memberDeviceKey(asString(item["id"])))})
+	message = fmt.Sprintf("见微 · 我的设备\n\n登录登记：%v / %v 台\n正在播放：%v / %v 路\n\n0表示不限。每条记录包含设备与软件。\n选择下方设备可验证安全码后停用。", len(items), d["max_devices"], playing, d["max_streams"])
+	page := 1
+	if len(c.Args) == 1 && strings.HasPrefix(c.Args[0], "page:") {
+		value, _ := strconv.Atoi(strings.TrimPrefix(c.Args[0], "page:"))
+		page = clamp(value, 1, 250)
 	}
+	start := (page - 1) * 4
+	if start >= len(items) {
+		page = 1
+		start = 0
+	}
+	for i := start; i < len(items) && i < start+4; i++ {
+		item, _ := items[i].(map[string]any)
+		client := firstNonEmpty(asString(item["client"]), "软件待同步")
+		message += fmt.Sprintf("\n%d. %s · %s %s", i+1, truncateString(asString(item["name"]), 18), client, asString(item["client_version"]))
+		rows = append(rows, []map[string]any{memberButton(fmt.Sprintf("%d · 停用 %s", i+1, truncateString(client, 15)), "/device_stop "+memberDeviceKey(asString(item["id"])))})
+	}
+	paging := []map[string]any{}
+	if page > 1 {
+		paging = append(paging, memberButton("‹ 上一页", fmt.Sprintf("/devices page:%d", page-1)))
+	}
+	if start+4 < len(items) {
+		paging = append(paging, memberButton("下一页 ›", fmt.Sprintf("/devices page:%d", page+1)))
+	}
+	if len(paging) > 0 {
+		rows = append(rows, paging)
+	}
+
 	a.memberSendButtons(ctx, c.ChatID, message, rows)
 }
 func init() {
@@ -262,22 +296,22 @@ func (a *App) sendMemberHero(ctx context.Context, chatID int64, text string, row
 		photo = publicHTTPSURL(cfg.TelegramBannerImageURL)
 	}
 	if photo == "" && publicHTTPSURL(cfg.PublicBaseURL) != "" {
-		photo = strings.TrimRight(cfg.PublicBaseURL, "/") + "/brand/jianwei-panel.png"
+		photo = strings.TrimRight(cfg.PublicBaseURL, "/") + "/brand/jianwei-panel-v2.png"
 	}
 	markup := map[string]any{"inline_keyboard": rows}
 	if cfg.TelegramPanelImageEnabled && photo != "" {
 		target, editing := ctx.Value(memberPanelContextKey{}).(memberPanelTarget)
 		method := "sendPhoto"
-		body := map[string]any{"chat_id": chatID, "photo": photo, "caption": truncateString(text, 1020), "parse_mode": "HTML", "reply_markup": markup}
+		body := map[string]any{"chat_id": chatID, "photo": photo, "caption": memberPanelCaption(text, len(rows), false), "reply_markup": markup}
 		if editing {
 			method = "editMessageMedia"
-			body = map[string]any{"chat_id": chatID, "message_id": target.MessageID, "media": map[string]any{"type": "photo", "media": photo, "caption": truncateString(text, 1020), "parse_mode": "HTML"}, "reply_markup": markup}
+			body = map[string]any{"chat_id": chatID, "message_id": target.MessageID, "media": map[string]any{"type": "photo", "media": photo, "caption": memberPanelCaption(text, len(rows), false)}, "reply_markup": markup}
 		}
 		if _, e := telegramPostResult[telegramDiscardResult](a, ctx, method, body, 20*time.Second); e == nil {
 			return
 		}
 	}
-	_, _ = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: chatID, Text: text, ParseMode: "HTML", DisableWebPagePreview: true, ReplyMarkup: markup}, 20*time.Second)
+	_, _ = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: chatID, Text: memberPanelCaption(text, len(rows), false), DisableWebPagePreview: true, ReplyMarkup: markup}, 20*time.Second)
 }
 
 func memberDeviceKey(id string) string {

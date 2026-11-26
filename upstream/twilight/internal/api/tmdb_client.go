@@ -47,6 +47,7 @@ func (a *App) searchTMDB(ctx context.Context, query, mediaType string, limit int
 	// 缓存键必须同时区分「搜索端点类型」与「归一化后的结果类型」：同一 query
 	// 走 /search/multi 与 /search/tv 会返回不同集合，混用会串味。
 	cacheKey := strings.Join([]string{
+		a.tmdbCacheScope(),
 		strconv.Itoa(limit),
 		tmdbSearchMediaType(mediaType),
 		normalizeTMDBMediaType(mediaType),
@@ -72,7 +73,7 @@ func (a *App) searchTMDB(ctx context.Context, query, mediaType string, limit int
 	mediaType = normalizeTMDBMediaType(mediaType)
 	q := url.Values{"api_key": {a.cfg().TMDBAPIKey}, "language": {"zh-CN"}, "query": {query}}
 	var payload map[string]any
-	if err := getJSON(ctx, endpoint+"?"+q.Encode(), nil, &payload); err != nil {
+	if err := a.tmdbJSON(ctx, strings.TrimPrefix(endpoint, base), q, &payload); err != nil {
 		return nil, err
 	}
 	rows, _ := payload["results"].([]any)
@@ -107,7 +108,7 @@ func (a *App) getTMDB(ctx context.Context, id, mediaType string) (map[string]any
 	if a.cfg().TMDBAPIKey == "" {
 		return nil, fmt.Errorf("TMDB API Key 未配置")
 	}
-	cacheKey := mediaType + "/" + id
+	cacheKey := a.tmdbCacheScope() + "/" + mediaType + "/" + id
 	if cached, ok := tmdbDetailsCache.get(cacheKey); ok {
 		if media, ok := cached.(map[string]any); ok {
 			return media, nil
@@ -125,7 +126,7 @@ func (a *App) getTMDB(ctx context.Context, id, mediaType string) (map[string]any
 		"include_image_language": {"zh,ja,en"},
 	}
 	var payload map[string]any
-	if err := getJSON(ctx, endpoint+"?"+q.Encode(), nil, &payload); err != nil {
+	if err := a.tmdbJSON(ctx, strings.TrimPrefix(endpoint, base), q, &payload); err != nil {
 		return nil, err
 	}
 	media := tmdbToMedia(payload, mediaType, a.cfg().TMDBImageURL)

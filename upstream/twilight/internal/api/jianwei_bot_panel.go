@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"html"
 	"net/http"
 	"net/url"
 	"strings"
@@ -38,94 +37,42 @@ func init() {
 }
 
 func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.User) {
-	user = effectiveMember(user)
 	cfg := a.cfg()
-	escape := html.EscapeString
-	text := ""
-	if cfg.TelegramBannerEnabled && strings.TrimSpace(cfg.TelegramBannerText) != "" {
-		text = "<b>推广 · 推荐内容</b>\n" + escape(truncateString(cfg.TelegramBannerText, 500)) + "\n\n"
-	}
-	text += "<b>见微 Emby · 微光影院</b>\n小见世界，细看生活。\n\n"
-	displayName := firstNonEmpty(user.EmbyUsername, user.TelegramUsername, user.Username)
-	text += "▎欢迎进入用户面板，" + escape(displayName) + "\n\n"
+	text := "见微 Emby · 微光影院\n小见世界，细看生活。\n\n欢迎进入用户面板。\n签到、续期与设备，一处处理。\n点击「我的账户」查询个人信息。\n\n请选择下方功能。"
 	if user.EmbyID == "" {
 		if user.PendingEmby {
-			text += "开通资格已就绪，点击「开通 Emby」设置用户名。\n\n"
+			text = "见微 Emby · 微光影院\n\n开通资格已经就绪。\n点击「开通Emby」设置账号，\n创建后请保存仅显示一次的密码。\n\n请选择下方功能。"
 		} else {
-			text += "已建立 Telegram 身份，尚未开通 Emby。请先兑换注册码，再开通媒体账户。\n\n"
-		}
-	} else {
-		text += "欢迎回来，你的 Telegram 与 Emby 已关联。\n\n"
-	}
-	status := "等待开通"
-	if user.EmbyID != "" {
-		status = "已开通"
-		if user.EmbyDisabled || !a.embyShouldEnableUser(user) {
-			status = "播放已停用"
+			text = "见微 Emby · 微光影院\n\n欢迎加入见微。\n你尚未开通Emby，\n请先使用注册码，再开通媒体账号。\n\n请选择下方功能。"
 		}
 	}
-	role := "用户"
-	if user.Role == store.RoleAdmin {
-		role = "管理员"
-	} else if user.Role == store.RoleWhitelist {
-		role = "白名单"
+	if cfg.TelegramBannerEnabled && strings.TrimSpace(cfg.TelegramBannerText) != "" {
+		text = "推广 · 推荐内容\n" + truncateString(cfg.TelegramBannerText, 160) + "\n\n" + text
 	}
-	text += fmt.Sprintf("· 🆔 Telegram ID  |  <code>%d</code>\n· 📊 当前状态  |  %s\n· 👥 账户类别  |  %s\n· ✦ 可用积分  |  %d\n· 👤 Emby 账号  |  %s\n", user.TelegramID, status, role, a.store().Wallet(user.UID).Available, escape(firstNonEmpty(user.EmbyUsername, "尚未开通")))
-	mode := "尚未参与"
-	if user.Role != store.RoleNormal {
-		mode = "受保护账户 · 免活动保号"
-	} else if v, err := a.store().RetentionView(user.UID, time.Now().Unix()); err == nil {
-		if !v.Policy.Enabled {
-			mode = "活动保号尚未开启"
-		} else if v.Member.Member.Participation {
-			if v.Member.Member.Mode == "A" {
-				mode = fmt.Sprintf("签到积分 · 每窗扣%d积分续30天", v.Policy.Cost)
-			} else {
-				mode = fmt.Sprintf("观影 · %d / 30 分钟", v.Seconds/60)
-			}
-		} else if v.Member.Member.ExemptEnd > time.Now().Unix() {
-			mode = "免保号有效期内"
-		}
-	}
-	text += "· 🛡 保号方式  |  " + mode + "\n"
-	expiry := "尚未开通"
-	if user.EmbyID != "" {
-		expiry = "长期有效"
-		if t := publicExpiryUnix(user.ExpiredAt); t > 0 {
-			expiry = time.Unix(t, 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04:05")
-		}
-	}
-	text += "· 🗓 有效期至  |  " + expiry + "\n\n选择下方功能；输入 / 可查看快捷命令。"
-	button := func(text, command string) map[string]any {
-		return map[string]any{"text": text, "callback_data": "jw:" + command}
-	}
-	rows := [][]map[string]any{{button("👤 我的账户", "/me"), button("🎞 在线状态", "/service")}}
+	rows := [][]map[string]any{{memberButton("👤 我的账户", "/account"), memberButton("🎞 服务状态", "/service")}}
+	entry := memberButton("🧭 账号线路", "/lines")
 	if user.EmbyID == "" {
-		rows = append(rows, []map[string]any{button("✨ 开通 Emby", "/register"), button("🎟 使用卡码", "/redeem")})
-	} else {
-		rows = append(rows, []map[string]any{button("🧭 账号与线路", "/lines"), button("📱 设备管理", "/devices")})
+		entry = memberButton("✨ 开通Emby", "/register")
 	}
-	rows = append(rows, []map[string]any{button("✦ 签到与保号", "/retention"), button("🛍 积分商店", "/points")}, []map[string]any{button("🎟 使用卡码", "/redeem"), button("🔐 账户安全", "/account_security")})
-	if cfg.MediaRequestEnabled {
-		rows = append(rows, []map[string]any{button("🎬 求片与进度", "/request")})
-	}
-	if cfg.InviteEnabled {
-		rows = append(rows, []map[string]any{button("🤝 邀请中心", "/invite")})
-	}
+	rows = append(rows, []map[string]any{entry, memberButton("📱 设备管理", "/devices")}, []map[string]any{memberButton("✦ 签到保号", "/retention"), memberButton("🛍 积分商店", "/points")}, []map[string]any{memberButton("🎟 使用卡码", "/redeem"), memberButton("🔐 账户安全", "/account_security")})
+	links := []map[string]any{}
 	if target := a.jianweiMiniURL(); target != "" {
-		rows = append(rows, []map[string]any{{"text": "见微 Mini App · 公告 / 收藏 / 媒体 / 排行 ↗", "web_app": map[string]string{"url": target}}})
+		links = append(links, map[string]any{"text": "见微 Mini App ↗", "web_app": map[string]string{"url": target}})
 	}
 	if cfg.TelegramShopEnabled {
 		if target := publicHTTPSURL(cfg.CommerceStoreURL); target != "" {
-			rows = append(rows, []map[string]any{{"text": "🛍 独立发卡商店", "url": target}, button("商店登录码", "/shopcode")})
+			links = append(links, map[string]any{"text": "发卡商店 ↗", "url": target})
 		}
+	}
+	if len(links) > 0 {
+		rows = append(rows, links)
 	}
 	if cfg.TelegramBannerEnabled {
 		if target := publicHTTPSURL(cfg.TelegramBannerURL); target != "" {
 			rows = append(rows, []map[string]any{{"text": "推广 · 了解更多", "url": target}})
 		}
 	}
-	rows = append(rows, []map[string]any{button("📖 使用帮助", "/help"), button("刷新主面板", "/panel")})
+	rows = append(rows, []map[string]any{memberButton("更多服务", "/more"), memberButton("刷新主面板", "/panel")})
 	a.sendMemberHero(ctx, chatID, text, rows)
 }
 
@@ -147,7 +94,7 @@ func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegr
 	// Only bounded read-only discovery commands may carry paging arguments.
 	parts := strings.Fields(command)
 	if len(parts) > 1 {
-		paging := (parts[0] == "/announcements" || parts[0] == "/favorites" || parts[0] == "/library") && strings.HasPrefix(parts[1], "page:")
+		paging := (parts[0] == "/announcements" || parts[0] == "/favorites" || parts[0] == "/library" || parts[0] == "/devices") && strings.HasPrefix(parts[1], "page:")
 		selection := len(parts) == 2 && parts[0] == "/retention" && (parts[1] == "A" || parts[1] == "B" || parts[1] == "off" || parts[1] == "month" || parts[1] == "quarter" || parts[1] == "year" || parts[1] == "rescue")
 		confirmation := len(parts) == 2 && parts[0] == "/retention_confirm" && len(parts[1]) == 24 && memberRedeemPayload.MatchString(parts[1])
 		memberChoice := (parts[0] == "/points" && (len(parts) == 2 || len(parts) == 3)) || ((parts[0] == "/device_stop" || parts[0] == "/points_redeem") && len(parts) == 2)
@@ -202,7 +149,14 @@ func (a *App) memberPanelEdit(ctx context.Context, method string, body any) (str
 	result := map[string]any{"chat_id": target.ChatID, "message_id": target.MessageID, "text": message.Text, "parse_mode": message.ParseMode, "disable_web_page_preview": true, "reply_markup": markup}
 	if target.Photo {
 		delete(result, "text")
-		result["caption"] = truncateString(message.Text, 1020)
+		rows := 1
+		if m, ok := markup.(map[string]any); ok {
+			if v, ok := m["inline_keyboard"].([][]map[string]any); ok {
+				rows = len(v)
+			}
+		}
+		result["caption"] = memberPanelCaption(message.Text, rows, message.ParseMode == "HTML")
+		delete(result, "parse_mode")
 	}
 	return method, result
 }
@@ -405,7 +359,7 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 	if success {
 		switch c.Command {
 		case "/register":
-			message = "Emby 已开通\n用户名：" + c.Args[0] + "\n初始密码：" + password + "\n请妥善保存，并在客户端修改密码。"
+			message = "Emby 已开通\n用户名：" + c.Args[0] + "\n初始密码：" + password + "\n\n仅本次显示，请立即保存到密码管理器；离开后无法反查。"
 		case "/devices":
 			message = "我的 Emby 在线设备\n"
 			if items, ok := data.([]any); ok {
@@ -492,6 +446,15 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 		}
 	}
 	rows := [][]map[string]any{}
+	if !success {
+		switch c.Command {
+		case "/security", "/password", "/redeem", "/register":
+			rows = append(rows, []map[string]any{memberButton("重新输入", c.Command)})
+		}
+	}
+	if success && c.Command == "/register" {
+		rows = append(rows, []map[string]any{{"text": "复制初始密码", "copy_text": map[string]string{"text": password}}, memberButton("我已保存，返回主面板", "/panel")})
+	}
 	if c.Command == "/request" && len(c.Args) == 0 && a.cfg().MediaRequestEnabled {
 		rows = append(rows, []map[string]any{memberButton("提交新的求片", "/request_new")})
 	}
@@ -572,7 +535,7 @@ func (a *App) publishTelegramMemberCommands(ctx context.Context) error {
 func (a *App) telegramMemberCommandVisible(name string) bool {
 	cfg := a.cfg()
 	switch name {
-	case "retention_confirm", "points_redeem", "device_sync", "device_stop", "request_new", "account_security":
+	case "retention_confirm", "points_redeem", "device_sync", "device_stop", "request_new", "account_security", "more", "member_help":
 		return false
 	case "signin":
 		return cfg.SigninEnabled

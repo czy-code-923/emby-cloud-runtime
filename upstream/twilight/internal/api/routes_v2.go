@@ -7,6 +7,9 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodPut, "/api/v2/admin/metadata", AuthAdmin, a.handleMetadataSave)
+	a.add(http.MethodPost, "/api/v2/admin/metadata/probe", AuthAdmin, a.handleMetadataProbe)
+	a.add(http.MethodGet, "/api/v2/miniapp/media/:item_id/image", AuthPublic, a.miniMember(a.handleMemberMediaImage))
 	a.add(http.MethodGet, "/api/v2/admin/media-worker", AuthAdmin, a.handleAdminMediaWorker)
 	a.add(http.MethodPost, "/api/v2/admin/media-worker/key", AuthAdmin, a.handleAdminMediaWorkerKey)
 	a.add(http.MethodGet, "/api/v2/integrations/media-requests", AuthAPIKey, a.withAPIKeyPermission(apiKeyPermissionMediaSync, a.handleMediaWorkerQueue))

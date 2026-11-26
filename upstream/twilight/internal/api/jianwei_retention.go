@@ -202,6 +202,12 @@ func (a *App) runRetention(ctx context.Context) (map[string]any, []string, error
 
 func retentionNativeText(v store.RetentionView) string {
 	m := v.Member.Member
+	if m.Permanent {
+		return "见微 · 签到与保号\n\n无需保号\n\n管理员、白名单或长期有效账户\n无需选择活动保号方式。\n每日签到仍可正常领取积分。"
+	}
+	if m.ExemptEnd > time.Now().Unix() && !v.Selectable {
+		return "见微 · 签到与保号\n\n无需保号\n当前购买权益有效，免活动保号。\n\n临近到期时可选择活动方式或购买续期。\n每日签到仍可正常使用。"
+	}
 	mode := m.Mode
 	if mode == "" {
 		mode = "尚未选择"

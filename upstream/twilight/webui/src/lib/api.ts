@@ -3357,6 +3357,13 @@ class ApiClient {
   async saveShop(settings:ShopSettings,password:string){return this.request("/admin/commerce",{method:"PUT",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-admin"},body:JSON.stringify({settings,revision:settings.revision,password})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
   async reviewShop(id:string,payload:Record<string,unknown>){return this.request<ShopOrder>(`/admin/commerce/orders/${encodeURIComponent(id)}/review`,{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"shop-admin"},body:JSON.stringify(payload)},{apiVersion:"v2",cacheRead:false,dedupe:false});}
 
+  async metadataSave(sections:Record<string,Record<string,unknown>>,expected_revision:string,password:string){const r=await this.request("/admin/metadata",{method:"PUT",headers:{"X-Twilight-Intent":"metadata-admin","X-Twilight-Client":"webui"},body:JSON.stringify({sections,expected_revision,password})},{apiVersion:"v2",cacheRead:false,dedupe:false});if(r.success)this.invalidateConfigSchemaCache();return r;}
+  async metadataProbe(){return this.request<Record<string,string>>("/admin/metadata/probe",{method:"POST",body:"{}"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async mediaWorker<T>(signal?:AbortSignal){return this.request<T>("/admin/media-worker",{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async mediaWorkerKey(password:string){return this.request<{key?:string;api_key?:string}>("/admin/media-worker/key",{method:"POST",headers:{"X-Twilight-Intent":"media-worker-key","X-Twilight-Client":"webui"},body:JSON.stringify({password})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniRequests<T>(page:number,signal?:AbortSignal){return this.request<T>(`/miniapp/requests?page=${page}`,{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniRequestSearch<T>(q:string,signal?:AbortSignal){return this.request<T>(`/miniapp/request-search?q=${encodeURIComponent(q)}&source=all`,{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniEmail<T>(action:"send"|"verify",body:Record<string,unknown>){return this.request<T>(`/miniapp/email/${action}`,{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"miniapp-action"},body:JSON.stringify(body)},{apiVersion:"v2",cacheRead:false,dedupe:false});}
   async miniRead<T>(section:"lines"|"devices"|"requests"|"invite"|"device-registry", signal?:AbortSignal) {
     const options={signal,cache:"no-store" as const};
     const extra={cacheRead:false,dedupe:false,apiVersion:"v2" as const};

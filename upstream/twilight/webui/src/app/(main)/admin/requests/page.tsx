@@ -1,5 +1,6 @@
 "use client";
 
+import {RequestProgress} from "@/app/miniapp/requests";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import Image from "next/image";
 import {
@@ -63,6 +64,7 @@ const EMPTY_STATUS_COUNTS: MediaRequestStatusCounts = {
   downloading: 0,
   rejected: 0,
   completed: 0,
+  failed: 0,
 };
 
 function isActiveStatus(status: string): boolean {
@@ -380,6 +382,7 @@ export default function AdminRequestsPage() {
             {t("media.statusAccepted")}
           </Badge>
         );
+      case "failed":return <Badge variant="destructive">{t("mini.status.failed")}</Badge>;
       case "rejected":
         return (
           <Badge variant="destructive">
@@ -472,6 +475,7 @@ export default function AdminRequestsPage() {
             <TabsTrigger value="accepted">{t("media.statusAccepted")} <span className="ml-1 text-xs text-muted-foreground">{statusCounts.accepted}</span></TabsTrigger>
             <TabsTrigger value="downloading">{t("media.statusDownloading")} <span className="ml-1 text-xs text-muted-foreground">{statusCounts.downloading}</span></TabsTrigger>
             <TabsTrigger value="rejected">{t("media.statusRejected")} <span className="ml-1 text-xs text-muted-foreground">{statusCounts.rejected}</span></TabsTrigger>
+            <TabsTrigger value="failed">{t("mini.status.failed")} <span className="ml-1 text-xs text-muted-foreground">{statusCounts.failed}</span></TabsTrigger>
             <TabsTrigger value="completed">{t("media.statusCompleted")} <span className="ml-1 text-xs text-muted-foreground">{statusCounts.completed}</span></TabsTrigger>
             <TabsTrigger value="all">{t("adminReview.all")} <span className="ml-1 text-xs text-muted-foreground">{statusCounts.all}</span></TabsTrigger>
           </TabsList>
@@ -731,9 +735,10 @@ export default function AdminRequestsPage() {
               {selectedRequests[0]?.media_info?.season && ` - ${t("media.season", { season: selectedRequests[0].media_info.season })}`}
             </DialogDescription>
           </DialogHeader>
+          {selectedRequests[0]&&<RequestProgress request={selectedRequests[0]}/>}
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label>{t("adminRequests.changeStatus")}</Label>
+              <Label>{t("adminRequests.changeStatus")}</Label><p className="text-xs leading-6 text-muted-foreground">{t("v6.manualProgress")}</p>
               <Select value={selectedStatus} onValueChange={setSelectedStatus}>
                 <SelectTrigger>
                   <SelectValue placeholder={t("adminRequests.selectStatus")} />
@@ -741,9 +746,7 @@ export default function AdminRequestsPage() {
                 <SelectContent>
                   <SelectItem value="pending">{t("media.statusUnhandled")}</SelectItem>
                   <SelectItem value="accepted">{t("media.statusAccepted")}</SelectItem>
-                  <SelectItem value="downloading">{t("media.statusDownloading")}</SelectItem>
                   <SelectItem value="rejected">{t("media.statusRejected")}</SelectItem>
-                  <SelectItem value="completed">{t("media.statusCompleted")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
