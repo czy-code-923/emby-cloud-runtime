@@ -129,6 +129,32 @@ func TestJianweiRetentionTrustedSamplingUnionSeeksAndWindows(t *testing.T) {
 		t.Fatal("seek credited")
 	}
 }
+
+func TestJianweiRetentionCollectionQualityExpiresWithoutFabricatingProgress(t *testing.T) {
+	s, u, now := retentionFixture(t)
+	v, err := s.RetentionView(u.UID, now)
+	if err != nil || v.Quality != "waiting" {
+		t.Fatal("unsampled account must wait", err)
+	}
+	if err = s.ObserveRetention(nil, now); err != nil {
+		t.Fatal(err)
+	}
+	v, _ = s.RetentionView(u.UID, now+30)
+	if v.Quality != "server_session_samples" || v.Seconds != 0 {
+		t.Fatal("an empty healthy poll must not fabricate viewing")
+	}
+	v, _ = s.RetentionView(u.UID, now+91)
+	if v.Quality != "stale" || v.Seconds != 0 {
+		t.Fatal("missing reports did not become stale")
+	}
+	if err = s.SetRetentionEnabled(false, s.RetentionPolicy().Revision); err != nil {
+		t.Fatal(err)
+	}
+	v, _ = s.RetentionView(u.UID, now+92)
+	if v.Quality != "disabled" {
+		t.Fatal("disabled collection shown as current")
+	}
+}
 func TestJianweiRetentionOrganicCapIdempotency(t *testing.T) {
 	s, u, _ := retentionFixture(t)
 	s.mu.Lock()

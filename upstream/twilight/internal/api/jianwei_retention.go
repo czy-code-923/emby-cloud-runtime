@@ -213,7 +213,44 @@ func retentionNativeText(v store.RetentionView) string {
 	} else if m.PlaybackEnd > 0 {
 		end = time.Unix(m.PlaybackEnd, 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04")
 	}
-	return fmt.Sprintf("见微 Emby · 保号与签到\n\n当前方式：%s · %s\n播放截止：%s\n可用积分：%d · A需%d\n本窗已签到：%d天\n可信观影：%d / %d分钟\n\nA：明确授权后，每个30天窗口扣%d积分续30天，无签到次数硬门槛。\nB：本窗有效观影满30分钟，免费续30天。\n实际更换后冷却20天；随时可撤销未提交的A扣分授权。\n签到 /signin · 选择 /retention A 或 /retention B\n撤回 /retention off", mode, status, end, v.Balance, v.Policy.Cost, v.SigninDays, v.Seconds/60, v.Policy.WatchSeconds/60, v.Policy.Cost)
+	now := time.Now().Unix()
+	format := func(value int64) string {
+		if value <= 0 {
+			return "—"
+		}
+		return time.Unix(value, 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04")
+	}
+	text := fmt.Sprintf("见微 Emby · 保号与签到\n\n· 当前方式  |  %s · %s\n· 播放截止  |  %s\n· 可用积分  |  %d · A需%d\n· 本窗签到  |  %d天\n· 可信观影  |  %d / %d分钟", mode, status, end, v.Balance, v.Policy.Cost, v.SigninDays, v.Seconds/60, v.Policy.WatchSeconds/60)
+	if !v.Policy.Enabled {
+		text += "\n\n活动保号尚未开启，当前不会自动扣分或按观影续期。"
+	}
+	if m.Permanent {
+		return text + "\n\n受保护或长期有效账户，免活动保号要求。"
+	}
+	if m.PlaybackEnd > 0 {
+		text += "\n· 窗口起止  |  " + format(v.Start) + " → " + format(v.End)
+	}
+	if m.ExemptEnd > now {
+		text += "\n· 免保号至  |  " + format(m.ExemptEnd)
+	}
+	if v.Start > now {
+		text += "\n本窗已结，下一窗尚未开始；不会重复扣款或复用旧观影。"
+	}
+	if m.NextSwitchAt > now {
+		text += "\n· 可更换于  |  " + format(m.NextSwitchAt)
+	} else {
+		text += "\n· 方式切换  |  可选择；真正变更后冷却20天"
+	}
+	quality := map[string]string{"disabled": "功能未开启", "waiting": "等待首次服务器采样", "stale": "采样已过期，缺报不会记为有效观影", "server_session_samples": "服务器采样正常"}[v.Quality]
+	if quality == "" {
+		quality = "等待首次服务器采样"
+	}
+	text += "\n· 采集状态  |  " + quality + "\n· 最近采样  |  " + format(v.LastPoll)
+	if v.AccessUntil > v.End && now >= v.End {
+		text += "\n· 救济播放至  |  " + format(v.AccessUntil) + "；补救须单独确认，不静默追扣。"
+	}
+	text += fmt.Sprintf("\n\nA：明确授权后，每个30天窗口扣%d积分续30天，无签到次数硬门槛。\nB：本窗有效观影满30分钟，免费续30天。\n实际更换后冷却20天；随时可撤销未提交的A扣分授权。\n签到 /signin · 选择 /retention A 或 /retention B\n撤回 /retention off", v.Policy.Cost)
+	return text
 }
 func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 	u, found := a.store().FindUserByTelegramID(c.FromID)

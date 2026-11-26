@@ -218,6 +218,15 @@ func (a *App) telegramDiscovery(ctx context.Context, c telegramCommandCtx) {
 			}
 			if id, ok := item["id"].(string); ok {
 				text += " · " + html.EscapeString(id)
+				if memberItemID.MatchString(id) && (c.Command == "/favorites" || c.Command == "/library") {
+					command, label := "/favorite ", "♡ 收藏"
+					if favorite, _ := item["favorite"].(bool); favorite {
+						command, label = "/unfavorite ", "♥ 取消收藏"
+					}
+					if callback := "jw:" + command + id; len(callback) <= 64 {
+						rows = append(rows, []map[string]any{{"text": fmt.Sprintf("%s · %d", label, i+1), "callback_data": callback}})
+					}
+				}
 			}
 			if plays, ok := item["plays"]; ok {
 				text += fmt.Sprintf(" · %v 次播放", plays)

@@ -1,0 +1,72 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prejudice-studio/twilight/internal/retention"
+	"github.com/prejudice-studio/twilight/internal/store"
+)
+
+func TestJianweiNativeMenuHonorsIndependentFeatureSwitches(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg().TelegramMode = true
+	a.cfg().TelegramBotToken = "fixture"
+	a.cfg().SigninEnabled = true
+	a.cfg().SigninRenewalEnabled = false
+	a.cfg().InviteEnabled = false
+	a.cfg().MediaRequestEnabled = false
+	var messages []map[string]any
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		messages = append(messages, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer remote.Close()
+	a.cfg().TelegramAPIURL = remote.URL
+	u, err := a.store().CreateUser(store.User{Username: "panel-fixture", TelegramID: 4321, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.telegramMemberPanel(context.Background(), u.TelegramID, u)
+	if len(messages) != 1 {
+		t.Fatal("panel did not reach Bot transport")
+	}
+	panel, _ := json.Marshal(messages[0]["reply_markup"])
+	if !strings.Contains(string(panel), "jw:/signin") || strings.Contains(string(panel), "jw:/renew") || strings.Contains(string(panel), "jw:/invite") || strings.Contains(string(panel), "jw:/request") {
+		t.Fatal("panel advertised a disabled feature", string(panel))
+	}
+	if err := a.publishTelegramMemberCommands(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	menu, _ := json.Marshal(messages[len(messages)-1]["commands"])
+	if !strings.Contains(string(menu), `"command":"signin"`) || strings.Contains(string(menu), `"command":"renew"`) || strings.Contains(string(menu), `"command":"retention_confirm"`) || strings.Contains(string(menu), `"command":"invite"`) {
+		t.Fatal("slash menu advertised a hidden or disabled feature", string(menu))
+	}
+}
+
+func TestJianweiNativeRetentionSummaryShowsFutureAndCollectionGap(t *testing.T) {
+	now := time.Now().Unix()
+	v := store.RetentionView{Policy: retention.DefaultPolicy(), Start: now + 3600, End: now + 31*86400, Quality: "stale"}
+	v.Policy.Enabled = true
+	v.Member.Member = retention.Member{PlaybackEnd: v.End, Mode: "B", Participation: true, NextSwitchAt: now + 86400}
+	text := retentionNativeText(v)
+	for _, expected := range []string{"下一窗尚未开始", "采样已过期", "窗口起止", "可更换于"} {
+		if !strings.Contains(text, expected) {
+			t.Fatal("missing member-facing state:", expected)
+		}
+	}
+	v.Policy.Enabled = false
+	if !strings.Contains(retentionNativeText(v), "不会自动扣分或按观影续期") {
+		t.Fatal("inactive policy was presented as active")
+	}
+}

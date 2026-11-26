@@ -1139,7 +1139,7 @@ func (a *App) telegramHelpText(admin bool) string {
 	)
 	catalog := a.telegramCommandCatalog()
 	for _, item := range catalog {
-		if item.Admin || item.Category != "user" || item.Disabled {
+		if item.Admin || item.Category != "user" || item.Disabled || !a.telegramMemberCommandVisible(item.Name) {
 			continue
 		}
 		lines = append(lines, telegramCommandHelpLine(item))

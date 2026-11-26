@@ -99,7 +99,11 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 	}
 	rows := [][]map[string]any{{button("👤 我的账户", "/me"), button("🎞 服务状态", "/emby")}, {button("🎟 兑换卡码", "/redeem"), button("✨ 开通 Emby", "/register")}}
 	if cfg.SigninEnabled {
-		rows = append(rows, []map[string]any{button("✦ 每日签到", "/signin"), button("🗓 积分续期", "/renew")})
+		signinRow := []map[string]any{button("✦ 每日签到", "/signin")}
+		if cfg.SigninRenewalEnabled {
+			signinRow = append(signinRow, button("🗓 积分续期", "/renew"))
+		}
+		rows = append(rows, signinRow)
 	}
 	rows = append(rows, []map[string]any{button("📱 我的设备", "/devices"), button("🧭 播放线路", "/lines")})
 	rows = append(rows, []map[string]any{button("🛡 保号方式与进度", "/retention")})
@@ -149,7 +153,8 @@ func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegr
 		paging := (parts[0] == "/announcements" || parts[0] == "/favorites" || parts[0] == "/library") && strings.HasPrefix(parts[1], "page:")
 		selection := len(parts) == 2 && parts[0] == "/retention" && (parts[1] == "A" || parts[1] == "B" || parts[1] == "off" || parts[1] == "month" || parts[1] == "quarter" || parts[1] == "year" || parts[1] == "rescue")
 		confirmation := len(parts) == 2 && parts[0] == "/retention_confirm" && len(parts[1]) == 24 && memberRedeemPayload.MatchString(parts[1])
-		if len(callback.Data) > 64 || (!paging && !selection && !confirmation) {
+		favorite := len(parts) == 2 && (parts[0] == "/favorite" || parts[0] == "/unfavorite") && memberItemID.MatchString(parts[1])
+		if len(callback.Data) > 64 || (!paging && !selection && !confirmation && !favorite) {
 			return true
 		}
 		command = parts[0]
@@ -254,6 +259,10 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 	case "/signin":
 		handler = a.handleSignin
 	case "/renew":
+		if !a.cfg().SigninEnabled || !a.cfg().SigninRenewalEnabled {
+			_ = a.telegramSendMessage(ctx, c.ChatID, "管理员尚未开启手动积分续期。使用 /retention 查看活动保号与免保号积分卡；没有扣除积分。")
+			return
+		}
 		if len(c.Args) != 1 || c.Args[0] != "confirm" {
 			_ = a.telegramSendMessage(ctx, c.ChatID, fmt.Sprintf("积分续期：%d 积分 / %d 天。确认扣除积分并续期，请输入 /renew confirm", a.cfg().SigninRenewalCost, a.cfg().SigninRenewalDays))
 			return
@@ -441,10 +450,33 @@ func memberInviteText(data any) string {
 func (a *App) publishTelegramMemberCommands(ctx context.Context) error {
 	commands := []map[string]string{{"command": "start", "description": "打开见微 Emby 主面板"}, {"command": "help", "description": "使用帮助与快捷命令"}}
 	for _, item := range a.telegramCommandCatalog() {
-		if !item.Admin && !item.Disabled && item.Name != "start" && item.Name != "help" && len(commands) < 100 {
+		if !item.Admin && !item.Disabled && a.telegramMemberCommandVisible(item.Name) && item.Name != "start" && item.Name != "help" && len(commands) < 100 {
 			commands = append(commands, map[string]string{"command": strings.ToLower(item.Name), "description": truncateString(item.Description, 100)})
 		}
 	}
 	_, err := telegramPostResult[telegramDiscardResult](a, ctx, "setMyCommands", map[string]any{"commands": commands, "scope": map[string]string{"type": "all_private_chats"}}, 15*time.Second)
 	return err
+}
+
+// Keep confirmation transports and disabled features out of the slash menu.
+// Their handlers independently enforce authorization and feature gates.
+func (a *App) telegramMemberCommandVisible(name string) bool {
+	cfg := a.cfg()
+	switch name {
+	case "retention_confirm":
+		return false
+	case "signin":
+		return cfg.SigninEnabled
+	case "renew":
+		return cfg.SigninEnabled && cfg.SigninRenewalEnabled
+	case "invite":
+		return cfg.InviteEnabled
+	case "request":
+		return cfg.MediaRequestEnabled
+	case "rank":
+		return cfg.PlayRankEnabled && cfg.PlayRankUserVisible
+	case "shopcode":
+		return cfg.TelegramShopEnabled
+	}
+	return true
 }

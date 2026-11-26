@@ -82,6 +82,8 @@ type RetentionView struct {
 	AccessUntil int64             `json:"access_until"`
 	LastPoll    int64             `json:"last_poll"`
 	Quality     string            `json:"quality"`
+	Username    string            `json:"username"`
+	EmbyName    string            `json:"emby_username"`
 	Ledger      []RetentionLedger `json:"ledger"`
 }
 
@@ -239,7 +241,15 @@ func (s *Store) retentionViewLocked(uid, now int64) (RetentionView, error) {
 	if len(ledger) > 12 {
 		ledger = ledger[:12]
 	}
-	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.state.Signin[uid].Points, Selectable: u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: s.state.Retention.Quality, Ledger: ledger}, nil
+	quality := s.state.Retention.Quality
+	if !p.Enabled {
+		quality = "disabled"
+	} else if s.state.Retention.LastPoll == 0 {
+		quality = "waiting"
+	} else if now-s.state.Retention.LastPoll > 90 {
+		quality = "stale"
+	}
+	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.state.Signin[uid].Points, Selectable: u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: quality, Username: u.Username, EmbyName: u.EmbyUsername, Ledger: ledger}, nil
 }
 func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (RetentionQuote, error) {
 	s.mu.Lock()

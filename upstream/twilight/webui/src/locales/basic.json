@@ -3897,6 +3897,10 @@
     "quarter": "90-day exempt card",
     "year": "365-day exempt card",
     "rescue": "Review window rescue",
-    "purchaseConsent": "I confirm this one-time points purchase. Remaining time is preserved and activity participation is paused. This does not enable a recurring purchase."
+    "purchaseConsent": "I confirm this one-time points purchase. Remaining time is preserved and activity participation is paused. This does not enable a recurring purchase.",
+    "protected": "Protected or permanent account; activity retention is not required.",
+    "future": "This window is settled. The next window has not started; no duplicate charge or viewing credit.",
+    "stale": "Server samples are stale. Missing reports do not count as viewing; contact the administrator.",
+    "healthy": "Server sampling is current"
   }
 }
