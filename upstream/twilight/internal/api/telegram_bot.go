@@ -522,11 +522,7 @@ func (a *App) telegramCachedEmbyHealth(ctx context.Context) (checked, online boo
 }
 
 func (a *App) telegramHandleResetPassword(ctx context.Context, chatID, telegramID int64) {
-	if _, okUser := a.store().FindUserByTelegramID(telegramID); !okUser {
-		_ = a.telegramSendMessage(ctx, chatID, "当前 Telegram 尚未绑定 Twilight 账号。")
-		return
-	}
-	_ = a.telegramSendMessage(ctx, chatID, "请在 Web 端的账号安全页面修改密码。Bot 不接收、不生成也不发送密码。")
+	a.telegramMemberCommand(ctx, telegramCommandCtx{ChatID: chatID, FromID: telegramID, Command: "/password"})
 }
 
 // telegramConsumeDelAccountPending 消费 delAccount 两步验证中的非命令文本。

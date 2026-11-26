@@ -68,7 +68,7 @@ func consoleFieldAllowed(section string, f configFieldDef) bool {
 		return false
 	}
 	key := strings.ToLower(f.Key)
-	for _, bad := range []string{"admin_uids", "admin_usernames", "repo_url", "databases_dir", "driver", "database_url", "host", "port", "cors_origins", "trusted_proxies", "state_file", "upload_dir"} {
+	for _, bad := range []string{"admin_ids", "admin_uids", "admin_usernames", "repo_url", "databases_dir", "driver", "database_url", "host", "port", "cors_origins", "trusted_proxies", "state_file", "upload_dir"} {
 		if key == bad {
 			return false
 		}

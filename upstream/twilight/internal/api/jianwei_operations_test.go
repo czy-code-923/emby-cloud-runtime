@@ -32,7 +32,7 @@ func TestJianweiControlRegistryHas24UniqueModulesAndExcludesSecrets(t *testing.T
 			}
 		}
 	}
-	for _, key := range []string{"admin_uids", "repo_url", "cors_origins", "databases_dir"} {
+	for _, key := range []string{"admin_ids", "admin_uids", "repo_url", "cors_origins", "databases_dir"} {
 		if consoleFieldAllowed("Global", configFieldDef{Key: key, Type: "string"}) {
 			t.Fatal("protected access field editable", key)
 		}
