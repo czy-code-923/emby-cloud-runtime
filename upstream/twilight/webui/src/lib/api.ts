@@ -1232,17 +1232,19 @@ class ApiClient {
       body: JSON.stringify(data),
       signal,
     }, { apiVersion: "v2" });
-    if (res.success && res.data?.user?.avatar) {
-      res.data.user.avatar = this.toAbsoluteAssetUrl(res.data.user.avatar) || undefined;
-    }
-    // V2 响应结构转换为 V1 格式
-    if (res.success && res.data?.user) {
+    // The shared Go mutation returns the public user directly; older V2
+    // adapters wrapped it in {user}. Accept both explicit response contracts.
+    const payload = res.data as (V2UserUpdateResponse & Partial<UserInfo>) | undefined;
+    const user = payload?.user ?? (payload && typeof payload.uid === "number" && typeof payload.username === "string" ? payload as UserInfo : undefined);
+    if (res.success && user?.uid === uid) {
+      const avatar = this.toAbsoluteAssetUrl(user.avatar) || undefined;
       return {
         success: true,
         message: res.message,
         data: {
-          ...(res.data.user as UserInfo),
-          emby_sync_failed: res.data.emby_sync_failed
+          ...user,
+          avatar,
+          emby_sync_failed: payload?.emby_sync_failed
         }
       } as ApiResponse<UserInfo & { emby_sync_failed?: boolean }>;
     }

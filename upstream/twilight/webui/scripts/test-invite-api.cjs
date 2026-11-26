@@ -40,3 +40,19 @@ test('personal invite summary has a single cancellable authenticated read',async
  assert.equal(calls[0][1].signal,controller.signal);
  assert.equal(response.data.invite.codes.length,0);
 });
+
+test('user quota update preserves success for the shared Go flat response',async()=>{
+ const user={uid:2,username:'member',role:2,media_max_devices:5,media_max_streams:2,emby_sync_failed:true};
+ for(const data of [user,{user,emby_sync_failed:true}]) {
+  const {api,calls}=client({success:true,message:'user updated',data});
+  const result=await api.updateUser(2,{media_max_devices:5,media_max_streams:2});
+  assert.equal(result.success,true);
+  assert.equal(result.data.uid,2);
+  assert.equal(result.data.media_max_devices,5);
+  assert.equal(result.data.emby_sync_failed,true);
+  assert.equal(calls[0][0],'/admin/users/2');
+  assert.equal(calls[0][1].method,'PUT');
+ }
+ const {api}=client({success:true,message:'unexpected response',data:{uid:3,username:'other'}});
+ assert.equal((await api.updateUser(2,{media_max_streams:2})).success,false);
+});
