@@ -273,7 +273,7 @@ class Manager:
                 raise ValueError('An upgrade is already running')
             if self.status()['installed_version'] != expected:
                 raise ValueError('Installed version changed; refresh before upgrading')
-            self.progress('queued', job_id=secrets.token_hex(8), target=tag, error=None)
+            self.progress('queued', job_id=secrets.token_hex(8), target=tag, error=None, message='Upgrade queued')
             threading.Thread(target=self._background, args=(tag,), daemon=True).start()
         return self.status()
 

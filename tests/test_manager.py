@@ -67,6 +67,17 @@ class ReleaseBoundaryTests(unittest.TestCase):
             manager.progress('applying')
             with self.assertRaises(ValueError):manager.start('v0.3.0','0.2.0')
 
+    def test_new_job_does_not_keep_previous_completion_message(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)/'app';root.mkdir();(root/'VERSION').write_text('0.2.0')
+            manager=m.Manager(root,Path(folder)/'state')
+            manager.progress('succeeded',message='Old upgrade completed',error='old')
+            with patch.object(m.threading,'Thread'):
+                result=manager.start('v0.3.0','0.2.0')
+            self.assertEqual(result['job']['phase'],'queued')
+            self.assertEqual(result['job']['message'],'Upgrade queued')
+            self.assertIsNone(result['job']['error'])
+
     def test_schema_change_refused_before_application_commands(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)/'app';root.mkdir();(root/'VERSION').write_text('0.2.0')

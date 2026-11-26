@@ -4081,6 +4081,8 @@
     "metadataMissing": "Not configured",
     "metadataBangumi": "Bangumi watch sync",
     "metadataSettings": "Metadata settings",
-    "manualProgress": "Download and import progress comes from the worker. This page approves or rejects requests."
+    "manualProgress": "Download and import progress comes from the worker. This page approves or rejects requests.",
+    "activityNav": "Check-in",
+    "onlineSessions": "Online sessions"
   }
 }

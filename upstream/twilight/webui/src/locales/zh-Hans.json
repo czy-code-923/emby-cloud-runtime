@@ -1077,6 +1077,8 @@
     "metadataMissing": "未配置",
     "metadataBangumi": "Bangumi观影同步",
     "metadataSettings": "资料源设置",
-    "manualProgress": "下载与入库进度由工作器回传；这里仅审核或拒绝请求。"
+    "manualProgress": "下载与入库进度由工作器回传；这里仅审核或拒绝请求。",
+    "activityNav": "签到保号",
+    "onlineSessions": "在线会话"
   }
 }

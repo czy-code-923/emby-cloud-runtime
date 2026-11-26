@@ -170,15 +170,16 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 			a.memberSendButtons(ctx, c.ChatID, "积分商店尚未开启，没有扣除积分。", nil)
 			return
 		}
+		if u.EmbyID == "" || u.ExpiredAt < 0 || u.Role == store.RoleAdmin {
+			a.memberSendButtons(ctx, c.ChatID, "当前账户尚未开通或已长期有效，无需兑换普通续期卡；没有扣除积分。", [][]map[string]any{{memberButton("返回积分商店", "/points")}})
+			return
+		}
 		if w.Available < cost {
 			a.memberSendButtons(ctx, c.ChatID, fmt.Sprintf("可用积分%d，本卡需要%d积分，还差%d积分；没有扣分。", w.Available, cost, cost-w.Available), [][]map[string]any{{memberButton("每日签到", "/signin"), memberButton("返回积分商店", "/points")}})
 			return
 		}
 		nonce := fmt.Sprintf("%016x", time.Now().UnixNano())
-		if u.EmbyID == "" || u.ExpiredAt < 0 || u.Role == store.RoleAdmin {
-			a.memberSendButtons(ctx, c.ChatID, "当前账户尚未开通或已长期有效，无需兑换普通续期卡；没有扣除积分。", [][]map[string]any{{memberButton("返回积分商店", "/points")}})
-			return
-		}
+
 		text += "\n\n确认兑换？本次将扣除对应可用积分。"
 		rows = append(rows, []map[string]any{memberButton("确认扣分并发码", "/points confirm "+sku+":"+nonce+":"+fmt.Sprint(map[string]int{"month": p.MonthPoints, "quarter": p.QuarterPoints, "year": p.YearPoints}[sku])), memberButton("取消", "/points")})
 	} else {
