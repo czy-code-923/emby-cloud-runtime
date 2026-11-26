@@ -23,7 +23,7 @@ func init() {
 		{"renew", "使用积分续期 Emby", "/renew confirm"},
 		{"redeem", "使用注册或续期兑换码", "/redeem <兑换码>"},
 		{"register", "使用已有资格开通 Emby", "/register <Emby用户名>"},
-		{"devices", "查看我的 Emby 在线设备", "/devices"},
+		{"devices", "登录设备、在线播放与配额", "/devices"},
 		{"lines", "查看我的播放线路", "/lines"},
 		{"request", "提交求片并查看进度", "/request <片名> 或 /request"},
 		{"invite", "查看邀请资格", "/invite"},

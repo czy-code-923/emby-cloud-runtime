@@ -54,7 +54,7 @@ func (s *Store) ShopRefundPreview(id string) map[string]any {
 	if latest.After != u.ExpiredAt {
 		return out
 	}
-	remaining := max(int64(0), v.After-max(max(v.Before, v.At), time.Now().Unix()))
+	remaining := max(int64(0), v.After-v.Offset-max(max(v.Before-v.Offset, v.At), time.Now().Unix()))
 	if remaining > int64(o.Product.Days)*86400 {
 		return out
 	}

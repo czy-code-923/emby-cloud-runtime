@@ -1912,7 +1912,7 @@ func roleName(role int) string {
 	case store.RoleUnrecognized:
 		return "未注册"
 	default:
-		return "普通用户"
+		return "用户"
 	}
 }
 

@@ -245,3 +245,36 @@ func TestJianweiDisabledZeroPriceTemplatesCannotOpenShop(t *testing.T) {
 		t.Fatal("shop opened without priced products")
 	}
 }
+
+func TestJianweiSequentialRefundRebasesLaterGrantWithoutTakingThirdGrant(t *testing.T) {
+	s, u, now := retentionFixture(t)
+	s.mu.Lock()
+	e := s.mutateAndSaveLocked(func() error {
+		u.ExpiredAt = now
+		s.state.Users[u.UID] = u
+		first := u
+		first.ExpiredAt += 30 * 86400
+		s.recordEntitlementLocked("code:first", "code", u, first, now)
+		second := first
+		second.ExpiredAt += 90 * 86400
+		s.recordEntitlementLocked("code:second", "code", first, second, now)
+		third := second
+		third.ExpiredAt += 30 * 86400
+		s.recordEntitlementLocked("third", "code", second, third, now)
+		s.state.Users[u.UID] = third
+		one := ShopOrder{ID: "one", UID: u.UID, CodeKey: "first", Product: ShopProduct{Days: 30}}
+		if e := s.refundSourceLocked(&one, now); e != nil {
+			return e
+		}
+		two := ShopOrder{ID: "two", UID: u.UID, CodeKey: "second", Product: ShopProduct{Days: 90}}
+		return s.refundSourceLocked(&two, now+20*86400)
+	})
+	s.mu.Unlock()
+	if e != nil {
+		t.Fatal(e)
+	}
+	after, _ := s.User(u.UID)
+	if after.ExpiredAt != now+50*86400 {
+		t.Fatal("third independent 30 days consumed by wrong refund", after.ExpiredAt-now)
+	}
+}

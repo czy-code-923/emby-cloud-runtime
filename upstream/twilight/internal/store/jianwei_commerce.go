@@ -353,6 +353,9 @@ func (s *Store) ConfirmShopPayment(id string, revision, admin, received, paidAt 
 		if o.Product.Kind == 3 && (u.Role == RoleAdmin || u.Role == RoleWhitelist && u.WhitelistUntil == 0) {
 			ready = false
 		}
+		if o.Product.Kind == 2 && (u.Role == RoleAdmin || u.ExpiredAt < 0) {
+			ready = false
+		}
 		// Recheck stock after a late payment lost its reservation. A paid hold
 		// records the real receipt without over-selling or silently dropping it.
 		stock := o.Product.Stock

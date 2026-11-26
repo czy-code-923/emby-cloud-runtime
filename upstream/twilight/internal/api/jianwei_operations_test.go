@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prejudice-studio/twilight/internal/config"
 	"github.com/prejudice-studio/twilight/internal/store"
 )
 
@@ -81,6 +82,22 @@ func TestJianweiPlaybackHostNormalizesOnlyDefaultPort(t *testing.T) {
 		v, e := url.Parse(raw)
 		if e != nil || normalizedPlaybackHost(v) != expected {
 			t.Fatal(raw, normalizedPlaybackHost(v), e)
+		}
+	}
+}
+
+func TestJianweiListOnlyPlaybackDoesNotDuplicatePrimaryCertificate(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg().EmbyPublicURL = ""
+	a.cfg().EmbyURLList = []config.Line{{URL: "https://normal.example.test"}, {URL: "https://second.example.test:443"}}
+	a.cfg().EmbyWhitelistURL = "https://white.example.test"
+	origins := a.configuredIngressOrigins()
+	if origins["playback"] != "https://normal.example.test" || len(origins) != 5 {
+		t.Fatal(origins)
+	}
+	for key, value := range origins {
+		if strings.HasPrefix(key, "playback-") && value == origins["playback"] {
+			t.Fatal("duplicate primary publication", origins)
 		}
 	}
 }

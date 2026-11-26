@@ -44,12 +44,6 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 		return
 	}
 	origin := configuredOrigins[profile]
-	if profile == "shop" {
-		origin = a.cfg().CommerceStoreURL
-	}
-	if profile == "playback" {
-		origin = a.cfg().EmbyPublicURL
-	}
 	var body map[string]any
 	switch operation {
 	case "configure":
@@ -111,21 +105,31 @@ func (a *App) handleNetworkAction(w http.ResponseWriter, r *http.Request, _ Para
 }
 
 func (a *App) configuredIngressOrigins() map[string]string {
-	out := map[string]string{"account": a.cfg().PublicBaseURL, "shop": a.cfg().CommerceStoreURL, "playback": a.cfg().EmbyPublicURL}
-	all := append(append([]string{}, a.cfg().EmbyWhitelistURL), a.cfg().EmbyPublicURL)
-	for _, line := range a.cfg().EmbyURLList {
-		all = append(all, line.URL)
+	cfg := a.cfg()
+	out := map[string]string{"account": cfg.PublicBaseURL, "shop": cfg.CommerceStoreURL, "playback": cfg.EmbyPublicURL}
+	ordinary := append([]string{cfg.EmbyPublicURL}, lineURLs(cfg.EmbyURLList)...)
+	// A list-only configuration uses its first standard HTTPS line as primary.
+	primary := ""
+	for _, raw := range ordinary {
+		u, e := url.Parse(raw)
+		if e == nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil && (u.Port() == "" || u.Port() == "443") {
+			primary = strings.ToLower(u.Hostname())
+			out["playback"] = "https://" + primary
+			break
+		}
 	}
-	for _, line := range a.cfg().EmbyWhitelistURLList {
-		all = append(all, line.URL)
-	}
+	all := append(ordinary, append([]string{cfg.EmbyWhitelistURL}, lineURLs(cfg.EmbyWhitelistURLList)...)...)
 	for _, raw := range all {
 		u, e := url.Parse(raw)
-		if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.Port() != "" && u.Port() != "443" || raw == a.cfg().EmbyPublicURL {
+		if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Port() != "" && u.Port() != "443" {
 			continue
 		}
-		sum := sha256.Sum256([]byte(strings.ToLower(u.Hostname())))
-		out[fmt.Sprintf("playback-%x", sum[:6])] = u.Scheme + "://" + u.Host
+		host := strings.ToLower(u.Hostname())
+		if host == primary {
+			continue
+		}
+		sum := sha256.Sum256([]byte(host))
+		out[fmt.Sprintf("playback-%x", sum[:6])] = "https://" + host
 	}
 	return out
 }

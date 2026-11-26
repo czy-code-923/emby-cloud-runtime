@@ -59,6 +59,7 @@ type ServiceIncident struct {
 	Actor     int64   `json:"actor"`
 }
 type EntitlementSource struct {
+	Offset        int64  `json:"offset"` // projection; original Before/After remain unchanged
 	Sequence      int64  `json:"sequence"`
 	ID            string `json:"id"`
 	UID           int64  `json:"uid"`
@@ -238,8 +239,9 @@ func (s *Store) CreateIncident(v ServiceIncident, expected int64) error {
 	defer s.mu.Unlock()
 	return s.mutateAndSaveLocked(func() error {
 		s.state.Finance.ensure()
-		if old, ok := s.state.Finance.Incidents[v.ID]; ok {
-			if old.Title != v.Title {
+		digest := financeDigest(map[string]any{"id": v.ID, "title": v.Title, "reason": v.Reason, "uids": v.UIDs, "start": v.Start, "end": v.End, "hold_until": v.HoldUntil, "days": v.Days, "points": v.Points, "actor": v.Actor})
+		if _, ok := s.state.Finance.Incidents[v.ID]; ok {
+			if s.state.Finance.Operations["incident-create:"+v.ID] != digest {
 				return ErrConflict
 			}
 			return errNoChange
@@ -271,6 +273,7 @@ func (s *Store) CreateIncident(v ServiceIncident, expected int64) error {
 			s.state.Users[uid] = u
 		}
 		s.state.Finance.Incidents[v.ID] = v
+		s.state.Finance.Operations["incident-create:"+v.ID] = digest
 		s.state.Finance.Revision++
 		return nil
 	})
@@ -399,12 +402,24 @@ func (s *Store) refundSourceLocked(o *ShopOrder, now int64) error {
 	if latest.After != u.ExpiredAt {
 		return ErrConflict
 	}
-	start := max(source.Before, source.At)
-	remaining := max(int64(0), source.After-max(start, now))
+	start := max(source.Before-source.Offset, source.At)
+	remaining := max(int64(0), source.After-source.Offset-max(start, now))
 	if remaining > int64(o.Product.Days)*86400 {
 		return ErrConflict
 	}
 	before := u
+	removedStart := max(start, now)
+	// Rebase later independent grants, preserving their original facts.
+	// A subsequent refund must not count their already consumed time again.
+	for otherID, other := range s.state.Finance.Sources {
+		if other.UID == u.UID && other.RevokedAt == 0 && other.Sequence > source.Sequence && other.After > other.Before && other.Kind != "refund" {
+			other.Offset += remaining
+			s.state.Finance.Sources[otherID] = other
+		}
+	}
+	if u.WhitelistUntil > removedStart {
+		u.WhitelistUntil -= min(remaining, u.WhitelistUntil-removedStart)
+	}
 	u.ExpiredAt = max(now, u.ExpiredAt-remaining)
 	if source.RoleAfter == RoleWhitelist && source.RoleBefore != RoleWhitelist && u.Role == RoleWhitelist {
 		laterWhite := false
@@ -569,7 +584,7 @@ func ValidateFinanceBackup(state *State) error {
 		seen[v.ID] = true
 	}
 	for id, v := range f.Sources {
-		if id != v.ID || v.UID <= 0 || v.At <= 0 {
+		if id != v.ID || v.UID <= 0 || v.At <= 0 || v.Offset < 0 {
 			return fmt.Errorf("invalid entitlement lineage")
 		}
 	}
