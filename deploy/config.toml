@@ -48,7 +48,9 @@ user_limit = 5
 emby_direct_register_enabled = false
 emby_direct_register_workers = 1
 emby_direct_register_max_queue = 50
-signin_enabled = false
+signin_enabled = true
+invite_enabled = false
+invite_require_emby = true
 daily_min = 10
 daily_max = 20
 streak_bonus_enabled = false
@@ -59,6 +61,13 @@ signin_renewal_days = 30
 auto_cleanup_no_emby = false
 auto_cleanup_pending_emby = false
 [DeviceLimit]
+media_limits_enabled = true
+media_normal_devices = 5
+media_normal_streams = 2
+media_whitelist_devices = 10
+media_whitelist_streams = 3
+media_admin_devices = 0
+media_admin_streams = 0
 device_limit_enabled = false
 [Security]
 telegram_direct_login_enabled = false

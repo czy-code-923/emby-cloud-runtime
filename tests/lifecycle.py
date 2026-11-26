@@ -56,6 +56,12 @@ with patch.object(m,'release_info',side_effect=lambda *_args,**_kwargs:dict(rele
     assert manager.status()['installed_version']==base
     api('/api/v2/setup/complete',{'admin':{'username':'ci-owner','password':'CI-Disposable-Password123!'}})
     assert api('/api/v2/auth/me')['data']['username']=='ci-owner'
+    features=api('/api/v2/system/info')['data']['features']
+    assert features['signin'] and not features['invite'] and not features['register'], 'Fresh member defaults are inconsistent'
+    # Emulate an administrator's explicit capacity change and prove that the
+    # next release does not replace it with its own deployment template.
+    config_path=m.ROOT/'runtime/twilight/config.toml'
+    config_path.write_text(config_path.read_text().replace('user_limit = 5','user_limit = 7'))
     # Check the actual container-to-host Unix socket route.
     assert api('/api/v2/admin/deployment/status')['data']['installed_version']==base
     manager.command(['systemctl','try-restart','emby-cloud-updater.service'])
@@ -85,6 +91,7 @@ with patch.object(m,'release_info',side_effect=lambda *_args,**_kwargs:dict(rele
     api('/api/v2/auth/login',{'username':'ci-owner','password':'CI-Disposable-Password123!'})
     assert api('/api/v2/admin/health/database')['data']['user_count']==1
     assert manager.status()['installed_version']==next_version
+    assert api('/api/v2/system/info')['data']['limits']['user_limit']==7, 'Upgrade reset administrator configuration'
     assert not (m.ROOT/'.git').exists()
     assert any((m.STATE/'history').glob('*/legacy-git'))
     prepare(failed_version)
