@@ -5,6 +5,7 @@ Reads and modifies only these two keys, preserving every other existing value.
 Defaults to a plan; --apply stores a root-only pre-change backup.
 """
 import argparse
+import os
 from pathlib import Path
 import re
 import time
@@ -12,7 +13,7 @@ import tomllib
 
 def main():
  p=argparse.ArgumentParser();p.add_argument('--root',default='/srv/emby-cloud');p.add_argument('--apply',action='store_true');a=p.parse_args()
- path=Path(a.root)/'runtime/twilight/config.toml';text=path.read_text();cfg=tomllib.loads(text)
+ path=Path(a.root)/'runtime/twilight/config.toml';metadata=path.stat();text=path.read_text();cfg=tomllib.loads(text)
  changes={'Global':{'admin_only':True},'DeviceLimit':{'media_limits_enabled':True}}
  for section,values in changes.items():
   match=re.search(r'(?ms)^\['+re.escape(section)+r'\]\s*\n(.*?)(?=^\[|\Z)',text)
@@ -26,7 +27,7 @@ def main():
  tomllib.loads(text)
  if a.apply:
   backup=path.with_name('config.before-member-boundary-'+str(int(time.time()))+'.toml');backup.write_bytes(path.read_bytes());backup.chmod(0o600)
-  temporary=path.with_name('config.member-boundary.tmp');temporary.write_text(text);temporary.chmod(0o600);temporary.replace(path)
+  temporary=path.with_name('config.member-boundary.tmp');temporary.write_text(text);os.chown(temporary,metadata.st_uid,metadata.st_gid);temporary.chmod(0o600);temporary.replace(path)
   print('Saved. The backend hot reloads this configuration.',flush=True)
  else:print('Plan only. Pass --apply after the compatible release is installed.',flush=True)
 

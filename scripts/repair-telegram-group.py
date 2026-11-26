@@ -2,6 +2,7 @@
 """Check saved group IDs; repair a missing minus sign only after Telegram confirms it."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -17,6 +18,7 @@ def main():
     args = parser.parse_args()
     path = Path(args.root) / 'runtime/twilight/config.toml'
     text = path.read_text(encoding='utf-8')
+    metadata = path.stat()
     cfg = tomllib.loads(text).get('Telegram', {})
     token = cfg.get('bot_token', '')
     if not token:
@@ -88,6 +90,7 @@ def main():
     backup.chmod(0o600)
     temporary = path.with_name('config.group-repair.tmp')
     temporary.write_text(updated, encoding='utf-8')
+    os.chown(temporary, metadata.st_uid, metadata.st_gid)
     temporary.chmod(0o600)
     temporary.replace(path)
     print('Verified group IDs saved; all enforcement switches preserved.', flush=True)

@@ -62,6 +62,8 @@ with patch.object(m,'release_info',side_effect=lambda *_args,**_kwargs:dict(rele
     # next release does not replace it with its own deployment template.
     config_path=m.ROOT/'runtime/twilight/config.toml'
     config_path.write_text(config_path.read_text().replace('user_limit = 5','user_limit = 7'))
+    manager.command(['python3', str(m.ROOT/'scripts/enable-member-boundary.py'), '--apply'])
+    assert config_path.stat().st_uid==10001, 'Maintenance helper removed backend configuration access'
     # Check the actual container-to-host Unix socket route.
     assert api('/api/v2/admin/deployment/status')['data']['installed_version']==base
     manager.command(['systemctl','try-restart','emby-cloud-updater.service'])
