@@ -2,7 +2,7 @@
 
 | 组件 | 版本 / 源码固定点 | 分发方式 |
 | --- | --- | --- |
-| Twilight | `7e9de1430a24ae8a01bc21d03168a4b8b459ba59` | 完整源码位于 upstream/twilight，基于该固定提交增加面板升级，保留 AGPL、LICENSE 和 NOTICE |
+| Twilight | `7e9de1430a24ae8a01bc21d03168a4b8b459ba59` | 完整源码位于 upstream/twilight，基于该固定提交增加见微会员、Bot/Mini App、商店、保号与面板升级；实际定制源码以本仓库 Release 标签为准，保留 AGPL、LICENSE 和 NOTICE |
 | OpenStrm | v2.28.0，`dde2b9889d8b9ba1194797be70e6fbf7472d9f5b` | 官方 indown/openstrm 镜像；完整对应源码与MIT许可位于 upstream/openstrm |
 | Emby Server | 4.10.2.0 | 官方 emby/embyserver 镜像；独立专有软件，遵循厂商条款 |
 | PostgreSQL | 17-alpine | 官方镜像，实机镜像摘要写入本地 images.lock.yaml |

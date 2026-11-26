@@ -11,7 +11,7 @@ import {OrderStatus,money} from "@/components/commerce-order";
 
 export default function CommerceAdmin(){
  const {t}=useI18n();const [page,setPage]=useState(1),[busy,setBusy]=useState(false),[notice,setNotice]=useState(""),[editing,setEditing]=useState<ShopSettings|null>(null),[selected,setSelected]=useState<ShopOrder|null>(null);
- const load=useCallback(async(signal?:AbortSignal)=>{const r=await api.adminShop(page,signal);if(!r.success||!r.data)throw new Error(r.message);return r.data},[page]);
+ const load=useCallback(async(signal?:AbortSignal)=>{const r=await api.adminShop(page,signal);if(!r.success||!r.data)throw new Error(r.message);return {...r.data,settings:{...r.data.settings,products:r.data.settings.products??[]},orders:r.data.orders??[]}},[page]);
  const {data,error,isLoading,execute}=useAsyncResource(load,{throwOnError:false});
  async function save(task:()=>Promise<{success:boolean;message?:string}>){if(busy)return;setBusy(true);setNotice("");try{const r=await task();if(!r.success)throw new Error(r.message);setNotice(r.message||t("commerce.saved"));setEditing(null);setSelected(null);await execute({throwOnError:false})}catch(e){setNotice(e instanceof Error?e.message:t("commerce.failed"))}finally{setBusy(false)}}
  return <div className="space-y-6"><header className="flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-2xl font-medium">{t("commerce.adminTitle")}</h1><p className="mt-2 text-sm text-muted-foreground">{t("commerce.adminHelp")}</p></div><Button variant="outline" disabled={busy||isLoading} onClick={()=>void execute({throwOnError:false})}>{t("commerce.refresh")}</Button></header>

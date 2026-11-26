@@ -16,7 +16,7 @@ import {MemberDevices} from "./member-devices";
 declare global { interface Window { Telegram?: {WebApp?: {initData:string;ready():void;expand():void;openLink?(url:string):void}} } }
 type Tab = "discover"|"home"|"benefits"|"requests"|"account";
 type ReadSection = "lines"|"devices"|"requests"|"invite";
-type PanelData = {lines?:{name:string;url:string}[];whitelist_lines?:{name:string;url:string}[];items?:{id:number;title:string;status:string}[];codes?:{code:string;active:boolean;days:number}[];can_invite?:boolean;reason?:string;total?:number};
+type PanelData = {lines?:{name:string;url:string}[];whitelist_lines?:{name:string;url:string}[];items?:{id:number;title:string;status:string;admin_note?:string}[];codes?:{code:string;active:boolean;days:number}[];can_invite?:boolean;reason?:string;total?:number};
 type Device = {session_id:string;device_name:string;client:string;now_playing?:{name:string}|null};
 function Glass({children,className=""}:{children:ReactNode;className?:string}) {return <section className={`${styles.glass} ${className}`}>{children}</section>}
 function RemotePanel({section,revision}:{section:ReadSection;revision:number}) {
@@ -30,7 +30,7 @@ function RemotePanel({section,revision}:{section:ReadSection;revision:number}) {
  if(Array.isArray(data))return <div className={styles.list}>{data.length?data.map(item=><div key={item.session_id}><Smartphone size={18}/><span>{item.device_name}<small>{item.client}{item.now_playing?` · ${item.now_playing.name}`:""}</small></span></div>):<p className={styles.muted}>{t("mini.emptyDevices")}</p>}</div>;
  if(section==="lines")return <div className={styles.list}>{[...(data.lines||[]),...(data.whitelist_lines||[])].map((line,i)=><div key={i}><Compass size={18}/><span>{line.name}<small>{t("mini.linePrivate")}</small></span><button type="button" onClick={()=>void copy(line.url)}>{copied===line.url?<Check size={18}/>:t("mini.copy")}</button></div>)}{!data.lines?.length&&!data.whitelist_lines?.length&&<p className={styles.muted}>{t("mini.emptyLines")}</p>}</div>;
  if(section==="invite")return <div className={styles.list}><p className={styles.muted}>{data.can_invite?t("mini.inviteReady"):data.reason||t("mini.inviteUnavailable")}</p>{data.codes?.map(code=><div key={code.code}><Ticket size={18}/><span>{code.code}<small>{code.days} {t("mini.days")} · {code.active?t("mini.usable"):t("mini.unusable")}</small></span><button onClick={()=>void copy(code.code)}>{copied===code.code?<Check size={18}/>:t("mini.copy")}</button></div>)}</div>;
- return <div className={styles.list}>{data.items?.length?data.items.map(item=><div key={item.id}><Clapperboard size={18}/><span>{item.title}<small>{requestStatus(item.status,t)}</small></span></div>):<p className={styles.muted}>{t("mini.emptyRequests")}</p>}</div>;
+ return <div className={styles.list}>{data.items?.length?data.items.map(item=><div key={item.id}><Clapperboard size={18}/><span>{item.title}<small>{requestStatus(item.status,t)}</small>{item.admin_note&&<small>{item.admin_note}</small>}</span></div>):<p className={styles.muted}>{t("mini.emptyRequests")}</p>}</div>;
 }
 export default function MiniAppPage() {
  const {t}=useI18n();
@@ -99,6 +99,6 @@ export default function MiniAppPage() {
 function expiryText(data:MiniAccount,t:(key:MessageKey)=>string){return !data.has_emby?t("mini.pending"):data.expired_at<0?t("mini.permanent"):data.expired_at?new Date(data.expired_at*1000).toLocaleDateString():t("mini.pending")}
 
 function requestStatus(status:string,t:(key:MessageKey)=>string){
- const keys:Record<string,MessageKey>={pending:"mini.status.pending",approved:"mini.status.approved",processing:"mini.status.processing",downloading:"mini.status.downloading",completed:"mini.status.completed",rejected:"mini.status.rejected",cancelled:"mini.status.cancelled",failed:"mini.status.failed"};
- return keys[status]?t(keys[status]):status;
+ const keys:Record<string,MessageKey>={unhandled:"mini.status.pending",accepted:"mini.status.approved",pending:"mini.status.pending",approved:"mini.status.approved",processing:"mini.status.processing",downloading:"mini.status.downloading",completed:"mini.status.completed",rejected:"mini.status.rejected",cancelled:"mini.status.cancelled",failed:"mini.status.failed"};
+ const key=keys[status.toLowerCase()];return key?t(key):t("mini.status.processing");
 }

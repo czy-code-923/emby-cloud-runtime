@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"go.uber.org/zap"
 	"strconv"
@@ -139,6 +140,8 @@ func (a *App) RunTelegramBot(ctx context.Context) error {
 	configVerified := false
 	nextConfigCheck := time.Time{}
 	waitingForConfig := false
+	lastMenuKey := ""
+	nextMenuAttempt := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -204,10 +207,18 @@ func (a *App) RunTelegramBot(ctx context.Context) error {
 			if botIdentity != "" && botIdentity != activeBot {
 				activeBot = botIdentity
 				a.setTelegramRuntimeStatus(true, nil)
-				if err := a.publishTelegramMemberCommands(ctx); err != nil {
-					zap.L().Warn("Telegram command menu publication failed")
-				}
 				zap.L().Info("Telegram bot polling started", zap.String("username", botIdentity), zap.Int64("resume_offset", offset))
+			}
+		}
+		menu, _ := json.Marshal(a.telegramMemberCommands())
+		menuKey := fmt.Sprintf("%s:%x", activeBot, sha256.Sum256(menu))
+		if menuKey != lastMenuKey && !now.Before(nextMenuAttempt) {
+			if err := a.publishTelegramMemberCommands(ctx); err != nil {
+				nextMenuAttempt = now.Add(time.Minute)
+				zap.L().Warn("Telegram command menu publication failed; retry scheduled")
+			} else {
+				lastMenuKey = menuKey
+				nextMenuAttempt = time.Time{}
 			}
 		}
 		updates, err := a.telegramGetUpdates(ctx, offset)

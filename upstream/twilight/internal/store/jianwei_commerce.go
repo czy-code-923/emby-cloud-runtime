@@ -57,7 +57,9 @@ func (s *Store) ShopConfiguration() ShopSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v := s.state.Shop
-	v.Products = cloneSlice(v.Products)
+	// Empty installations expose a JSON array, never null. Both catalogue
+	// editors and snapshots can legitimately have no products yet.
+	v.Products = append([]ShopProduct{}, v.Products...)
 	return v
 }
 func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) error {

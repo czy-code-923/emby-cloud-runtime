@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prejudice-studio/twilight/internal/config"
 	"github.com/prejudice-studio/twilight/internal/retention"
 	"github.com/prejudice-studio/twilight/internal/store"
 )
@@ -68,5 +69,21 @@ func TestJianweiNativeRetentionSummaryShowsFutureAndCollectionGap(t *testing.T) 
 	v.Policy.Enabled = false
 	if !strings.Contains(retentionNativeText(v), "不会自动扣分或按观影续期") {
 		t.Fatal("inactive policy was presented as active")
+	}
+}
+
+func TestJianweiSigninRetryKeepsOriginalDailyReceipt(t *testing.T) {
+	date := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")
+	si := store.Signin{Points: 3600, Records: []store.SigninRecord{{Date: date, RawAward: 20, Points: 5, Total: 5, CapWithheld: 15}}}
+	first := signinActionPayload(config.Config{}, si, true, 5, 0)
+	retry := signinActionPayload(config.Config{}, si, false, 0, 0)
+	for _, payload := range []map[string]any{first, retry} {
+		award, ok := payload["today_award"].(map[string]any)
+		if !ok || award["raw_points"] != 20 || award["credited_points"] != 5 || award["withheld_points"] != 15 {
+			t.Fatal("daily receipt lost original result", payload)
+		}
+	}
+	if retry["total_today"] != 0 {
+		t.Fatal("retry appears to have granted a second award")
 	}
 }

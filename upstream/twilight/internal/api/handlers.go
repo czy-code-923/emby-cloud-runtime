@@ -968,6 +968,9 @@ func (a *App) handleRegisterEmby(w http.ResponseWriter, r *http.Request, params 
 	if a.requireEmailVerified(w, p.User) {
 		return
 	}
+	if p.User.EmbyID == "" && a.requireMemberTelegramEligibility(w, r, p.User) {
+		return
+	}
 	if p.User.EmbyID != "" {
 		failWithCode(w, http.StatusBadRequest, ErrEmbyAlreadyLinked, "当前账号已关联 Emby 账号")
 		return

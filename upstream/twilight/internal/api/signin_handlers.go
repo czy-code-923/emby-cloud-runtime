@@ -234,6 +234,19 @@ func signinActionPayload(cfg config.Config, si store.Signin, created bool, daily
 	payload["daily_points"] = dailyPoints
 	payload["bonus_points"] = bonusPoints
 	payload["total_today"] = totalToday
+	// Report the original daily result even when a retry grants nothing.
+	today := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")
+	for i := len(si.Records) - 1; i >= 0; i-- {
+		record := si.Records[i]
+		if record.Date == today {
+			raw := record.RawAward
+			if raw == 0 && record.CapWithheld == 0 {
+				raw = record.Points + record.BonusPoints
+			}
+			payload["today_award"] = map[string]any{"date": record.Date, "raw_points": raw, "credited_points": record.Points + record.BonusPoints, "withheld_points": record.CapWithheld}
+			break
+		}
+	}
 	return payload
 }
 

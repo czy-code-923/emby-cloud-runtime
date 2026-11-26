@@ -406,7 +406,10 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 					if items, ok := d["items"].([]any); ok {
 						for _, v := range items {
 							if item, ok := v.(map[string]any); ok {
-								message += "• " + asString(item["title"]) + " · " + asString(item["status"]) + "\n"
+								message += "• " + asString(item["title"]) + " · " + store.MediaRequestStatusText(asString(item["status"])) + "\n"
+								if note := asString(item["admin_note"]); note != "" {
+									message += "  管理员：" + truncateString(note, 150) + "\n"
+								}
 							}
 						}
 					}
@@ -417,9 +420,18 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 		case "/invite":
 			message = memberInviteText(data)
 		case "/signin":
-			message += "\n返回 /panel 查看积分余额。"
+			if d, ok := data.(map[string]any); ok {
+				if award, ok := d["today_award"].(map[string]any); ok {
+					message += fmt.Sprintf("\n\n· 今日奖励  |  %v %s\n· 实际入账  |  %v\n· 封顶暂未发放  |  %v\n· 当前可用余额  |  %v\n· 连续签到  |  %v天", award["raw_points"], a.cfg().SigninCurrencyName, award["credited_points"], award["withheld_points"], d["current_points"], d["current_streak"])
+				}
+			}
+			message += "\n\n同日重试不会重复入账；返回主面板可查看保号进度。"
 		case "/redeem":
-			message += "\n未开通用户可继续 /register 用户名；/panel 查看账户。"
+			if user.EmbyID == "" {
+				message += "\n开通资格已就绪，请继续 /register 用户名；/panel 查看账户。"
+			} else {
+				message += "\n已同步现有 Emby 账户，无需再次注册；返回主面板查看有效期与线路。"
+			}
 		}
 	}
 	_ = a.telegramSendMessage(ctx, c.ChatID, truncateString(message, 3500))
@@ -447,14 +459,18 @@ func memberInviteText(data any) string {
 	return text
 }
 
-func (a *App) publishTelegramMemberCommands(ctx context.Context) error {
+func (a *App) telegramMemberCommands() []map[string]string {
 	commands := []map[string]string{{"command": "start", "description": "打开见微 Emby 主面板"}, {"command": "help", "description": "使用帮助与快捷命令"}}
 	for _, item := range a.telegramCommandCatalog() {
 		if !item.Admin && !item.Disabled && a.telegramMemberCommandVisible(item.Name) && item.Name != "start" && item.Name != "help" && len(commands) < 100 {
 			commands = append(commands, map[string]string{"command": strings.ToLower(item.Name), "description": truncateString(item.Description, 100)})
 		}
 	}
-	_, err := telegramPostResult[telegramDiscardResult](a, ctx, "setMyCommands", map[string]any{"commands": commands, "scope": map[string]string{"type": "all_private_chats"}}, 15*time.Second)
+	return commands
+}
+
+func (a *App) publishTelegramMemberCommands(ctx context.Context) error {
+	_, err := telegramPostResult[telegramDiscardResult](a, ctx, "setMyCommands", map[string]any{"commands": a.telegramMemberCommands(), "scope": map[string]string{"type": "all_private_chats"}}, 15*time.Second)
 	return err
 }
 
