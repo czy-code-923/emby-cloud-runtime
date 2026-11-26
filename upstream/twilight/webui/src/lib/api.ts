@@ -3363,7 +3363,7 @@ class ApiClient {
   async mediaWorkerKey(password:string){return this.request<{key?:string;api_key?:string}>("/admin/media-worker/key",{method:"POST",headers:{"X-Twilight-Intent":"media-worker-key","X-Twilight-Client":"webui"},body:JSON.stringify({password})},{apiVersion:"v2",cacheRead:false,dedupe:false});}
   async miniRequests<T>(page:number,signal?:AbortSignal){return this.request<T>(`/miniapp/requests?page=${page}`,{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
   async miniRequestSearch<T>(q:string,signal?:AbortSignal){return this.request<T>(`/miniapp/request-search?q=${encodeURIComponent(q)}&source=all`,{signal,cache:"no-store"},{apiVersion:"v2",cacheRead:false,dedupe:false});}
-  async miniEmail<T>(action:"send"|"verify",body:Record<string,unknown>){return this.request<T>(`/miniapp/email/${action}`,{method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"miniapp-action"},body:JSON.stringify(body)},{apiVersion:"v2",cacheRead:false,dedupe:false});}
+  async miniEmail<T>(action:"send"|"verify",body:Record<string,unknown>){const options={method:"POST",headers:{"X-Twilight-Client":"webui","X-Twilight-Intent":"miniapp-action"},body:JSON.stringify(body)},extra={apiVersion:"v2" as const,cacheRead:false,dedupe:false};switch(action){case "send":return this.request<T>("/miniapp/email/send",{...options,method:"POST"},extra);case "verify":return this.request<T>("/miniapp/email/verify",{...options,method:"POST"},extra);}}
   async miniRead<T>(section:"lines"|"devices"|"requests"|"invite"|"device-registry", signal?:AbortSignal) {
     const options={signal,cache:"no-store" as const};
     const extra={cacheRead:false,dedupe:false,apiVersion:"v2" as const};
