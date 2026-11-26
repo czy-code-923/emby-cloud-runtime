@@ -303,3 +303,19 @@ func TestJianweiDeliveryCannotAcknowledgeNewRefundWithOldReceipt(t *testing.T) {
 		t.Fatal("refund obligation missing")
 	}
 }
+
+func TestJianweiIncidentCannotDowngradePermanentUser(t *testing.T) {
+	s, u, now := retentionFixture(t)
+	_, e := s.UpdateUser(u.UID, func(next *User) error { next.ExpiredAt = -1; return nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	incident := ServiceIncident{ID: "incident-permanent-01", Title: "fixture", Reason: "fixture", UIDs: []int64{u.UID}, Start: now, End: now, HoldUntil: now + 86400, Days: 1}
+	if s.CreateIncident(incident, s.Wallet(u.UID).Revision) == nil {
+		t.Fatal("permanent user made finite by compensation")
+	}
+	after, _ := s.User(u.UID)
+	if after.ExpiredAt != -1 {
+		t.Fatal(after.ExpiredAt)
+	}
+}

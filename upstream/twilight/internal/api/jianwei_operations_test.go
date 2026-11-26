@@ -101,3 +101,65 @@ func TestJianweiListOnlyPlaybackDoesNotDuplicatePrimaryCertificate(t *testing.T)
 		}
 	}
 }
+
+func TestJianweiPlaybackHostAuthorizationReadsCurrentRole(t *testing.T) {
+	a := newTestApp(t)
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("X-Emby-Token") == "native-admin" {
+			_, _ = w.Write([]byte(`{"Id":"member-host","Policy":{"IsAdministrator":true}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"Id":"member-host","Policy":{"IsAdministrator":false}}`))
+	}))
+	defer remote.Close()
+	a.cfg().EmbyURL = remote.URL
+	a.cfg().EmbyToken = "fixture-admin"
+	a.cfg().BotInternalSecret = strings.Repeat("x", 32)
+	a.cfg().MediaLimitsEnabled = false
+	a.cfg().EmbyPublicURL = "https://normal.example.test"
+	a.cfg().EmbyWhitelistURL = "https://white.example.test"
+	u, e := a.store().CreateUser(store.User{Username: "host-member", Role: store.RoleNormal, Active: true, EmbyID: "member-host", ExpiredAt: time.Now().Unix() + 86400})
+	if e != nil {
+		t.Fatal(e)
+	}
+	call := func(host, token string) int {
+		r := httptest.NewRequest("GET", "/api/v2/internal/emby-access", nil)
+		r.Header.Set("X-JW-Gateway", a.cfg().BotInternalSecret)
+		r.Header.Set("X-JW-URI", "/Items")
+		r.Header.Set("X-JW-Method", "GET")
+		r.Header.Set("X-JW-Host", host)
+		r.Header.Set("X-Emby-Token", token)
+		r.Header.Set("X-Emby-Device-Id", "phone")
+		w := httptest.NewRecorder()
+		a.handleMediaGatewayAccess(w, r, nil)
+		return w.Code
+	}
+	if call("normal.example.test:443", "member-token") != 204 || call("white.example.test", "member-token") != 403 {
+		t.Fatal("ordinary role boundary")
+	}
+	_, e = a.store().UpdateUser(u.UID, func(next *store.User) error { next.Role = store.RoleWhitelist; return nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	if call("white.example.test", "member-token") != 204 {
+		t.Fatal("whitelist route denied")
+	}
+	_, e = a.store().UpdateUser(u.UID, func(next *store.User) error { next.WhitelistUntil = time.Now().Unix() - 1; return nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	if call("white.example.test", "member-token") != 403 {
+		t.Fatal("cached identity retained expired white privileges")
+	}
+	_, e = a.store().UpdateUser(u.UID, func(next *store.User) error { next.Role = store.RoleAdmin; return nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	if call("white.example.test", "member-token") != 204 || call("unknown.example.test", "member-token") != 403 {
+		t.Fatal("admin still must use configured route")
+	}
+	if call("normal.example.test", "native-admin") != 403 {
+		t.Fatal("native server administrator exposed")
+	}
+}

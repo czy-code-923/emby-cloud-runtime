@@ -33,7 +33,7 @@ func (a *App) handleFinance(w http.ResponseWriter, r *http.Request, _ Params) {
 		if len(eligible) >= 500 {
 			break
 		}
-		if u.Active && u.Role == store.RoleNormal && u.EmbyID != "" && (!u.EmbyDisabled || u.EmbyAutoDisabled) {
+		if u.Active && u.Role == store.RoleNormal && u.ExpiredAt >= 0 && u.EmbyID != "" && (!u.EmbyDisabled || u.EmbyAutoDisabled) {
 			eligible = append(eligible, map[string]any{"uid": u.UID, "username": u.Username})
 		}
 	}

@@ -478,6 +478,9 @@ func (s *Store) ReviewShopOrder(id, action, note, refundReference string, revisi
 				si := s.state.Signin[o.UID]
 				si.UID = o.UID
 				si.Points += o.PointsCost
+				if si.Points > 100000000 {
+					return ErrInvalid
+				}
 				s.state.Signin[o.UID] = si
 				s.walletEntryLocked(o.UID, admin, "points-refund:"+o.ID, "points_refund", note, o.PointsCost)
 			}

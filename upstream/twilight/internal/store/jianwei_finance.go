@@ -252,7 +252,7 @@ func (s *Store) CreateIncident(v ServiceIncident, expected int64) error {
 		seen := map[int64]bool{}
 		for _, uid := range v.UIDs {
 			u, ok := s.state.Users[uid]
-			if !ok || seen[uid] || u.Role != RoleNormal || u.EmbyID == "" || !u.Active || u.EmbyDisabled && !u.EmbyAutoDisabled {
+			if !ok || seen[uid] || u.Role != RoleNormal || u.ExpiredAt < 0 || u.EmbyID == "" || !u.Active || u.EmbyDisabled && !u.EmbyAutoDisabled {
 				return ErrInvalid
 			}
 			seen[uid] = true
@@ -310,11 +310,13 @@ func (s *Store) ResolveIncident(id, action string, revision, actor int64, amount
 				continue
 			}
 			if action == "compensate" {
-				if u.Role != RoleNormal || !u.Active || u.EmbyDisabled && !u.EmbyAutoDisabled {
+				if u.Role != RoleNormal || u.ExpiredAt < 0 || !u.Active || u.EmbyDisabled && !u.EmbyAutoDisabled {
 					return ErrConflict
 				}
 				old := u
-				u.ExpiredAt = max(u.ExpiredAt, now) + int64(v.Days)*86400
+				if v.Days > 0 {
+					u.ExpiredAt = max(u.ExpiredAt, now) + int64(v.Days)*86400
+				}
 				s.recordEntitlementLocked("incident:"+id+fmt.Sprint(":", uid), "incident", old, u, now)
 				si := s.state.Signin[uid]
 				si.UID = uid
