@@ -278,3 +278,28 @@ func TestJianweiSequentialRefundRebasesLaterGrantWithoutTakingThirdGrant(t *test
 		t.Fatal("third independent 30 days consumed by wrong refund", after.ExpiredAt-now)
 	}
 }
+
+func TestJianweiDeliveryCannotAcknowledgeNewRefundWithOldReceipt(t *testing.T) {
+	s, u, now := retentionFixture(t)
+	if e := s.AdjustWallet(u.UID, 1, 0, "outbox-credit-000001", "credit", "fixture", 1000); e != nil {
+		t.Fatal(e)
+	}
+	o, e := s.CreatePointsOrder(u.UID, "outbox-order-000001", "month", "outbox-request-00001", strings.Repeat("c", 64), "encrypted", now, 300)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, _, found, e := s.ClaimShopDelivery()
+	if e != nil || !found {
+		t.Fatal(found, e)
+	}
+	o, e = s.ReviewShopOrder(o.ID, "refund_pending", "refund fixture", "", o.Revision, 1)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if s.MarkShopDelivered(o.ID, u.UID, "issued") == nil {
+		t.Fatal("old issuance receipt marked refund delivered")
+	}
+	if !s.FinancialLiability(u.UID) {
+		t.Fatal("refund obligation missing")
+	}
+}

@@ -42,6 +42,7 @@ type PaymentChannel struct {
 }
 type ShopOrder struct {
 	EntitlementSourceID string      `json:"entitlement_source_id,omitempty"`
+	NotifiedStatus      string      `json:"notified_status,omitempty"`
 	NotifiedAt          int64       `json:"notified_at,omitempty"`
 	NotifyLeaseUntil    int64       `json:"notify_lease_until,omitempty"`
 	PaymentQR           string      `json:"payment_qr,omitempty"`
