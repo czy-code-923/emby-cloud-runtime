@@ -3,7 +3,8 @@ WORKDIR /src
 COPY upstream/twilight/go.mod upstream/twilight/go.sum ./
 RUN go mod download && go mod verify
 COPY upstream/twilight/ ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/twilight ./cmd/twilight
+COPY VERSION /build-version
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X github.com/prejudice-studio/twilight/internal/config.BuildVersion=$(cat /build-version)" -o /out/twilight ./cmd/twilight
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata curl && rm -rf /var/lib/apt/lists/* && useradd -u 10001 -m twilight
 COPY --from=build /out/twilight /usr/local/bin/twilight

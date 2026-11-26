@@ -56,7 +56,9 @@ with patch.object(m,'release_info',side_effect=lambda *_args,**_kwargs:dict(rele
     assert manager.status()['installed_version']==base
     api('/api/v2/setup/complete',{'admin':{'username':'ci-owner','password':'CI-Disposable-Password123!'}})
     assert api('/api/v2/auth/me')['data']['username']=='ci-owner'
-    features=api('/api/v2/system/info')['data']['features']
+    public_info=api('/api/v2/system/info')['data']
+    assert public_info['version']==base, 'Bot/API build version differs from the installed release'
+    features=public_info['features']
     assert features['signin'] and not features['invite'] and not features['register'], 'Fresh member defaults are inconsistent'
     # Emulate an administrator's explicit capacity change and prove that the
     # next release does not replace it with its own deployment template.

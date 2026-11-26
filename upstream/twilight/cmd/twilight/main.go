@@ -55,7 +55,7 @@ func run(args []string) error {
 	case "migrate-json":
 		return runMigrateJSON(args[2:])
 	case "version", "--version", "-v":
-		fmt.Println("Twilight Go Backend")
+		fmt.Println("Twilight Go Backend " + config.BuildVersion)
 		return nil
 	case "help", "--help", "-h":
 		printHelp()

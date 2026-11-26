@@ -15,6 +15,10 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// BuildVersion is set by the distribution build. Standalone upstream builds
+// keep their own default; administrators cannot change a binary's version.
+var BuildVersion = "0.0.6"
+
 type Line struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
@@ -733,7 +737,7 @@ func defaultConfigPath() string {
 func defaults() Config {
 	return Config{
 		AppName:              "Twilight",
-		Version:              "0.0.6",
+		Version:              BuildVersion,
 		Host:                 "0.0.0.0",
 		Port:                 5000,
 		DatabaseDir:          "db",
