@@ -15,3 +15,9 @@ test('CNY preserves decimal cents exactly through product and receipt entry',()=
 test('money rejects rounding, exponents, negative values and over-limit totals',()=>{
  for(const text of ['19.999','-1','1e3','Infinity','','1.','100000.01','9999999','0x10'])assert.equal(yuanToCents(text),null,text);
 });
+
+const statusExports={};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname,'../src/lib/media-status.ts'),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,{exports:statusExports});
+test('worker failure remains a failure in member and administrator projections',()=>{
+ for(const input of ['failed','FAILED',' failed ']){assert.equal(statusExports.normalizeMediaRequestStatus(input,'admin'),'failed');assert.equal(statusExports.normalizeMediaRequestStatus(input,'user'),'FAILED')}
+});
