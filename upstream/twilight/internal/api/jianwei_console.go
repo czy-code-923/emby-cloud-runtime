@@ -202,33 +202,36 @@ func (a *App) handleControlApply(w http.ResponseWriter, r *http.Request, _ Param
 		fail(w, 400, "模块已失效")
 		return
 	}
-	for section, raw := range d.Sections {
-		if !moduleSection(module, section) {
-			fail(w, 403, "草稿模块范围不匹配")
-			return
-		}
-		fields, valid := raw.(map[string]any)
-		if !valid {
-			fail(w, 400, "草稿结构无效")
-			return
-		}
-		for key := range fields {
-			allowed := false
-			for _, def := range configSectionDefs() {
-				if def.Key == section {
-					for _, f := range def.Fields {
-						if f.Key == key && consoleFieldAllowed(section, f) {
-							allowed = true
+	for _, changes := range []map[string]any{d.Sections, d.Before} {
+		for section, raw := range changes {
+			if !moduleSection(module, section) {
+				fail(w, 403, "草稿模块范围不匹配")
+				return
+			}
+			fields, valid := raw.(map[string]any)
+			if !valid {
+				fail(w, 400, "草稿结构无效")
+				return
+			}
+			for key := range fields {
+				allowed := false
+				for _, def := range configSectionDefs() {
+					if def.Key == section {
+						for _, f := range def.Fields {
+							if f.Key == key && consoleFieldAllowed(section, f) {
+								allowed = true
+							}
 						}
 					}
 				}
-			}
-			if !allowed {
-				fail(w, 403, "草稿含受保护字段")
-				return
+				if !allowed {
+					fail(w, 403, "草稿含受保护字段")
+					return
+				}
 			}
 		}
 	}
+
 	rev, valid := shopInteger(w, body, "revision")
 	if !valid {
 		return
