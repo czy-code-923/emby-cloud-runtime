@@ -2,7 +2,7 @@
 
 **v0.4.18：全量源码、正式安装包、一键安装/卸载和面板升级。**
 
-当前程序提供独立管理后台、Emby、OpenStrm、PostgreSQL、入口隔离、加密备份和发布升级。依据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 持续开发；该方案中的定制保号、交易和24模块总控尚未全部实现，准确范围见 [差距清单](docs/gaps.md)。
+当前程序提供独立管理后台、Emby、OpenStrm、PostgreSQL、入口隔离、加密备份和发布升级。依据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 持续开发；会员 A/B 保号、人工核款发卡与核心 Emby 管理已集成，24模块总控及高级事故/退款流程尚未全部实现，准确范围见 [逐项验收](docs/acceptance-2026-11-26.md) 和 [差距清单](docs/gaps.md)。
 
 ## 一键安装
 
@@ -22,6 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/czy-code-923/emby-cloud-runtime/mai
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/czy-code-923/emby-cloud-runtime/main/uninstall.sh | bash
+```
+
+仓库改私有后也可直接使用已安装的本地执行器卸载，无需再下载脚本：
+
+```bash
+python3 /usr/local/lib/emby-cloud/manager.py uninstall
 ```
 
 再次执行安装命令可使用保留的数据恢复服务。若明确要删除本项目所有运行数据、索引、备份和升级历史，使用下面的单行命令；执行后不可通过项目功能恢复：
@@ -48,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/czy-code-923/emby-cloud-runtime/mai
 
 ## 后台与方案核对
 
-当前后台尚未实现v8.1全部业务。24模块状态、卡码/邀请/TG分工和域名配置边界见[2026-11-24核对报告](docs/panel-audit-2026-11-24.md)。账户与购买网站域名可在“系统运维 → 站点与入口”修改，支持 Cloudflare DNS-01 证书申请、续期与独立的 HTTPS 发布。配置和生效状态分别显示；管理后台继续通过 SSH 安全入口使用。Mini App 菜单在账户入口发布后由 Telegram 管理页发布。
+当前后台尚未实现v8.1全部业务。最新生产状态与每项要求见 [2026-11-26 验收表](docs/acceptance-2026-11-26.md)；较早的24模块结构核对保留于 [2026-11-24历史报告](docs/panel-audit-2026-11-24.md)。账户与购买网站域名可在“系统运维 → 站点与入口”修改，支持 Cloudflare DNS-01 证书申请、续期与独立的 HTTPS 发布。配置和生效状态分别显示；管理后台继续通过 SSH 安全入口使用。Mini App 菜单在账户入口发布后由 Telegram 管理页发布。
 
 ## 完整源码与完整版本
 
@@ -60,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/czy-code-923/emby-cloud-runtime/mai
 
 CI在临时环境验证源码/构建、鉴权、恶意源与损坏包拒绝、安装、保留数据升级、健康失败回退、卸载/重装、显式清理和其它容器保留后，才公开发布版本。版本与依赖清单见 [source-manifest.md](docs/source-manifest.md)，实机结果见 [verification.md](docs/verification.md)，使用与恢复说明见 [operations.md](docs/operations.md)。
 
-商店与会员发现的操作和交付边界见 [v0.4.7](docs/v0.4.7-商店与会员发现.md)。
+商店与会员发现的操作说明见 [商店与会员发现](docs/v0.4.7-商店与会员发现.md)（最初随未发布的 v0.4.7 编写，相关功能已合入后续正式版）；当前范围以最新验收表为准。
 
 ## 私有仓库的新 VPS 安装
 
