@@ -1501,6 +1501,9 @@ func (s *Store) LoadSnapshot(data []byte, configuredKey ...string) error {
 	if err := ValidateShopBackup(state, configuredKey...); err != nil {
 		return err
 	}
+	if err := ValidateRetentionBackup(&state); err != nil {
+		return err
+	}
 	factors := state.TwoFactorAccounts
 	state.TwoFactorAccounts = nil
 	s.mu.Lock()

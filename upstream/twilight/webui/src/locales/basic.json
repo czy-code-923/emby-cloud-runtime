@@ -3890,5 +3890,10 @@
   "retention.sync": "Media synchronization",
   "retention.pending": "Pending",
   "retention.applied": "Applied",
-  "retention.policy": "30-day windows, A costs 300 points, B requires 30 minutes, 20-day change cooldown, 3600 organic reward cap. Daily rewards are 10–20 points. Point cards cost 300/850/3000 for 30/90/365 days; policy tightening requires a separate reviewed release and authorization."
+  "retention.policy": "30-day windows, A costs 300 points, B requires 30 minutes, 20-day change cooldown, 3600 organic reward cap. Daily rewards are 10–20 points. Point cards cost 300/850/3000 for 30/90/365 days; policy tightening requires a separate reviewed release and authorization.",
+  "retention.month": "30-day exempt card",
+  "retention.quarter": "90-day exempt card",
+  "retention.year": "365-day exempt card",
+  "retention.rescue": "Review window rescue",
+  "retention.purchaseConsent": "I confirm this one-time points purchase. Remaining time is preserved and activity participation is paused. This does not enable a recurring purchase."
 }

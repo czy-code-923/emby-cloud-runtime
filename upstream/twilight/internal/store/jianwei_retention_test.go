@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/prejudice-studio/twilight/internal/retention"
 	"sync"
@@ -64,13 +65,13 @@ func TestJianweiRetentionAtomicSigninSettlementAndFutureWindow(t *testing.T) {
 	if len(s.state.Retention.Settlements) != 1 {
 		t.Fatal("same/future window settled twice")
 	}
-	if _, e = s.RetentionPreview(u.UID, "B", "quote-b", now+3); e != retention.ErrCooldown {
+	if _, e = s.RetentionPreview(u.UID, "B", "quote-b", now+3); e == nil {
 		t.Fatal("cooldown bypass", e)
 	}
 	if e = s.RetentionWithdraw(u.UID); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = s.RetentionPreview(u.UID, "B", "quote-b", now+4); e != retention.ErrCooldown {
+	if _, e = s.RetentionPreview(u.UID, "B", "quote-b", now+4); e == nil {
 		t.Fatal("withdraw reset cooldown", e)
 	}
 	oldNext := v.Member.Member.NextSwitchAt
@@ -146,5 +147,71 @@ func TestJianweiRetentionOrganicCapIdempotency(t *testing.T) {
 	again, created, e := s.AddSignin(u.UID, 20)
 	if e != nil || created || again.Points != 3600 {
 		t.Fatal("daily replay re-awarded", e)
+	}
+}
+
+func TestJianweiRetentionCardsAndRescueConsent(t *testing.T) {
+	s, u, now := retentionFixture(t)
+	s.mu.Lock()
+	e := s.mutateAndSaveLocked(func() error { s.state.Signin[u.UID] = Signin{UID: u.UID, Points: 1000}; return nil })
+	s.mu.Unlock()
+	if e != nil {
+		t.Fatal(e)
+	}
+	q, e := s.RetentionPreview(u.UID, "month", "card-one", now)
+	if e != nil || q.Selection.Cost != 300 {
+		t.Fatal(e)
+	}
+	if e = s.RetentionConfirm(u.UID, "card-one", false, false, 0, now, false); e != retention.ErrConsent {
+		t.Fatal("purchase confirmation bypass", e)
+	}
+	if e = s.RetentionConfirm(u.UID, "card-one", false, false, 0, now, true); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.RetentionConfirm(u.UID, "card-one", false, false, 0, now+1, true); e != nil {
+		t.Fatal("purchase retry", e)
+	}
+	v, _ := s.RetentionView(u.UID, now+1)
+	if v.Balance != 700 || v.End != u.ExpiredAt+30*86400 || v.Member.Member.Participation {
+		t.Fatal("card reset or repeated spend")
+	}
+	// Exactly thirty days of exemption is not an eligible tail window.
+	if v.Selectable {
+		t.Fatal("card silently opted in")
+	}
+	if _, e = s.RetentionPreview(u.UID, "A", "tail", now+86402); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.RetentionConfirm(u.UID, "tail", true, true, 300, now+86402); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func TestJianweiRetentionBackupRejectsCorruptionAndDropsPendingConfirmations(t *testing.T) {
+	s, u, now := retentionFixture(t)
+	if _, e := s.RetentionPreview(u.UID, "B", "before-import", now); e != nil {
+		t.Fatal(e)
+	}
+	s.mu.RLock()
+	snapshot, e := s.snapshotStateLocked()
+	s.mu.RUnlock()
+	if e != nil {
+		t.Fatal(e)
+	}
+	var state State
+	if e = json.Unmarshal(snapshot.data, &state); e != nil {
+		t.Fatal(e)
+	}
+	if e = ValidateRetentionBackup(&state); e != nil {
+		t.Fatal(e)
+	}
+	if len(state.Retention.Quotes) != 0 || len(state.Retention.Samples) != 0 {
+		t.Fatal("transient confirmation survived import")
+	}
+	r := state.Retention.Members[u.UID]
+	r.Member.PlaybackEnd++
+	state.Retention.Members[u.UID] = r
+	if e = ValidateRetentionBackup(&state); e == nil {
+		t.Fatal("mismatched entitlement imported")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"github.com/prejudice-studio/twilight/internal/security"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -40,6 +41,18 @@ func (a *App) telegramRedeemLink(ctx context.Context, c telegramCommandCtx, code
 	if !u.Active {
 		_ = a.telegramSendMessage(ctx, c.ChatID, "账户已停用，请联系管理员。")
 		return
+	}
+	lookup := code
+	if strings.HasPrefix(strings.ToUpper(code), "JW-P-") {
+		if digest, err := a.shopDigest("code", strings.ToUpper(code)); err == nil {
+			lookup = digest
+		}
+	}
+	if u.EmbyID != "" {
+		if rc, ok := a.store().RegCode(lookup); ok && (rc.Type == 1 || rc.Type == 3) {
+			_ = a.telegramSendMessage(ctx, c.ChatID, "你已经注册 Emby，账号："+u.EmbyUsername+"。此链接为开通资格，无需重复注册；续期请使用续期码。\n/panel 返回用户面板。")
+			return
+		}
 	}
 	// Reuse the command dispatcher rather than skipping normal command gating.
 	c.Command = "/redeem"

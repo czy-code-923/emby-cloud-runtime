@@ -31,16 +31,34 @@ fi
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 python3 - "$stage" <<'PY'
-import hashlib,json,pathlib,urllib.request,sys
+import hashlib,json,os,pathlib,urllib.request,urllib.error,sys
 repo='czy-code-923/emby-cloud-runtime'
-req=urllib.request.Request('https://api.github.com/repos/'+repo+'/releases/latest',headers={'User-Agent':'emby-cloud-bootstrap'})
-with urllib.request.urlopen(req,timeout=45) as response: release=json.load(response)
-if release['draft'] or release['prerelease']: raise SystemExit('没有可安装的正式版本')
+token=os.environ.get('GITHUB_TOKEN','')
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):return None
+opener=urllib.request.build_opener(NoRedirect())
+def github(url,accept):
+    headers={'User-Agent':'emby-cloud-bootstrap','Accept':accept}
+    if token:headers['Authorization']='Bearer '+token
+    for _ in range(5):
+        try:return opener.open(urllib.request.Request(url,headers=headers),timeout=120)
+        except urllib.error.HTTPError as error:
+            if error.code not in (301,302,303,307,308):raise SystemExit('无法获取正式版本；私有仓库请提供有效的只读 GITHUB_TOKEN') from None
+            target=error.headers.get('Location','')
+            from urllib.parse import urlparse
+            parsed=urlparse(target)
+            if parsed.scheme!='https' or parsed.hostname not in ('release-assets.githubusercontent.com','objects.githubusercontent.com'):raise SystemExit('安装资产跳转来源不正确')
+            url=target;headers={'User-Agent':'emby-cloud-bootstrap','Accept':accept}
+    raise SystemExit('安装资产跳转次数过多')
+with github('https://api.github.com/repos/'+repo+'/releases/latest','application/vnd.github+json') as response:release=json.load(response)
+if release['draft'] or release['prerelease']:raise SystemExit('没有可安装的正式版本')
 asset=next(a for a in release['assets'] if a['name']=='manager.py')
 url='https://github.com/'+repo+'/releases/download/'+release['tag_name']+'/manager.py'
-if asset['browser_download_url']!=url: raise SystemExit('发布来源不匹配')
-with urllib.request.urlopen(url,timeout=45) as response: raw=response.read()
-if len(raw)!=asset['size'] or 'sha256:'+hashlib.sha256(raw).hexdigest()!=asset.get('digest'): raise SystemExit('安装器校验失败')
+if asset['browser_download_url']!=url:raise SystemExit('发布来源不匹配')
+request_url='https://api.github.com/repos/'+repo+'/releases/assets/'+str(asset['id']) if token else url
+response=github(request_url,'application/octet-stream') if token else urllib.request.urlopen(url,timeout=120)
+with response:raw=response.read()
+if len(raw)!=asset['size'] or 'sha256:'+hashlib.sha256(raw).hexdigest()!=asset.get('digest'):raise SystemExit('安装器校验失败')
 (pathlib.Path(sys.argv[1])/'manager.py').write_bytes(raw)
 PY
 python3 "$stage/manager.py" "$action" "$@"

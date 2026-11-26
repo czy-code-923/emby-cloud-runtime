@@ -205,7 +205,7 @@ class Manager:
                 'uninstalled': marker.get('uninstalled', False), 'credentials': self.credentials_status()}
 
     def release_credentials(self):
-        return read_json(self.state/'release-credentials.json', {'revision': 0, 'token': ''})
+        return read_json(self.state/'release-credentials.json', {'revision': 0, 'token': os.environ.get('GITHUB_TOKEN', '')})
 
     def credentials_status(self):
         value = self.release_credentials()

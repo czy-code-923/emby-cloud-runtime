@@ -1,6 +1,6 @@
 # 见微 Emby · Emby Cloud Runtime
 
-**v0.4.3：全量源码、正式安装包、一键安装/卸载和面板升级。**
+**v0.4.10：全量源码、正式安装包、一键安装/卸载和面板升级。**
 
 当前程序提供独立管理后台、Emby、OpenStrm、PostgreSQL、入口隔离、加密备份和发布升级。依据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 持续开发；该方案中的定制保号、交易和24模块总控尚未全部实现，准确范围见 [差距清单](docs/gaps.md)。
 
@@ -61,3 +61,13 @@ curl -fsSL https://raw.githubusercontent.com/czy-code-923/emby-cloud-runtime/mai
 CI在临时环境验证源码/构建、鉴权、恶意源与损坏包拒绝、安装、保留数据升级、健康失败回退、卸载/重装、显式清理和其它容器保留后，才公开发布版本。版本与依赖清单见 [source-manifest.md](docs/source-manifest.md)，实机结果见 [verification.md](docs/verification.md)，使用与恢复说明见 [operations.md](docs/operations.md)。
 
 商店与会员发现的操作和交付边界见 [v0.4.7](docs/v0.4.7-商店与会员发现.md)。
+
+## 私有仓库的新 VPS 安装
+
+已有服务器在“版本与升级”保存本仓库 Contents: Read 的细粒度 Token 后继续使用同一升级流程。新 VPS 先通过官方 GitHub CLI 登录具有仓库读取权限的账户，再运行：
+
+```bash
+gh api -H 'Accept: application/vnd.github.raw+json' repos/czy-code-923/emby-cloud-runtime/contents/install.sh > /tmp/jianwei-install.sh && GITHUB_TOKEN="$(gh auth token)" bash /tmp/jianwei-install.sh
+```
+
+Token 仅在安装进程中使用；后续面板升级凭据通过管理页单独保存，不将凭据写进命令历史或源码。当前支持 Debian/Ubuntu、Linux amd64；ARM64 尚不支持。

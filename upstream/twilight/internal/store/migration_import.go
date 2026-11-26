@@ -207,6 +207,9 @@ func parseMigrationArchive(archive migration.Archive, configuredKey ...string) (
 	if err := ValidateShopBackup(result.state, configuredKey...); err != nil {
 		return parsedMigrationData{}, err
 	}
+	if err := ValidateRetentionBackup(&result.state); err != nil {
+		return parsedMigrationData{}, err
+	}
 	if err := decodeMigrationJSON(files["data/runtime-logs.json"], &result.runtimeLogs); err != nil {
 		return parsedMigrationData{}, fmt.Errorf("invalid runtime logs: %w", err)
 	}

@@ -24,6 +24,8 @@ func retentionError(w http.ResponseWriter, err error) bool {
 		message = "距离上次实际选择或更换尚未满20天"
 	case errors.Is(err, retention.ErrStale), errors.Is(err, store.ErrConflict):
 		message = "确认已过期或账户进度已改变，请重新预览"
+	case errors.Is(err, retention.ErrNotReady), errors.Is(err, store.ErrInsufficientPoints):
+		message = "积分或可信观影尚未达标，本次没有扣分或续期"
 	case errors.Is(err, retention.ErrConsent):
 		message = "请选择明确同意自动扣分及费用上限"
 	case errors.Is(err, retention.ErrRisk):
@@ -53,7 +55,7 @@ func (a *App) handleMemberRetentionPreview(w http.ResponseWriter, r *http.Reques
 	if retentionError(w, err) {
 		return
 	}
-	ok(w, "请核对保号方式与费用", map[string]any{"token": token, "quote": q.Selection})
+	ok(w, "请核对保号方式与费用", map[string]any{"token": token, "quote": q.Selection, "purchase": q.Action != "" && q.Action != "rescue", "rescue": q.Action == "rescue"})
 }
 func (a *App) handleMemberRetentionConfirm(w http.ResponseWriter, r *http.Request, _ Params) {
 	b := decodeMap(r)
@@ -69,8 +71,12 @@ func (a *App) handleMemberRetentionConfirm(w http.ResponseWriter, r *http.Reques
 	if !valid {
 		return
 	}
+	purchase, _, valid := requireStrictBoolValue(w, b, "confirm_purchase")
+	if !valid {
+		return
+	}
 	uid := current(r).User.UID
-	if retentionError(w, a.store().RetentionConfirm(uid, stringValue(b, "token"), risk, consent, int(cap), time.Now().Unix())) {
+	if retentionError(w, a.store().RetentionConfirm(uid, stringValue(b, "token"), risk, consent, int(cap), time.Now().Unix(), purchase)) {
 		return
 	}
 	a.audit(r, "retention_mode_confirmed", "retention", uid, nil)
@@ -222,13 +228,17 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 			return
 		}
 		handler = a.handleMemberRetentionConfirm
-		body = map[string]any{"token": c.Args[0], "acknowledge_risk": true, "authorize_a": true, "cost_cap": 300}
+		body = map[string]any{"token": c.Args[0], "acknowledge_risk": true, "authorize_a": true, "cost_cap": 300, "confirm_purchase": true}
 	} else if len(c.Args) > 0 {
 		if c.Args[0] == "off" {
 			handler = a.handleMemberRetentionWithdraw
 		} else {
 			handler = a.handleMemberRetentionPreview
-			body["mode"] = strings.ToUpper(c.Args[0])
+			mode := c.Args[0]
+			if mode == "a" || mode == "b" {
+				mode = strings.ToUpper(mode)
+			}
+			body["mode"] = mode
 		}
 	}
 	success, message, data := a.invokeMember(ctx, u, handler, body)
@@ -238,6 +248,12 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 		q, _ := d["quote"].(map[string]any)
 		token := asString(d["token"])
 		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分，顺延30天，可随时撤回。B不扣积分。\n下一次可更换时间：%s\n确认120秒内有效。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"], time.Unix(int64(numeric(q["next_switch_at"])), 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04"))
+		if purchase, _ := d["purchase"].(bool); purchase {
+			message = fmt.Sprintf("积分免保号卡 · %s\n本次扣除%v积分，保留当前剩余时长，追加卡券天数并暂停活动自动扣分。\n这是独立的单次交易，不会开启自动购买订阅。确认120秒内有效。", q["target_mode"], q["cost"])
+		}
+		if rescue, _ := d["rescue"].(bool); rescue {
+			message = fmt.Sprintf("明确补救确认\n本次需%v积分，已有可信观影%v秒。成功按原截止顺延30天，已使用的救济时间包含在内。A需本次明确授权，不静默追扣。", q["cost"], q["watch_seconds"])
+		}
 		if risk, _ := q["risk"].(bool); risk {
 			message += fmt.Sprintf("\n临近截止，目标尚有缺口：积分%v / 观影%v秒。切换立即生效，原方式不兜底；到期仍不足则进入收尾与救济。", q["points_shortfall"], q["watch_shortfall"])
 		}
@@ -245,6 +261,13 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 	} else if success && len(c.Args) == 0 && c.Command == "/retention" {
 		if v, e := a.store().RetentionView(u.UID, time.Now().Unix()); e == nil {
 			message = retentionNativeText(v)
+			if v.Policy.Enabled && !v.Member.Member.Permanent && v.Member.Member.PlaybackEnd > 0 {
+				rows = append([][]map[string]any{{{"text": "月卡 · 300积分", "callback_data": "jw:/retention month"}, {"text": "季卡 · 850积分", "callback_data": "jw:/retention quarter"}, {"text": "年卡 · 3000积分", "callback_data": "jw:/retention year"}}}, rows...)
+				if v.Member.Member.Participation && time.Now().Unix() >= v.End && time.Now().Unix() < v.AccessUntil {
+					rows = append([][]map[string]any{{{"text": "查看本窗补救确认", "callback_data": "jw:/retention rescue"}}}, rows...)
+				}
+			}
+
 			if v.Selectable {
 				rows = append([][]map[string]any{{{"text": "A · 签到积分", "callback_data": "jw:/retention A"}, {"text": "B · 观影保号", "callback_data": "jw:/retention B"}}, {{"text": "撤回自动保号参与", "callback_data": "jw:/retention off"}}}, rows...)
 			}
@@ -257,6 +280,6 @@ func handlerNamePreview(command string, args []string) bool {
 }
 func init() {
 	for _, name := range []string{"retention", "retention_confirm"} {
-		telegramCommandRegistry["/"+name] = telegramCommandSpec{name: name, label: "/" + name, description: "查看与选择签到或观影保号", usage: "/retention [A|B|off]", category: "user", order: 45, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramRetention(ctx, c) }}
+		telegramCommandRegistry["/"+name] = telegramCommandSpec{name: name, label: "/" + name, description: "查看与选择签到或观影保号", usage: "/retention [A|B|off|month|quarter|year|rescue]", category: "user", order: 45, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramRetention(ctx, c) }}
 	}
 }

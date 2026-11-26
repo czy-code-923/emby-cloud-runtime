@@ -28,8 +28,14 @@ type RetentionMember struct {
 	QualifiedAt     int64            `json:"qualified_at"`
 }
 type RetentionQuote struct {
-	UID       int64               `json:"uid"`
-	Selection retention.Selection `json:"selection"`
+	UID            int64               `json:"uid"`
+	Selection      retention.Selection `json:"selection"`
+	Action         string              `json:"action,omitempty"`
+	Version        int64               `json:"version,omitempty"`
+	Balance        int                 `json:"balance,omitempty"`
+	Watch          int64               `json:"watch,omitempty"`
+	End            int64               `json:"end,omitempty"`
+	PolicyRevision int64               `json:"policy_revision,omitempty"`
 }
 type RetentionLedger struct {
 	retention.Settlement
@@ -248,6 +254,21 @@ func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (Re
 		r := s.retentionMemberLocked(u)
 		p := r.Policy
 		p.Enabled = s.state.Retention.Policy.Enabled
+		if target == "month" || target == "quarter" || target == "year" || target == "rescue" {
+			var err error
+			quote, err = s.retentionSpecialPreviewLocked(u, r, p, target, now)
+			if err != nil {
+				return err
+			}
+			for id, q := range s.state.Retention.Quotes {
+				if q.UID == uid || q.Selection.ExpiresAt <= now {
+					delete(s.state.Retention.Quotes, id)
+				}
+			}
+			s.state.Retention.Quotes[token] = quote
+			s.state.Retention.Members[uid] = r
+			return nil
+		}
 		selection, err := retention.Preview(r.Member, retention.Wallet{Balance: s.state.Signin[uid].Points}, s.retentionProgressLocked(r, now), p, target, now)
 		if err != nil {
 			return err
@@ -264,13 +285,16 @@ func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (Re
 	})
 	return quote, err
 }
-func (s *Store) RetentionConfirm(uid int64, token string, risk, consent bool, cap int, now int64) error {
+func (s *Store) RetentionConfirm(uid int64, token string, risk, consent bool, cap int, now int64, purchase ...bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mutateAndSaveLocked(func() error {
 		s.state.Retention.ensure()
 		q, ok := s.state.Retention.Quotes[token]
 		if !ok || q.UID != uid {
+			if ledger, ok := s.state.Retention.Settlements["card:"+token]; ok && ledger.UID == uid {
+				return errNoChange
+			}
 			return retention.ErrStale
 		}
 		u, ok := s.state.Users[uid]
@@ -280,6 +304,14 @@ func (s *Store) RetentionConfirm(uid int64, token string, risk, consent bool, ca
 		r := s.retentionMemberLocked(u)
 		p := r.Policy
 		p.Enabled = s.state.Retention.Policy.Enabled
+		if q.Action != "" {
+			confirmed := len(purchase) > 0 && purchase[0]
+			if err := s.retentionSpecialConfirmLocked(u, r, p, q, token, risk, consent, cap, confirmed, now); err != nil {
+				return err
+			}
+			delete(s.state.Retention.Quotes, token)
+			return nil
+		}
 		m, err := retention.Confirm(r.Member, retention.Wallet{Balance: s.state.Signin[uid].Points}, s.retentionProgressLocked(r, now), p, q.Selection, risk, consent, cap, now)
 		if err != nil {
 			return err
