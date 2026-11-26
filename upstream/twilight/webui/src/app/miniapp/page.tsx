@@ -3,7 +3,7 @@ import {PointsShop,ShopLoginCode,LiveService,MemberOrders} from "./points-shop";
 import Script from "next/script";
 import Image from "next/image";
 import { useCallback, useState, useRef, type ReactNode, type FormEvent } from "react";
-import { Film, Sparkles, Ticket, Compass, UserRound, RefreshCw, ShoppingBag, Check, Users, Clapperboard, ArrowUpRight, ShieldCheck } from "lucide-react";
+import { Film, Sparkles, Ticket, Smartphone, Compass, UserRound, RefreshCw, ShoppingBag, Check, Users, Clapperboard, ArrowUpRight, ShieldCheck } from "lucide-react";
 import { api } from "@/lib/api";
 import type { MiniAccount } from "@/lib/api-types";
 import { useAsyncResource } from "@/hooks/use-async-resource";
