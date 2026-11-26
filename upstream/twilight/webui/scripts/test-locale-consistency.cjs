@@ -61,3 +61,21 @@ test("new i18n keys exist in all four catalogs", () => {
     for (const key of keys) assert.ok(typeof catalog[key] === "string" && catalog[key], `${name}: missing ${key}`);
   }
 });
+
+// Runtime lookup traverses nested objects; literal dotted property names never resolve.
+test("catalog keys resolve through the runtime dotted-path lookup", () => {
+  for (const name of ["basic.json", "zh-Hans.json", "zh-Hant.json", "en-US.json"]) {
+    const catalog = load(name);
+    function verifyTree(node, prefix = "") {
+      for (const [key, value] of Object.entries(node)) {
+        assert.ok(!key.includes("."), `${name}: literal dotted key ${prefix}${key}`);
+        if (value && typeof value === "object") verifyTree(value, `${prefix}${key}.`);
+      }
+    }
+    verifyTree(catalog);
+    for (const key of ["retention.title", "retention.policy", "retention.purchaseConsent", "adminRegcodes.copyRedeemLink"]) {
+      const value = key.split(".").reduce((node, part) => node?.[part], catalog);
+      assert.ok(typeof value === "string" && value, `${name}: runtime cannot resolve ${key}`);
+    }
+  }
+});

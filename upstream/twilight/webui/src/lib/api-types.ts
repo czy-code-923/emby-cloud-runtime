@@ -972,7 +972,7 @@ export interface Regcode {
   created_at: string;
   created_time?: number; // 创建时间戳（兼容字段）
   used_at?: string;
-  source?: "admin" | "invite"; // 来源：admin=管理员创建, invite=邀请系统生成
+  source?: "admin" | "invite" | "commerce"; // 来源：admin=管理员创建, invite=邀请系统生成, commerce=订单定向卡码
   creator_uid?: number; // 创建者 UID
   creator_username?: string; // 创建者用户名
   paused_seconds?: number; // 累计暂停时长（秒）
