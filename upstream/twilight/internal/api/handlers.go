@@ -1909,7 +1909,7 @@ func (a *App) handleEmbyURLs(w http.ResponseWriter, r *http.Request, _ Params) {
 		return
 	}
 	// Expired normal user: hide URLs regardless of whether account is active
-	if u.Role == store.RoleNormal && u.ExpiredAt > 0 && u.ExpiredAt < time.Now().Unix() {
+	if u.Role == store.RoleNormal && embyAccessExpired(u) {
 		ok(w, "OK", map[string]any{"lines": []any{}, "whitelist_lines": []any{}, "requires_emby_account": false, "requires_renewal": true, "emby_disabled_by_expiry": true})
 		return
 	}

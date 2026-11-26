@@ -78,6 +78,7 @@ type mediaIdentityCache struct {
 }
 type mediaIdentityEntry struct {
 	id          string
+	device      string
 	until       time.Time
 	policyStamp string
 }
@@ -183,7 +184,7 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 			fail(w, 403, "Emby 服务器管理员请使用安全入口；播放请使用普通媒体账户")
 			return
 		}
-		entry = mediaIdentityEntry{id: asString(remote["Id"]), until: time.Now().Add(15 * time.Second), policyStamp: entry.policyStamp}
+		entry = mediaIdentityEntry{id: asString(remote["Id"]), until: time.Now().Add(15 * time.Second), policyStamp: entry.policyStamp, device: entry.device}
 		if entry.id == "" {
 			fail(w, 401, "无法验证媒体账户")
 			return
@@ -199,6 +200,12 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 	if !found || !u.Active || u.EmbyDisabled || !a.embyShouldEnableUser(u) {
 		fail(w, 403, "媒体账户未开通或已停用")
 		return
+	}
+	// Image/subtitle requests from native clients often carry only api_key.
+	// Reuse only a device already admitted with this verified token; a fresh
+	// token without device enrollment still cannot claim a device slot.
+	if device == "" {
+		device = entry.device
 	}
 	devices, streams := mediaLimits(a.cfg(), u)
 	stamp := fmt.Sprintf("%d:%d:%v", u.UID, streams, a.cfg().MediaLimitsEnabled)
@@ -239,6 +246,12 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 			fail(w, 403, "已达到设备上限，请在见微面板释放旧设备或联系管理员")
 			return
 		}
+	}
+	if device != "" && entry.device != device {
+		entry.device = device
+		cache.mu.Lock()
+		cache.items[key] = entry
+		cache.mu.Unlock()
 	}
 	w.WriteHeader(204)
 }

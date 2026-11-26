@@ -1083,7 +1083,7 @@ func configSectionDefs() []configSectionDef {
 			{Key: "emby_url_list", Label: "普通线路", Type: "list", Description: "格式：名称 : URL"},
 			{Key: "emby_url_list_for_whitelist", Label: "白名单线路", Type: "list", Description: "管理员和白名单用户可见线路"},
 			{Key: "emby_stats_enabled", Label: "Emby库统计", Type: "bool", Description: "在首页仪表盘 Emby 卡片显示电影/剧集/集数统计"},
-			{Key: "emby_public_url", Label: "Emby 公开地址", Type: "string", Description: "浏览器侧访问 Emby 的地址；留空则使用后端地址"},
+			{Key: "emby_public_url", Label: "Emby 客户端普通播放地址", Type: "string", Description: "例如 https://jwemby.iczy.top；供 Emby 客户端登录与播放，不是网页管理地址。留空不公布默认线路。"},
 			{Key: "emby_whitelist_url", Label: "白名单单线路地址", Type: "string", Description: "仅管理员与白名单用户可见的单一线路地址；留空则只使用上面的白名单线路列表"},
 			{Key: "play_rank_enabled", Label: "播放排行榜", Type: "bool", Description: "启用 Emby 播放日榜/周榜；关闭后除管理员后台外全部拒绝访问"},
 			{Key: "play_rank_user_visible", Label: "排行榜对普通用户开放", Type: "bool", Description: "普通用户可在侧边栏入口查看脱敏后的排行榜（用户名打码）；未登录访客无任何入口"},

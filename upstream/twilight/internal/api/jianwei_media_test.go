@@ -176,8 +176,14 @@ func TestJianweiGatewayAuthAndQuota(t *testing.T) {
 	if streamLimit.Load() != 2 {
 		t.Fatal("native stream policy not applied")
 	}
+	if request(secret, "fixture-token", "", "/Items/poster/Images/Primary?api_key=fixture-token", "GET") != 204 {
+		t.Fatal("admitted client image request lost its device association")
+	}
 	if request(secret, "fixture-token", "two", "/Items", "GET") != 403 {
 		t.Fatal("second device exceeded quota")
+	}
+	if request(secret, "fixture-token", "", "/Items/poster/Images/Primary?api_key=fixture-token", "GET") != 204 {
+		t.Fatal("rejected second device corrupted admitted device association")
 	}
 	a.cfg().MediaLimitsEnabled = false
 	if request(secret, "fixture-token", "one", "/Items", "GET") != 204 || streamLimit.Load() != 0 {

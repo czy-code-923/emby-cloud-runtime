@@ -269,7 +269,10 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 			}
 
 			if v.Selectable {
-				rows = append([][]map[string]any{{{"text": "A · 签到积分", "callback_data": "jw:/retention A"}, {"text": "B · 观影保号", "callback_data": "jw:/retention B"}}, {{"text": "撤回自动保号参与", "callback_data": "jw:/retention off"}}}, rows...)
+				rows = append([][]map[string]any{{{"text": "A · 签到积分", "callback_data": "jw:/retention A"}, {"text": "B · 观影保号", "callback_data": "jw:/retention B"}}}, rows...)
+			}
+			if v.Member.Member.Participation {
+				rows = append([][]map[string]any{{{"text": "撤回自动保号参与", "callback_data": "jw:/retention off"}}}, rows...)
 			}
 		}
 	}

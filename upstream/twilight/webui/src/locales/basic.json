@@ -3895,5 +3895,6 @@
   "retention.quarter": "90-day exempt card",
   "retention.year": "365-day exempt card",
   "retention.rescue": "Review window rescue",
-  "retention.purchaseConsent": "I confirm this one-time points purchase. Remaining time is preserved and activity participation is paused. This does not enable a recurring purchase."
+  "retention.purchaseConsent": "I confirm this one-time points purchase. Remaining time is preserved and activity participation is paused. This does not enable a recurring purchase.",
+  "adminRegcodes.copyRedeemLink": "Copy Telegram redemption link"
 }

@@ -353,6 +353,11 @@ export default function AdminRegcodesPage() {
     }
   };
 
+  const redemptionLink = (code:Regcode) => {
+    const bot=(systemInfo?.telegram_bot?.username||"").replace(/^@/,"");
+    if(!/^[A-Za-z0-9_]{5,32}$/.test(bot)||!/^[A-Za-z0-9_-]{1,57}$/.test(code.code)||code.source==="commerce")return "";
+    return `https://t.me/${bot}?start=redeem_${code.code}`;
+  };
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
     toast({ title: t("common.copiedToClipboard") });
@@ -1475,7 +1480,7 @@ export default function AdminRegcodesPage() {
                         onClick={() => copyToClipboard(code.code)}
                       >
                         <Copy className="h-3.5 w-3.5" />
-                      </Button>
+                      </Button>{redemptionLink(code)&&<Button size="icon" variant="ghost" className="h-8 w-8" aria-label={t("adminRegcodes.copyRedeemLink")} title={t("adminRegcodes.copyRedeemLink")} onClick={()=>copyToClipboard(redemptionLink(code))}><Link2 className="h-3.5 w-3.5"/></Button>}
                       <Button
                         size="icon"
                         variant="ghost"
@@ -1628,7 +1633,7 @@ export default function AdminRegcodesPage() {
                             onClick={() => copyToClipboard(code.code)}
                           >
                             <Copy className="h-3 w-3" />
-                          </Button>
+                          </Button>{redemptionLink(code)&&<Button size="icon" variant="ghost" className="h-8 w-8" aria-label={t("adminRegcodes.copyRedeemLink")} title={t("adminRegcodes.copyRedeemLink")} onClick={()=>copyToClipboard(redemptionLink(code))}><Link2 className="h-3.5 w-3.5"/></Button>}
                         </div>
                       </td>
                       <td className="px-4 py-3 align-top">

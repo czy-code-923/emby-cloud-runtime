@@ -3911,5 +3911,6 @@
   "retention.quarter": "90天免保号卡",
   "retention.year": "365天免保号卡",
   "retention.rescue": "预览本窗补救",
-  "retention.purchaseConsent": "我确认本次单次扣分购买免保号卡，保留剩余时长并暂停活动参与；不会启用自动购买订阅。"
+  "retention.purchaseConsent": "我确认本次单次扣分购买免保号卡，保留剩余时长并暂停活动参与；不会启用自动购买订阅。",
+  "adminRegcodes.copyRedeemLink": "复制 Telegram 兑换链接"
 }
