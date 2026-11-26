@@ -4017,6 +4017,7 @@
     "myOrders": "我的卡码",
     "myOrdersHelp": "仅显示本人最近20笔订单；未使用的已发卡码可继续兑换。",
     "noOrders": "暂无订单",
-    "unavailable": "暂不可用"
+    "unavailable": "暂不可用",
+    "copyHelp": "当前客户端未能复制，请长按上方登录码复制。"
   }
 }

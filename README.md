@@ -1,6 +1,6 @@
 # 见微 Emby · Emby Cloud Runtime
 
-**v0.5.0：事故补偿、钱包冻结、来源退款对账、24模块总控与会员操作整合。**
+**v0.5.1：事故补偿、钱包冻结、来源退款对账、24模块总控与会员操作整合。**
 
 当前程序提供独立管理后台、Emby、OpenStrm、PostgreSQL、入口隔离、加密备份和发布升级。依据 [emby-cloud-plan v8.1](https://github.com/czy-code-923/emby-cloud-plan) 持续开发；会员 A/B 保号、人工核款发卡、共享钱包冻结、事故保护/补偿、来源权益退款和24模块配置总控已集成。自动下载追新、外部游戏与异地服务适配仍需独立建设，准确范围见 [逐项验收](docs/acceptance-v0.5.0.md) 和 [差距清单](docs/gaps.md)。
 
