@@ -41,7 +41,7 @@ def main():
   if status not in (200,204):raise RuntimeError('Emby name update was not confirmed')
  info=manager.status();state=network.status()
  report={'version':info['installed_version'],'job_phase':info['job'].get('phase'),'configuration':{},'entrances':{},'private_ports':{}}
- for section,keys in {'Global':['admin_only','public_base_url','commerce_store_url'],'Telegram':['mini_app_url','shop_enabled','banner_enabled','auto_provision'],'Emby':['emby_public_url'],'SAR':['signin_enabled','signin_auto_renewal_enabled','emby_user_limit'],'MediaRequest':['enabled'],'Database':['migration_panel_enabled']}.items():
+ for section,keys in {'Global':['admin_only','public_base_url','commerce_store_url'],'Telegram':['mini_app_url','shop_enabled','banner_enabled','auto_provision'],'Emby':['emby_public_url'],'SAR':['signin_enabled','signin_auto_renewal_enabled','emby_user_limit'],'MediaRequest':['enabled'],'Database':['migration_panel_enabled'],'DeviceLimit':['media_limits_enabled','media_normal_devices','media_normal_streams','media_whitelist_devices','media_whitelist_streams','media_admin_devices','media_admin_streams']}.items():
   report['configuration'][section]={k:cfg.get(section,{}).get(k) for k in keys}
  for profile,s in state['profiles'].items():
   host=s['applied'].get('domain');entry={'host':host,'certificate_days':(s.get('active_certificate') or {}).get('days_remaining'),'admin_exposed':s['applied'].get('admin_exposed')}
@@ -55,6 +55,9 @@ def main():
   result=subprocess.run(['ss','-ltnH','sport = :'+str(port)],capture_output=True,text=True,timeout=10)
   lines=result.stdout.splitlines();report['private_ports'][port]=bool(lines) and all('127.0.0.1:'+str(port) in line for line in lines)
  status,body=http('http://127.0.0.1:18096/System/Info/Public');report['emby']={'http':status,'name':json.loads(body).get('ServerName') if status==200 else ''}
+ status,body=http('http://127.0.0.1:18096/Users',token)
+ if status==200:
+  report['media_users']=[{'name':u.get('Name'),'administrator':u.get('Policy',{}).get('IsAdministrator'),'disabled':u.get('Policy',{}).get('IsDisabled'),'stream_limit':u.get('Policy',{}).get('SimultaneousStreamLimit')} for u in json.loads(body)]
  report['automatic_renewal']=state['automatic_renewal']
  print(json.dumps(report,ensure_ascii=False,indent=2),flush=True)
 
