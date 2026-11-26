@@ -180,7 +180,8 @@ func (a *App) handleCreateMediaRequest(w http.ResponseWriter, r *http.Request, _
 		}
 		mediaInfo["inventory_checked"] = true
 	}
-	if mediaID == 0 {
+	if mediaID <= 0 {
+		mediaInfo["manual_title_only"] = true
 		mediaID = int64(time.Now().UnixNano())
 	}
 
@@ -279,7 +280,7 @@ func mediaRequestAdminGroupDTO(group store.MediaRequestGroup, users map[int64]st
 
 func validMediaRequestAdminFilter(filter string) bool {
 	switch strings.ToLower(strings.TrimSpace(filter)) {
-	case "all", "active", "pending", "unhandled", "accepted", "downloading", "rejected", "completed":
+	case "all", "active", "pending", "unhandled", "accepted", "downloading", "rejected", "completed", "failed":
 		return true
 	default:
 		return false
@@ -312,6 +313,10 @@ func mediaRequestUserForDTO(st *store.Store, req store.MediaRequest) *store.User
 }
 
 func failMediaRequestMutation(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, store.ErrMediaRequestProgressManaged) {
+		failWithCode(w, 409, ErrMediaRequestConflict, "该求片由工作器同步进度；管理员可审核、拒绝或在失败后重新排队")
+		return true
+	}
 	if errors.Is(err, store.ErrConflict) {
 		failWithCode(w, http.StatusConflict, ErrMediaRequestConflict, "求片已被其他操作更新，请刷新后重试")
 		return true

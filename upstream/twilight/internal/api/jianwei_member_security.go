@@ -1,8 +1,10 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/prejudice-studio/twilight/internal/security"
@@ -12,19 +14,35 @@ import (
 var memberSecurityCodePattern = regexp.MustCompile(`^[0-9]{6,12}$`)
 
 func (a *App) verifyMemberSecurityCode(w http.ResponseWriter, r *http.Request, u store.User, code string) bool {
-	if !a.allowRate(r.Context(), rateKey("member-security:", u.UID), 5, 5*time.Minute) {
-		fail(w, 429, "安全码验证过于频繁，请5分钟后重试")
-		return false
-	}
 	if u.SecurityCodeHash == "" {
 		fail(w, 409, "请先设置安全码")
 		return false
 	}
-	if !memberSecurityCodePattern.MatchString(code) || !security.VerifyPassword(code, u.SecurityCodeHash) {
-		fail(w, 403, "安全码不正确")
+	now := time.Now().Unix()
+	if u.MemberSecurityAttempts.LockedUntil > now {
+		memberSecurityCooldown(w, u.MemberSecurityAttempts.LockedUntil-now)
+		return false
+	}
+	valid := memberSecurityCodePattern.MatchString(code) && security.VerifyPassword(code, u.SecurityCodeHash)
+	retry, err := a.store().CheckMemberSecurityResult(u.UID, u.SecurityCodeHash, valid, now)
+	if err != nil {
+		fail(w, 409, "安全设置已变化，请刷新后重新验证")
+		return false
+	}
+	if retry > 0 {
+		memberSecurityCooldown(w, retry)
+		return false
+	}
+	if !valid {
+		failWithCode(w, 403, ErrForbidden, "安全码不正确；连续错误5次将冷却5分钟")
 		return false
 	}
 	return true
+}
+
+func memberSecurityCooldown(w http.ResponseWriter, seconds int64) {
+	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	failWithCodeData(w, 429, ErrRateLimited, fmt.Sprintf("安全码连续验证错误，请%d秒后重试", seconds), map[string]any{"retry_after_seconds": seconds})
 }
 
 func (a *App) handleMemberSecurityCode(w http.ResponseWriter, r *http.Request, _ Params) {
@@ -56,13 +74,14 @@ func (a *App) handleMemberSecurityCode(w http.ResponseWriter, r *http.Request, _
 			return store.ErrConflict
 		}
 		next.SecurityCodeHash = hash
+		next.MemberSecurityAttempts = store.MemberSecurityAttempts{}
 		return nil
 	})
 	if statusFromError(w, err) {
 		return
 	}
 	a.audit(r, "member_security_code_changed", "user", u.UID, nil)
-	ok(w, "安全码已保存，请勿与 Emby 密码相同", nil)
+	ok(w, "安全码已保存，请立即备份到安全位置；系统不会显示原安全码，请勿与Emby密码相同", nil)
 }
 
 func (a *App) handleMemberPassword(w http.ResponseWriter, r *http.Request, _ Params) {
@@ -85,7 +104,7 @@ func (a *App) handleMemberPassword(w http.ResponseWriter, r *http.Request, _ Par
 	}
 	// This member channel uses Telegram identity + the security code. Any
 	// separately enabled email verification remains mandatory.
-	if !a.consumePasswordChangeEmailCode(w, body, u, emailPurposeChangeEmby) {
+	if a.memberPasswordEmailRequired(u) && !a.consumePasswordChangeEmailCode(w, body, u, emailPurposeChangeEmby) {
 		return
 	}
 	if err := a.embySetPassword(r.Context(), u.EmbyID, password); err != nil {
@@ -93,7 +112,7 @@ func (a *App) handleMemberPassword(w http.ResponseWriter, r *http.Request, _ Par
 		return
 	}
 	a.audit(r, "change_emby_password", "user", u.UID, map[string]any{"method": "telegram_security_code"})
-	ok(w, "Emby 密码已更新", nil)
+	ok(w, "Emby密码已更新，请立即保存到密码管理器；系统无法再次显示原密码", nil)
 }
 
 func (a *App) handleAdminResetMemberSecurity(w http.ResponseWriter, r *http.Request, p Params) {
@@ -109,7 +128,11 @@ func (a *App) handleAdminResetMemberSecurity(w http.ResponseWriter, r *http.Requ
 		fail(w, 400, "无效用户")
 		return
 	}
-	_, err = a.store().UpdateUser(uid, func(u *store.User) error { u.SecurityCodeHash = ""; return nil })
+	_, err = a.store().UpdateUser(uid, func(u *store.User) error {
+		u.SecurityCodeHash = ""
+		u.MemberSecurityAttempts = store.MemberSecurityAttempts{}
+		return nil
+	})
 	if statusFromError(w, err) {
 		return
 	}
@@ -119,7 +142,7 @@ func (a *App) handleAdminResetMemberSecurity(w http.ResponseWriter, r *http.Requ
 
 func (a *App) handleMemberPasswordEmail(w http.ResponseWriter, r *http.Request, _ Params) {
 	user := current(r).User
-	if !a.passwordChangeEmailRequired(user, emailPurposeChangeEmby) {
+	if !a.memberPasswordEmailRequired(user) {
 		fail(w, 409, "此账户无需邮箱验证码")
 		return
 	}
@@ -156,4 +179,10 @@ func (a *App) handleAdminResetMediaDevices(w http.ResponseWriter, r *http.Reques
 	a.mediaIdentity.mu.Unlock()
 	a.audit(r, "admin_reset_media_devices", "admin", uid, nil)
 	ok(w, "登记与停用记录已清除，设备将在下次访问时重新登记", nil)
+}
+
+// Telegram identity and the security code remain mandatory. Email proof is
+// added only when the member actually has a verified email address.
+func (a *App) memberPasswordEmailRequired(user store.User) bool {
+	return user.EmailVerified && user.Email != "" && a.passwordChangeEmailRequired(user, emailPurposeChangeEmby)
 }

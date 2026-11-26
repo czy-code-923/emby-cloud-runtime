@@ -88,11 +88,12 @@ func (a *App) memberAccount(user store.User) map[string]any {
 		"uid": user.UID, "username": user.Username, "emby_username": user.EmbyUsername,
 		"media_enabled": user.EmbyID != "" && !user.EmbyDisabled && a.embyShouldEnableUser(user), "has_emby": user.EmbyID != "",
 		"expired_at": publicExpiryUnix(user.ExpiredAt), "points": a.store().Wallet(user.UID).Available, "wallet": a.store().Wallet(user.UID), "role_label": memberRoleName(user.Role), "avatar": miniAvatarURL(user),
+		"email_enabled": emailConfigured(cfg), "email_verified": user.EmailVerified, "email_masked": maskEmail(user.Email),
 		"signin_enabled": cfg.SigninEnabled, "last_signin": si.LastSignin,
 		"can_register":   user.EmbyID == "" && (user.PendingEmby || cfg.EmbyDirectRegisterEnabled),
 		"invite_enabled": cfg.InviteEnabled, "requests_enabled": cfg.MediaRequestEnabled,
 		"banner_image": publicHTTPSURL(cfg.TelegramBannerImageURL), "shop_url": shop, "banner": banner, "banner_url": bannerURL,
-		"signin": a.signinPagePayload(user, 12), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.passwordChangeEmailRequired(user, emailPurposeChangeEmby),
+		"signin": a.signinPagePayload(user, 12), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.memberPasswordEmailRequired(user),
 	}
 }
 
@@ -100,15 +101,12 @@ func (a *App) handleMemberMediaRequests(w http.ResponseWriter, r *http.Request, 
 	if a.requireMediaRequestEnabled(w) {
 		return
 	}
-	requests := a.store().ListMediaRequests(current(r).User.UID, false)
-	items := make([]map[string]any, 0, 30)
-	for _, item := range requests {
-		if len(items) >= 30 {
-			break
-		}
+	result := a.store().ListMediaRequestsPageWithOptions(store.MediaRequestListOptions{UID: current(r).User.UID, StatusFilter: "all", Page: clamp(queryInt(r, "page", 1), 1, 1000), PerPage: 12})
+	items := make([]map[string]any, 0, len(result.Requests))
+	for _, item := range result.Requests {
 		items = append(items, mediaRequestUserDTO(item))
 	}
-	ok(w, "OK", map[string]any{"items": items, "total": len(requests)})
+	ok(w, "OK", map[string]any{"items": items, "total": result.Total, "page": result.Page, "has_next": result.HasNext})
 }
 
 func (a *App) handleMemberInvite(w http.ResponseWriter, r *http.Request, _ Params) {
@@ -144,13 +142,19 @@ func (a *App) handleMemberCreateRequest(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	clean := map[string]any{"title": title, "note": truncateString(stringValue(payload, "note"), 1000)}
+	for _, key := range []string{"source", "media_id", "media_type", "season", "year", "media_info", "original_title"} {
+		if value, ok := payload[key]; ok {
+			clean[key] = value
+		}
+	}
+
 	raw, _ := json.Marshal(clean)
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	a.handleCreateMediaRequest(w, r, p)
 }
 
 func miniAvatarURL(u store.User) string {
-	if u.Avatar != "" {
+	if u.Avatar != "" || u.TelegramID > 0 {
 		return "/api/v2/miniapp/avatar"
 	}
 	return ""

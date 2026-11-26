@@ -92,12 +92,12 @@ func (a *App) handleMiniAvatar(w http.ResponseWriter, r *http.Request, _ Params)
 	u := current(r).User
 	name := filepath.Base(u.Avatar)
 	if !uploadFilenamePattern.MatchString(name) || u.Avatar != "/api/v1/users/assets/avatar/"+name {
-		http.NotFound(w, r)
+		a.handleMiniTelegramAvatar(w, r)
 		return
 	}
 	file, valid := resolveUploadAssetPath(a.cfg().UploadDir, "avatar", name)
 	if !valid {
-		http.NotFound(w, r)
+		a.handleMiniTelegramAvatar(w, r)
 		return
 	}
 	// This URL identifies the current viewer, never an immutable shared asset.

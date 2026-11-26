@@ -46,6 +46,7 @@ func cloneSchedulerRun(run SchedulerRun) SchedulerRun {
 }
 
 func cloneMediaRequest(r MediaRequest) MediaRequest {
+	r.Tracking.Events = cloneSlice(r.Tracking.Events)
 	if r.MediaInfo != nil {
 		info := make(map[string]any, len(r.MediaInfo))
 		for k, v := range r.MediaInfo {

@@ -20,9 +20,10 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 	// 天数"预言机，吞吐量是全局 IP 桶（最高 1200/min）而非 regcode-check/invite-check
 	// 专用的 10~20/min，等于绕过了那两个端点刻意设置的枚举防护。
 	// 双桶：per-IP 挡单机扫描与"多账号并发刷同一码空间"，per-UID 挡单账号轮换 IP。
-	if !a.allowRate(r.Context(), rateKey("use-code:ip:", a.clientIP(r)), 10, time.Minute) ||
-		!a.allowRate(r.Context(), rateKey("use-code:uid:", strconv.FormatInt(p.User.UID, 10)), 10, time.Minute) {
-		failWithCode(w, http.StatusTooManyRequests, ErrRateLimited, "请求过于频繁，请稍后再试")
+	if !a.allowRate(r.Context(), rateKey("use-code:ip:", a.clientIP(r)), 20, time.Minute) ||
+		!a.allowRate(r.Context(), rateKey("use-code:uid:", strconv.FormatInt(p.User.UID, 10)), 20, time.Minute) {
+		w.Header().Set("Retry-After", "60")
+		failWithCodeData(w, http.StatusTooManyRequests, ErrRateLimited, "卡码尝试过于频繁，每分钟最多20次，请60秒后重试", map[string]any{"retry_after_seconds": 60})
 		return
 	}
 	payload := decodeMap(r)
@@ -308,7 +309,7 @@ func codePreview(source string, codeType int, days int, inviter string) map[stri
 }
 
 func (a *App) handleRegcodeCheck(w http.ResponseWriter, r *http.Request, _ Params) {
-	if !a.allowRate(r.Context(), rateKey("regcode-check:", a.clientIP(r)), 10, time.Minute) {
+	if !a.allowRate(r.Context(), rateKey("regcode-check:", a.clientIP(r)), 20, time.Minute) {
 		failWithCode(w, http.StatusTooManyRequests, ErrRateLimited, "请求过于频繁，请稍后再试")
 		return
 	}

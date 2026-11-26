@@ -14,6 +14,7 @@ const (
 	MediaRequestStatusRejected    = "REJECTED"
 	MediaRequestStatusCompleted   = "COMPLETED"
 	MediaRequestStatusDownloading = "DOWNLOADING"
+	MediaRequestStatusFailed      = "FAILED"
 )
 
 type MediaRequestCreateOptions struct {
@@ -95,6 +96,8 @@ func NormalizeMediaRequestStatus(status string) string {
 		return MediaRequestStatusRejected
 	case "completed", "complete", "done":
 		return MediaRequestStatusCompleted
+	case "failed", "error":
+		return MediaRequestStatusFailed
 	case "downloading", "download":
 		return MediaRequestStatusDownloading
 	default:
@@ -112,6 +115,8 @@ func MediaRequestAdminStatus(status string) string {
 		return "rejected"
 	case MediaRequestStatusCompleted:
 		return "completed"
+	case MediaRequestStatusFailed:
+		return "failed"
 	case MediaRequestStatusDownloading:
 		return "downloading"
 	default:
@@ -148,6 +153,8 @@ func MediaRequestStatusText(status string) string {
 		return "已拒绝"
 	case MediaRequestStatusCompleted:
 		return "已完成"
+	case MediaRequestStatusFailed:
+		return "处理失败"
 	case MediaRequestStatusDownloading:
 		return "正在下载"
 	default:
@@ -200,7 +207,7 @@ func (s *Store) ListMediaRequestsPageWithOptions(opts MediaRequestListOptions) M
 	var top mediaRequestIDMinHeap
 	counts := map[string]int{
 		"all": 0, "active": 0, "pending": 0, "accepted": 0,
-		"downloading": 0, "rejected": 0, "completed": 0,
+		"downloading": 0, "rejected": 0, "completed": 0, "failed": 0,
 	}
 	total := 0
 	heapReady := false
@@ -301,7 +308,7 @@ func (s *Store) ListMediaRequestGroupsPageWithOptions(opts MediaRequestListOptio
 	defer s.mu.RUnlock()
 	counts := map[string]int{
 		"all": 0, "active": 0, "pending": 0, "accepted": 0,
-		"downloading": 0, "rejected": 0, "completed": 0,
+		"downloading": 0, "rejected": 0, "completed": 0, "failed": 0,
 	}
 	groupMap := make(map[string][]MediaRequest)
 	requestTotal := 0
@@ -436,6 +443,9 @@ func (s *Store) UpdateMediaRequestStatusIfRevision(id int64, rawStatus string, a
 		if expectedRevision != nil && r.Revision != *expectedRevision {
 			return ErrConflict
 		}
+		if !manualMediaRequestStatusAllowed(r, status) {
+			return ErrMediaRequestProgressManaged
+		}
 		applyMediaRequestStatusUpdate(&r, status, adminNote, replaceNote)
 		s.state.MediaRequests[id] = r
 		updated = r
@@ -464,6 +474,9 @@ func (s *Store) UpdateMediaRequestStatusByKey(key, rawStatus, adminNote string, 
 		}
 		if expectedRevision != nil && current.Revision != *expectedRevision {
 			return ErrConflict
+		}
+		if !manualMediaRequestStatusAllowed(current, status) {
+			return ErrMediaRequestProgressManaged
 		}
 		applyMediaRequestStatusUpdate(&current, status, adminNote, replaceNote)
 		s.state.MediaRequests[id] = current
@@ -521,6 +534,9 @@ func (s *Store) UpdateMediaRequestsStatusByKey(items []MediaRequestBatchItem, ra
 			if item.Revision != nil && target.request.Revision != *item.Revision {
 				return ErrConflict
 			}
+			if !manualMediaRequestStatusAllowed(target.request, status) {
+				return ErrMediaRequestProgressManaged
+			}
 		}
 		for _, item := range items {
 			target := targets[strings.TrimSpace(item.RequireKey)]
@@ -541,6 +557,17 @@ func (s *Store) UpdateMediaRequestsStatusByKey(items []MediaRequestBatchItem, ra
 }
 
 func applyMediaRequestStatusUpdate(r *MediaRequest, status, adminNote string, replaceNote bool) {
+	if r.Status != status {
+		r.NotificationPending = false
+		r.NotificationLeaseUntil = 0
+	}
+	if r.Status != status && (status == MediaRequestStatusCompleted || status == MediaRequestStatusRejected || status == MediaRequestStatusFailed) {
+		r.NotificationPending = true
+		r.NotificationLeaseUntil = 0
+	}
+	if r.Status == MediaRequestStatusFailed && status == MediaRequestStatusAccepted {
+		r.Tracking = MediaRequestTracking{Events: cloneSlice(r.Tracking.Events)}
+	}
 	r.Status = status
 	if replaceNote || strings.TrimSpace(adminNote) != "" {
 		r.AdminNote = adminNote

@@ -121,6 +121,7 @@ type PostgresTargetStatus struct {
 }
 
 type State struct {
+	MediaWorkerLastSeen     int64                                  `json:"media_worker_last_seen,omitempty"`
 	Finance                 FinanceState                           `json:"finance,omitempty"`
 	Console                 ConsoleState                           `json:"console,omitempty"`
 	Retention               RetentionState                         `json:"retention,omitempty"`
@@ -178,15 +179,16 @@ type State struct {
 }
 
 type User struct {
-	WhitelistUntil       int64         `json:"whitelist_until,omitempty"`
-	RetentionAccessUntil int64         `json:"retention_access_until,omitempty"`
-	RetentionManaged     bool          `json:"retention_managed,omitempty"`
-	SecurityCodeHash     string        `json:"security_code_hash,omitempty"`
-	MediaMaxDevices      *int          `json:"media_max_devices,omitempty"`
-	MediaMaxStreams      *int          `json:"media_max_streams,omitempty"`
-	MediaPolicyManaged   bool          `json:"media_policy_managed,omitempty"`
-	MediaDevices         []MediaDevice `json:"media_devices,omitempty"`
-	MediaRevokedDevices  []string      `json:"media_revoked_devices,omitempty"`
+	WhitelistUntil         int64                  `json:"whitelist_until,omitempty"`
+	RetentionAccessUntil   int64                  `json:"retention_access_until,omitempty"`
+	RetentionManaged       bool                   `json:"retention_managed,omitempty"`
+	MemberSecurityAttempts MemberSecurityAttempts `json:"member_security_attempts,omitempty"`
+	SecurityCodeHash       string                 `json:"security_code_hash,omitempty"`
+	MediaMaxDevices        *int                   `json:"media_max_devices,omitempty"`
+	MediaMaxStreams        *int                   `json:"media_max_streams,omitempty"`
+	MediaPolicyManaged     bool                   `json:"media_policy_managed,omitempty"`
+	MediaDevices           []MediaDevice          `json:"media_devices,omitempty"`
+	MediaRevokedDevices    []string               `json:"media_revoked_devices,omitempty"`
 
 	UID              int64  `json:"uid"`
 	Username         string `json:"username"`
@@ -322,25 +324,28 @@ type APIKey struct {
 }
 
 type MediaRequest struct {
-	ID            int64          `json:"id"`
-	Revision      int64          `json:"revision,omitempty"`
-	RequireKey    string         `json:"require_key"`
-	UID           int64          `json:"uid"`
-	TelegramID    int64          `json:"telegram_id,omitempty"`
-	Username      string         `json:"username,omitempty"`
-	Title         string         `json:"title"`
-	OriginalTitle string         `json:"original_title,omitempty"`
-	Source        string         `json:"source"`
-	MediaID       int64          `json:"media_id"`
-	MediaType     string         `json:"media_type"`
-	Season        int            `json:"season,omitempty"`
-	Year          string         `json:"year,omitempty"`
-	Status        string         `json:"status"`
-	AdminNote     string         `json:"admin_note,omitempty"`
-	Note          string         `json:"note,omitempty"`
-	MediaInfo     map[string]any `json:"media_info,omitempty"`
-	CreatedAt     int64          `json:"created_at"`
-	UpdatedAt     int64          `json:"updated_at"`
+	Tracking               MediaRequestTracking `json:"tracking,omitempty"`
+	NotificationPending    bool                 `json:"notification_pending,omitempty"`
+	NotificationLeaseUntil int64                `json:"notification_lease_until,omitempty"`
+	ID                     int64                `json:"id"`
+	Revision               int64                `json:"revision,omitempty"`
+	RequireKey             string               `json:"require_key"`
+	UID                    int64                `json:"uid"`
+	TelegramID             int64                `json:"telegram_id,omitempty"`
+	Username               string               `json:"username,omitempty"`
+	Title                  string               `json:"title"`
+	OriginalTitle          string               `json:"original_title,omitempty"`
+	Source                 string               `json:"source"`
+	MediaID                int64                `json:"media_id"`
+	MediaType              string               `json:"media_type"`
+	Season                 int                  `json:"season,omitempty"`
+	Year                   string               `json:"year,omitempty"`
+	Status                 string               `json:"status"`
+	AdminNote              string               `json:"admin_note,omitempty"`
+	Note                   string               `json:"note,omitempty"`
+	MediaInfo              map[string]any       `json:"media_info,omitempty"`
+	CreatedAt              int64                `json:"created_at"`
+	UpdatedAt              int64                `json:"updated_at"`
 }
 
 type Announcement struct {
@@ -1501,6 +1506,9 @@ func (s *Store) LoadSnapshot(data []byte, configuredKey ...string) error {
 	}
 	state.ensure()
 	if err := ValidateTwoFactorBackup(state, configuredKey...); err != nil {
+		return err
+	}
+	if err := ValidateMediaRequestTrackingBackup(&state); err != nil {
 		return err
 	}
 	if err := ValidateShopBackup(state, configuredKey...); err != nil {

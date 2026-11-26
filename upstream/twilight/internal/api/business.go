@@ -464,6 +464,7 @@ func mediaRequestUserDTO(req store.MediaRequest) map[string]any {
 		"admin_note":     req.AdminNote,
 		"note":           req.Note,
 		"media_info":     mediaInfo,
+		"tracking":       mediaRequestTrackingDTO(req.Tracking),
 	}
 }
 

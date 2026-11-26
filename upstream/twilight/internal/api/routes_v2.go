@@ -7,6 +7,13 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodGet, "/api/v2/admin/media-worker", AuthAdmin, a.handleAdminMediaWorker)
+	a.add(http.MethodPost, "/api/v2/admin/media-worker/key", AuthAdmin, a.handleAdminMediaWorkerKey)
+	a.add(http.MethodGet, "/api/v2/integrations/media-requests", AuthAPIKey, a.withAPIKeyPermission(apiKeyPermissionMediaSync, a.handleMediaWorkerQueue))
+	a.add(http.MethodPost, "/api/v2/integrations/media-requests/:require_key/events", AuthAPIKey, a.withAPIKeyPermission(apiKeyPermissionMediaSync, a.handleMediaWorkerEvent))
+	a.add(http.MethodGet, "/api/v2/miniapp/request-search", AuthPublic, a.miniMember(a.handleMemberRequestSearch))
+	a.add(http.MethodPost, "/api/v2/miniapp/email/send", AuthPublic, a.miniMember(a.handleMemberBindEmailSend))
+	a.add(http.MethodPost, "/api/v2/miniapp/email/verify", AuthPublic, a.miniMember(a.handleVerifyEmailCode))
 	a.add(http.MethodGet, "/api/v2/miniapp/avatar", AuthPublic, a.miniMember(a.handleMiniAvatar))
 	a.add(http.MethodGet, "/api/v2/commerce/assets/:filename", AuthPublic, a.handleCommerceImage)
 	a.add(http.MethodPost, "/api/v2/admin/commerce/image", AuthAdmin, a.handleCommerceImageUpload)

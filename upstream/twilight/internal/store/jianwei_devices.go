@@ -7,13 +7,25 @@ import (
 )
 
 type MediaDevice struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Client        string `json:"client,omitempty"`
+	ClientVersion string `json:"client_version,omitempty"`
 }
 
 // ClaimMediaDevice serializes enrollment across API workers in the same state
 // CAS transaction as user/role changes. Known devices do not cause writes.
-func (s *Store) ClaimMediaDevice(uid int64, id, name string, limitFor func(User) int) error {
+func (s *Store) ClaimMediaDevice(uid int64, id, name string, limitFor func(User) int, software ...string) error {
+	client, version := "", ""
+	if len(software) > 0 {
+		client = strings.TrimSpace(software[0])
+	}
+	if len(software) > 1 {
+		version = strings.TrimSpace(software[1])
+	}
+	if len(client) > 100 || len(version) > 50 {
+		return ErrInvalid
+	}
 	if id == "" || len(id) > 200 || len(name) > 200 {
 		return ErrInvalid
 	}
@@ -33,6 +45,17 @@ func (s *Store) ClaimMediaDevice(uid int64, id, name string, limitFor func(User)
 		for index, device := range u.MediaDevices {
 			if device.ID == id {
 				if limit <= 0 || index < limit {
+					if (client != "" && device.Client != client) || (version != "" && device.ClientVersion != version) {
+						u.MediaDevices = append([]MediaDevice{}, u.MediaDevices...)
+						if client != "" {
+							u.MediaDevices[index].Client = client
+						}
+						if version != "" {
+							u.MediaDevices[index].ClientVersion = version
+						}
+						s.state.Users[uid] = u
+						return nil
+					}
 					return errNoChange
 				}
 				return ErrConflict
@@ -41,7 +64,7 @@ func (s *Store) ClaimMediaDevice(uid int64, id, name string, limitFor func(User)
 		if (limit > 0 && len(u.MediaDevices) >= limit) || len(u.MediaDevices) >= 1000 {
 			return ErrConflict
 		}
-		u.MediaDevices = append(append([]MediaDevice{}, u.MediaDevices...), MediaDevice{ID: id, Name: strings.TrimSpace(name)})
+		u.MediaDevices = append(append([]MediaDevice{}, u.MediaDevices...), MediaDevice{ID: id, Name: strings.TrimSpace(name), Client: client, ClientVersion: version})
 		s.state.Users[uid] = u
 		return nil
 	})

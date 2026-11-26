@@ -168,7 +168,7 @@ func TestJianweiEmbyDeviceImportUsesReportedIDAndOwnAccount(t *testing.T) {
 	a := newTestApp(t)
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"Items":[{"Id":"7","ReportedDeviceId":"reported-own","Name":"Phone","LastUserId":"mine"},{"Id":"8","ReportedDeviceId":"reported-other","Name":"Other","LastUserId":"other"}]}`))
+		_, _ = w.Write([]byte(`{"Items":[{"Id":"7","ReportedDeviceId":"reported-own","Name":"Phone","AppName":"Yamby","AppVersion":"2.1","LastUserId":"mine"},{"Id":"8","ReportedDeviceId":"reported-other","Name":"Other","LastUserId":"other"}]}`))
 	}))
 	defer remote.Close()
 	a.cfg().EmbyURL = remote.URL
@@ -185,7 +185,7 @@ func TestJianweiEmbyDeviceImportUsesReportedIDAndOwnAccount(t *testing.T) {
 		t.Fatal(message)
 	}
 	after, _ := a.store().User(u.UID)
-	if len(after.MediaDevices) != 1 || after.MediaDevices[0].ID != "reported-own" {
+	if len(after.MediaDevices) != 1 || after.MediaDevices[0].ID != "reported-own" || after.MediaDevices[0].Client != "Yamby" || after.MediaDevices[0].ClientVersion != "2.1" {
 		t.Fatal(after.MediaDevices)
 	}
 	if e = a.store().RemoveMediaDevice(u.UID, "reported-own"); e != nil {

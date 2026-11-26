@@ -269,25 +269,19 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 			return
 		}
 	}
-	if devices > 0 {
-		if device == "" {
-			fail(w, 400, "客户端未提供设备标识，请升级客户端")
-			return
-		}
-		known := false
-		for index, registered := range u.MediaDevices {
-			if registered.ID == device && index < devices {
-				known = true
-			}
-		}
-		if !known {
-			err = a.store().ClaimMediaDevice(u.UID, device, name, func(user store.User) int { n, _ := mediaLimits(a.cfg(), user); return n })
-		}
+	if devices > 0 && device == "" {
+		fail(w, 400, "客户端未提供设备标识，请升级客户端")
+		return
+	}
+	if device != "" {
+		client, version := mediaClientSoftware(r, uri)
+		err = a.store().ClaimMediaDevice(u.UID, device, name, func(user store.User) int { n, _ := mediaLimits(a.cfg(), user); return n }, client, version)
 		if err != nil {
-			fail(w, 403, "已达到设备上限，请在见微面板释放旧设备或联系管理员")
+			fail(w, 403, "已达到设备上限或此设备已停用，请在见微面板核对设备")
 			return
 		}
 	}
+
 	if device != "" && entry.device != device {
 		entry.device = device
 		cache.mu.Lock()
@@ -333,7 +327,7 @@ func (a *App) handleMemberDeviceRegistry(w http.ResponseWriter, r *http.Request,
 			if watching && !paused {
 				playing++
 			}
-			online = append(online, map[string]any{"device_id": asString(session["DeviceId"]), "name": asString(session["DeviceName"]), "client": asString(session["Client"]), "playing": watching && !paused})
+			online = append(online, map[string]any{"device_id": asString(session["DeviceId"]), "name": asString(session["DeviceName"]), "client": asString(session["Client"]), "client_version": asString(session["ApplicationVersion"]), "playing": watching && !paused})
 		}
 	}
 	ok(w, "OK", map[string]any{"items": items, "online": online, "playing_streams": playing, "sessions_available": e == nil, "used_devices": len(items), "max_devices": devices, "max_streams": streams, "enabled": a.cfg().MediaLimitsEnabled})
@@ -353,6 +347,8 @@ func (a *App) handleMemberDeviceSync(w http.ResponseWriter, r *http.Request, _ P
 		Items []struct {
 			ID         string `json:"Id"`
 			ReportedID string `json:"ReportedDeviceId"`
+			AppName    string `json:"AppName"`
+			AppVersion string `json:"AppVersion"`
 			Name       string `json:"Name"`
 			LastUserID string `json:"LastUserId"`
 		} `json:"Items"`
@@ -377,7 +373,7 @@ func (a *App) handleMemberDeviceSync(w http.ResponseWriter, r *http.Request, _ P
 			continue
 		}
 		id := firstNonEmpty(device.ReportedID, device.ID)
-		if e := a.store().ClaimMediaDevice(u.UID, id, device.Name, func(v store.User) int { d, _ := mediaLimits(a.cfg(), v); return d }); e != nil {
+		if e := a.store().ClaimMediaDevice(u.UID, id, device.Name, func(v store.User) int { d, _ := mediaLimits(a.cfg(), v); return d }, device.AppName, device.AppVersion); e != nil {
 			skipped++
 		} else {
 			added++
@@ -460,4 +456,33 @@ func normalizedPlaybackHost(v *url.URL) string {
 		return host
 	}
 	return host + ":" + port
+}
+
+func mediaClientSoftware(r *http.Request, uri *url.URL) (string, string) {
+	client := firstNonEmpty(r.Header.Get("X-Emby-Client"), uri.Query().Get("X-Emby-Client"), uri.Query().Get("Client"))
+	version := firstNonEmpty(r.Header.Get("X-Emby-Client-Version"), uri.Query().Get("Version"))
+	for _, header := range []string{r.Header.Get("X-Emby-Authorization"), r.Header.Get("Authorization")} {
+		header = strings.TrimSpace(header)
+		lower := strings.ToLower(header)
+		for _, prefix := range []string{"mediabrowser ", "emby "} {
+			if strings.HasPrefix(lower, prefix) {
+				header = header[len(prefix):]
+				break
+			}
+		}
+		for _, part := range strings.Split(header, ",") {
+			key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if !ok {
+				continue
+			}
+			value = strings.Trim(value, "\"")
+			switch strings.ToLower(key) {
+			case "client":
+				client = firstNonEmpty(client, value)
+			case "version":
+				version = firstNonEmpty(version, value)
+			}
+		}
+	}
+	return truncateString(client, 100), truncateString(version, 50)
 }
