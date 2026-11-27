@@ -280,7 +280,7 @@ func (s *Store) refundServiceSourceLocked(o *ShopOrder, source EntitlementSource
 		return ErrConflict
 	}
 	for id, v := range s.state.Finance.Sources {
-		if v.UID == o.UID && v.ServiceID == source.ServiceID && v.RevokedAt == 0 && v.Sequence > source.Sequence {
+		if v.UID == o.UID && v.ServiceID == source.ServiceID && v.RevokedAt == 0 && v.Sequence > source.Sequence && v.Kind != "refund" {
 			v.Offset += remaining
 			s.state.Finance.Sources[id] = v
 		}
@@ -290,5 +290,7 @@ func (s *Store) refundServiceSourceLocked(o *ShopOrder, source EntitlementSource
 	source.RefundSeconds = remaining
 	s.state.Finance.Sources[source.ID] = source
 	s.state.Finance.Revision++
+	refundID := "refund:" + o.ID
+	s.state.Finance.Sources[refundID] = EntitlementSource{ID: refundID, UID: o.UID, ServiceID: source.ServiceID, Before: end, After: s.state.Services.Grants[o.UID][source.ServiceID], At: now, Sequence: s.state.Finance.Revision, Kind: "refund"}
 	return nil
 }

@@ -98,6 +98,15 @@ func TestJianweiServicesAreIndependentAndPointsAreAtomic(t *testing.T) {
 	if end := s.ServiceGrants(u.UID)["music"]; end != now+30*86400+10 {
 		t.Fatal("refund removed later independent service renewal", end)
 	}
+	s.mu.Lock()
+	e = s.mutateAndSaveLocked(func() error {
+		source := s.state.Finance.Sources["code:"+renewal.Code]
+		return s.refundServiceSourceLocked(&ShopOrder{ID: "later-independent-order", UID: u.UID, Product: ShopProduct{Days: 30}}, source, now+20)
+	})
+	s.mu.Unlock()
+	if e != nil || s.ServiceGrants(u.UID)["music"] != now+20 {
+		t.Fatal("later source refund lost lineage after earlier refund", e)
+	}
 	after, _ = s.User(u.UID)
 	if after.ExpiredAt != u.ExpiredAt {
 		t.Fatal("service refund touched movie membership")

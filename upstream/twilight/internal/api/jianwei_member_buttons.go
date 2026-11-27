@@ -146,7 +146,7 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 	items := a.memberPointsItems(effectiveMember(u))
 	p := a.store().RetentionPolicy()
 	rows := [][]map[string]any{}
-	text := fmt.Sprintf("见微 Emby · 积分商店\n\n可用：%d · 冻结：%d · 总额：%d\n月卡 %d积分 / 30天\n季卡 %d积分 / 90天\n年卡 %d积分 / 365天\n\n扣分后生成本人专属续期码，核销后保留剩余时长并增加免保号时长。", w.Available, w.Frozen, w.Balance, p.MonthPoints, p.QuarterPoints, p.YearPoints)
+	text := fmt.Sprintf("见微 Emby · 积分商店\n\n可用：%d · 冻结：%d · 总额：%d\n月卡 %d积分 / 30天\n季卡 %d积分 / 90天\n年卡 %d积分 / 365天\n\n扣分后生成本人专属权益码，核销后保留剩余时长并增加免保号时长。", w.Available, w.Frozen, w.Balance, p.MonthPoints, p.QuarterPoints, p.YearPoints)
 	if len(c.Args) == 2 && c.Args[0] == "confirm" {
 		sku := strings.Split(c.Args[1], ":")
 		if len(sku) != 3 || len(sku[1]) != 16 {

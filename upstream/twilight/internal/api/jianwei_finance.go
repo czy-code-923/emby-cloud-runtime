@@ -187,7 +187,7 @@ func (a *App) handlePointsPurchase(w http.ResponseWriter, r *http.Request, _ Par
 		return
 	}
 	a.audit(r, "points_card_issued", "commerce", uid, map[string]any{"order_id": order.ID, "points": order.PointsCost})
-	ok(w, "积分已扣除，专属单次续期码已生成；兑换后生效", a.shopOrderView(order, false))
+	ok(w, "积分已扣除，专属单次权益码已生成；兑换后生效", a.shopOrderView(order, false))
 }
 func (a *App) handleMemberShopCode(w http.ResponseWriter, r *http.Request, _ Params) {
 	u := current(r).User
