@@ -362,7 +362,7 @@ class Manager:
                 if dirty.strip():
                     raise ValueError('Tracked local modifications exist; preserve them before upgrading')
                 shutil.move(str(self.root/'.git'), str(saved/'legacy-git'))
-            ingress_path=self.state/'network'/'Caddyfile'
+            ingress_path=self.root/'runtime/network/Caddyfile'
             previous_ingress=ingress_path.read_bytes() if ingress_path.exists() else None
             self.progress('applying')
             try:
@@ -400,6 +400,7 @@ class Manager:
                         ingress_path.write_bytes(previous_ingress)
                     if active:
                         self.resume_stack()
+                        if previous_ingress is not None:self.network().reload_edge()
                     self.progress('rolled_back', message='Previous program and image selection restored; databases preserved')
                 except Exception:
                     self.progress('recovery_required', message='Automatic program rollback failed; consult local operations.log')
