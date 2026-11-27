@@ -34,7 +34,7 @@ func TestJianweiServicesAreIndependentAndPointsAreAtomic(t *testing.T) {
 	if e := s.AdjustWallet(u.UID, 1, s.Wallet(u.UID).Revision, "service-freeze-fixture", "freeze", "fixture", 400); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := s.CreatePointsOrder(u.UID, "service-frozen-order", "svc-music", "service-frozen-request", strings.Repeat("a", 64), "sealed", now, 150); e != ErrInsufficientPoints {
+	if _, e := s.CreatePointsOrder(u.UID, "service-frozen-order", "svc-music", "service-frozen-request", strings.Repeat("a", 64), "sealed", now, 150, 30); e != ErrInsufficientPoints {
 		t.Fatal("service spent frozen points", e)
 	}
 	if e := s.AdjustWallet(u.UID, 1, s.Wallet(u.UID).Revision, "service-release-fixture", "release", "fixture", 400); e != nil {
@@ -47,11 +47,11 @@ func TestJianweiServicesAreIndependentAndPointsAreAtomic(t *testing.T) {
 		t.Fatal(e)
 	}
 	key := strings.Repeat("f", 64)
-	order, e := s.CreatePointsOrder(u.UID, "service-points-order-01", "svc-music", "service-points-request", key, "sealed-fixture", now, 150)
+	order, e := s.CreatePointsOrder(u.UID, "service-points-order-01", "svc-music", "service-points-request", key, "sealed-fixture", now, 150, 30)
 	if e != nil {
 		t.Fatal(e)
 	}
-	duplicate, e := s.CreatePointsOrder(u.UID, "service-points-order-02", "svc-music", "service-points-request", strings.Repeat("e", 64), "sealed-fixture", now, 150)
+	duplicate, e := s.CreatePointsOrder(u.UID, "service-points-order-02", "svc-music", "service-points-request", strings.Repeat("e", 64), "sealed-fixture", now, 150, 30)
 	if e != nil || duplicate.ID != order.ID || s.Wallet(u.UID).Available != 350 {
 		t.Fatal("duplicate points debit", e)
 	}

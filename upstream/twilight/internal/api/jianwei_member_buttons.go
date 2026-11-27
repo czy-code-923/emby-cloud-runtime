@@ -149,10 +149,18 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 	text := fmt.Sprintf("见微 Emby · 积分商店\n\n可用：%d · 冻结：%d · 总额：%d\n月卡 %d积分 / 30天\n季卡 %d积分 / 90天\n年卡 %d积分 / 365天\n\n扣分后生成本人专属权益码，核销后保留剩余时长并增加免保号时长。", w.Available, w.Frozen, w.Balance, p.MonthPoints, p.QuarterPoints, p.YearPoints)
 	if len(c.Args) == 2 && c.Args[0] == "confirm" {
 		sku := strings.Split(c.Args[1], ":")
-		if len(sku) != 3 || len(sku[1]) != 16 {
+		if (len(sku) != 3 && len(sku) != 4) || (len(sku[1]) != 16 && !(len(sku[1]) == 12 && strings.HasPrefix(sku[0], "svc-"))) {
 			return
 		}
-		success, message, data := a.invokeMember(ctx, u, a.handlePointsPurchase, map[string]any{"sku": sku[0], "request_id": sku[1], "confirm": true, "expected_cost": financeUID(sku[2])})
+		requestID := sku[1]
+		if len(requestID) == 12 {
+			requestID = "svc-" + requestID
+		}
+		expectedDays := int64(-1)
+		if len(sku) == 4 {
+			expectedDays = financeUID(sku[3])
+		}
+		success, message, data := a.invokeMember(ctx, u, a.handlePointsPurchase, map[string]any{"sku": sku[0], "request_id": requestID, "confirm": true, "expected_cost": financeUID(sku[2]), "expected_days": expectedDays})
 		text = message
 		if success {
 			d, _ := data.(map[string]any)
@@ -163,11 +171,13 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 	} else if len(c.Args) == 1 {
 		sku := c.Args[0]
 		cost := 0
+		days := 0
 		can := false
 		label := ""
 		for _, item := range items {
 			if item["id"] == sku {
 				cost, _ = item["points"].(int)
+				days, _ = item["days"].(int)
 				can, _ = item["can_purchase"].(bool)
 				label, _ = item["name"].(string)
 			}
@@ -176,15 +186,20 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 			a.memberSendButtons(ctx, c.ChatID, "此商品尚未启用、已包含此服务或需先开通统一Emby账号；没有扣分。", nil)
 			return
 		}
-		text = fmt.Sprintf("见微 · 积分兑换\n\n%s · %d积分\n可用积分%d，兑换后发本人专属单次码。", label, cost, w.Available)
+		text = fmt.Sprintf("见微 · 积分兑换\n\n%s · %d天 · %d积分\n可用积分%d，兑换后发本人专属单次码。", label, days, cost, w.Available)
 		if w.Available < cost {
 			a.memberSendButtons(ctx, c.ChatID, fmt.Sprintf("可用积分%d，本卡需要%d积分，还差%d积分；没有扣分。", w.Available, cost, cost-w.Available), [][]map[string]any{{memberButton("每日签到", "/signin"), memberButton("返回积分商店", "/points")}})
 			return
 		}
 		nonce := fmt.Sprintf("%016x", time.Now().UnixNano())
+		suffix := ""
+		if strings.HasPrefix(sku, "svc-") {
+			nonce = nonce[4:]
+			suffix = ":" + fmt.Sprint(days)
+		}
 
 		text += "\n\n确认兑换？本次将扣除对应可用积分。"
-		rows = append(rows, []map[string]any{memberButton("确认扣分并发码", "/points confirm "+sku+":"+nonce+":"+fmt.Sprint(cost)), memberButton("取消", "/points")})
+		rows = append(rows, []map[string]any{memberButton("确认扣分并发码", "/points confirm "+sku+":"+nonce+":"+fmt.Sprint(cost)+suffix), memberButton("取消", "/points")})
 	} else {
 		for _, item := range items {
 			if item["can_purchase"] == true {

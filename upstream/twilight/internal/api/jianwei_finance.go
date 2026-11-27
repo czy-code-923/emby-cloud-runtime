@@ -182,7 +182,7 @@ func (a *App) handlePointsPurchase(w http.ResponseWriter, r *http.Request, _ Par
 		fail(w, 503, "交付密钥不可用")
 		return
 	}
-	order, e := a.store().CreatePointsOrder(uid, id, stringValue(b, "sku"), stringValue(b, "request_id"), key, cipher, time.Now().Unix(), int(intValue(b, "expected_cost", -1)))
+	order, e := a.store().CreatePointsOrder(uid, id, stringValue(b, "sku"), stringValue(b, "request_id"), key, cipher, time.Now().Unix(), int(intValue(b, "expected_cost", -1)), int(intValue(b, "expected_days", -1)))
 	if statusFromError(w, e) {
 		return
 	}

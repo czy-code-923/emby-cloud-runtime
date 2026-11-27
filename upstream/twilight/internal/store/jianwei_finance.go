@@ -482,7 +482,7 @@ func (s *Store) CreatePointsOrder(uid int64, id, sku, requestKey, codeKey, ciphe
 				return err
 			}
 		}
-		if len(expectedCost) != 1 || expectedCost[0] != cost {
+		if len(expectedCost) < 1 || len(expectedCost) > 2 || expectedCost[0] != cost || (isService && (len(expectedCost) != 2 || expectedCost[1] != product.Days)) {
 			return ErrConflict
 		}
 		if (!isService && !p.Enabled) || cost <= 0 {
