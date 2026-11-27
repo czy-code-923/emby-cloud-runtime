@@ -110,7 +110,11 @@ func TestJianweiPlaybackHostAuthorizationReadsCurrentRole(t *testing.T) {
 	a := newTestApp(t)
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Header.Get("X-Emby-Token") == "native-admin" {
+		if r.URL.Path == "/Sessions" {
+			w.Write([]byte(`[]`))
+			return
+		}
+		if r.URL.Path == "/Users/native-host" {
 			_, _ = w.Write([]byte(`{"Id":"member-host","Policy":{"IsAdministrator":true}}`))
 			return
 		}
@@ -125,6 +129,12 @@ func TestJianweiPlaybackHostAuthorizationReadsCurrentRole(t *testing.T) {
 	a.cfg().EmbyWhitelistURL = "https://white.example.test"
 	u, e := a.store().CreateUser(store.User{Username: "host-member", Role: store.RoleNormal, Active: true, EmbyID: "member-host", ExpiredAt: time.Now().Unix() + 86400})
 	if e != nil {
+		t.Fatal(e)
+	}
+	if e := a.store().RememberMediaClientLogin(a.mediaTokenHash("member-token"), "member-host", "phone"); e != nil {
+		t.Fatal(e)
+	}
+	if e := a.store().RememberMediaClientLogin(a.mediaTokenHash("native-admin"), "native-host", "phone"); e != nil {
 		t.Fatal(e)
 	}
 	call := func(host, token string) int {

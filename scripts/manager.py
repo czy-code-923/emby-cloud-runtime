@@ -362,6 +362,8 @@ class Manager:
                 if dirty.strip():
                     raise ValueError('Tracked local modifications exist; preserve them before upgrading')
                 shutil.move(str(self.root/'.git'), str(saved/'legacy-git'))
+            ingress_path=self.state/'network'/'Caddyfile'
+            previous_ingress=ingress_path.read_bytes() if ingress_path.exists() else None
             self.progress('applying')
             try:
                 if active:
@@ -378,6 +380,8 @@ class Manager:
                 self.command(['python3',str(self.root/'scripts/check.py')], timeout=90)
                 if old_version is None:
                     self.initialize_cloud()
+                ingress_refresh=self.root/'scripts/refresh-ingress.py'
+                if ingress_refresh.exists():self.command(['python3',str(ingress_refresh),str(self.root)],timeout=180)
                 write_json(self.root/'.emby-cloud.json', {'version':version,'database_schema':metadata['database_schema'],
                     'commit':metadata['commit'],'files':files,'uninstalled':False})
                 self.progress('succeeded', target=release['tag_name'], message='Upgrade completed and health checks passed', error=None)
@@ -392,6 +396,8 @@ class Manager:
                             shutil.copy2(previous, dest)
                         elif dest.is_file():
                             dest.unlink()
+                    if previous_ingress is not None:
+                        ingress_path.write_bytes(previous_ingress)
                     if active:
                         self.resume_stack()
                     self.progress('rolled_back', message='Previous program and image selection restored; databases preserved')

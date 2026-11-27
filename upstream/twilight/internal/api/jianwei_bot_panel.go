@@ -137,7 +137,7 @@ func (a *App) memberPanelEdit(ctx context.Context, method string, body any) (str
 		rows := [][]map[string]any{{{"text": "‹ 返回主面板", "callback_data": "jw:/panel"}}}
 		if a.cfg().TelegramShopEnabled {
 			if url := publicHTTPSURL(a.cfg().CommerceStoreURL); url != "" {
-				rows = append(rows, []map[string]any{{"text": "🛍 发卡商店 ↗", "url": url}})
+				rows = append(rows, []map[string]any{memberButton("🛍 发卡商店 ↗", "/shopcode")})
 			}
 		}
 		markup = map[string]any{"inline_keyboard": rows}

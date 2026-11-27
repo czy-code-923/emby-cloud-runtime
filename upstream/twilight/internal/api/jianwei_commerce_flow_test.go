@@ -91,7 +91,12 @@ func TestJianweiShopPublishOrderReviewDeliveryEndToEnd(t *testing.T) {
 	}
 	// Replaying the identical receipt cannot create another delivery or code.
 	w = call("POST", "/api/v2/admin/commerce/orders/"+id+"/review", review, false)
-	if w.Code < 400 {
-		t.Fatal("stale review was replayed")
+	if w.Code == 200 {
+		after, _ := a.store().ShopOrder(id)
+		if after.CodeKey != order.CodeKey || after.ReceiptHash != order.ReceiptHash || len(a.store().ShopOrders(buyer.UID, false)) != 1 {
+			t.Fatal("idempotent review created another delivery")
+		}
+	} else if w.Code != 409 {
+		t.Fatal("unexpected review replay failure", w.Code, w.Body)
 	}
 }

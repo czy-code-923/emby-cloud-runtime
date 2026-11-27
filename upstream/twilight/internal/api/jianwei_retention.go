@@ -298,7 +298,7 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 		d, _ := data.(map[string]any)
 		q, _ := d["quote"].(map[string]any)
 		token := asString(d["token"])
-		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分，顺延30天，可随时撤回。B不扣积分。\n下一次可更换时间：%s\n确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"], time.Unix(int64(numeric(q["next_switch_at"])), 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04"))
+		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分续30天；B累计30分钟观影、不扣积分。\n确认后仅管理员可修改；原冷却记录：%s\n确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"], time.Unix(int64(numeric(q["next_switch_at"])), 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04"))
 		if purchase, _ := d["purchase"].(bool); purchase {
 			message = fmt.Sprintf("积分免保号卡 · %s\n本次扣除%v积分，保留当前剩余时长，追加卡券天数并暂停活动自动扣分。\n这是独立的单次交易，不会开启自动购买订阅。确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["cost"])
 		}

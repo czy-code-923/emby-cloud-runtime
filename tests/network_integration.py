@@ -30,6 +30,10 @@ class Gateway(BaseHTTPRequestHandler):
         self.send_header('Set-Cookie', 'session=disposable-fixture; HttpOnly; Path=/')
         self.end_headers()
         self.wfile.write(b'fixture-health')
+    def do_POST(self):
+        if self.path!='/api/v2/internal/emby-login' or self.headers.get('X-JW-Gateway')!='fixture-gateway-secret':
+            self.send_response(403);self.end_headers();return
+        self.send_response(200);self.end_headers();self.wfile.write(b'login-proxy-fixture')
     def log_message(self, *args): pass
 
 class Emby(Gateway):
