@@ -48,7 +48,12 @@ func run(args []string) error {
 	case "bind-admin-playback":
 		return runAdminPlaybackBind(args[2:])
 	case "audit-whitelist":
-		return runWhitelistAccessAudit(args[2:])
+		err := runWhitelistAccessAudit(args[2:])
+		if err != nil {
+			// Offline commands do not install the API logger.
+			fmt.Fprintln(os.Stderr, err)
+		}
+		return err
 	case "reset-2fa":
 		err := runTwoFactorReset(args[2:])
 		if err != nil {
@@ -531,6 +536,7 @@ Usage:
   twilight all
   twilight scheduler
   twilight bot
+  twilight audit-whitelist --confirm AUDIT_WHITELIST
   twilight migrate-json --state-file <path> [--config config.toml] [--force]
   twilight reset-2fa --uid <uid> --confirm RESET_2FA_<uid> [--config config.toml]
   twilight version`)

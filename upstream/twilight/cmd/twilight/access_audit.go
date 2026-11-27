@@ -11,11 +11,43 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/prejudice-studio/twilight/internal/config"
 	"github.com/prejudice-studio/twilight/internal/store"
 )
+
+// Both legacy single URLs and current multi-line configuration are supported.
+// Keep only configured HTTPS origins; never infer a public address from EmbyURL.
+func auditPlaybackLines(single string, lines []config.Line) []string {
+	values := []string{single}
+	for _, line := range lines {
+		values = append(values, line.URL)
+	}
+	var result []string
+	seen := map[string]bool{}
+	for _, value := range values {
+		u, err := url.Parse(strings.TrimSpace(value))
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" {
+			continue
+		}
+		u.Host = strings.ToLower(u.Host)
+		if u.Port() == "443" {
+			u.Host = u.Hostname()
+			if strings.Contains(u.Host, ":") {
+				u.Host = "[" + u.Host + "]"
+			}
+		}
+		u.Path = ""
+		value = u.String()
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	return result
+}
 
 // Root-only maintenance via the backend container. Creates a disposable native
 // player and matching platform user, checks real HTTPS, then removes only IDs
@@ -35,14 +67,16 @@ func runWhitelistAccessAudit(args []string) (resultError error) {
 	}
 	cfg, e := config.NewReader(path).ReadLocked()
 	if e != nil {
-		return e
+		return errors.New("cannot read runtime configuration for whitelist audit")
 	}
 	st, e := openStore(context.Background(), cfg)
 	if e != nil {
-		return e
+		return errors.New("cannot open runtime database for whitelist audit")
 	}
 	defer st.Close()
-	if cfg.EmbyPublicURL == "" || cfg.EmbyWhitelistURL == "" {
+	ordinary := auditPlaybackLines(cfg.EmbyPublicURL, cfg.EmbyURLList)
+	whitelist := auditPlaybackLines(cfg.EmbyWhitelistURL, cfg.EmbyWhitelistURLList)
+	if len(ordinary) == 0 || len(whitelist) == 0 {
 		return errors.New("ordinary and whitelist HTTPS lines must be configured")
 	}
 	random := make([]byte, 12)
@@ -119,7 +153,7 @@ func runWhitelistAccessAudit(args []string) (resultError error) {
 	}
 	uid = u.UID
 	report := map[string]any{"audit": "disposable_whitelist", "existing_users_unchanged": true}
-	loginStatus, login, e := request("POST", cfg.EmbyPublicURL+"/Users/AuthenticateByName", map[string]any{"Username": name, "Pw": password}, "")
+	loginStatus, login, e := request("POST", ordinary[0]+"/Users/AuthenticateByName", map[string]any{"Username": name, "Pw": password}, "")
 	if e != nil || loginStatus != 200 {
 		return errors.New("audit client authentication failed")
 	}
@@ -127,26 +161,31 @@ func runWhitelistAccessAudit(args []string) (resultError error) {
 	if token == "" {
 		return errors.New("audit authentication token missing")
 	}
-	for label, host := range map[string]string{"ordinary": cfg.EmbyPublicURL, "whitelist": cfg.EmbyWhitelistURL} {
-		status, _, err := request("GET", host+"/Users/"+id+"/Views", nil, token)
-		report[label+"_as_whitelist"] = status
-		if err != nil || status != 200 {
-			return fmt.Errorf("%s line denied valid whitelist", label)
+	for label, hosts := range map[string][]string{"ordinary": ordinary, "whitelist": whitelist} {
+		for index, host := range hosts {
+			status, _, err := request("GET", host+"/Users/"+id+"/Views", nil, token)
+			report[fmt.Sprintf("%s_%d_as_whitelist", label, index+1)] = status
+			if err != nil || status != 200 {
+				return fmt.Errorf("%s line %d denied valid whitelist", label, index+1)
+			}
 		}
 	}
 	_, e = st.UpdateUser(uid, func(next *store.User) error { next.WhitelistUntil = time.Now().Unix() - 1; return nil })
 	if e != nil {
 		return e
 	}
-	status, _, e := request("GET", cfg.EmbyWhitelistURL+"/Users/"+id+"/Views", nil, token)
-	report["whitelist_after_expiry"] = status
-	if e != nil || status != 403 {
-		return errors.New("expired whitelist retained exclusive line")
-	}
-	status, _, e = request("GET", cfg.EmbyPublicURL+"/Users/"+id+"/Views", nil, token)
-	report["ordinary_after_expiry"] = status
-	if e != nil || status != 200 {
-		return errors.New("whitelist expiry broke ordinary playback")
+	for label, hosts := range map[string][]string{"ordinary": ordinary, "whitelist": whitelist} {
+		for index, host := range hosts {
+			status, _, err := request("GET", host+"/Users/"+id+"/Views", nil, token)
+			report[fmt.Sprintf("%s_%d_after_expiry", label, index+1)] = status
+			expected := 200
+			if label == "whitelist" {
+				expected = 403
+			}
+			if err != nil || status != expected {
+				return fmt.Errorf("%s line %d returned unexpected permissions after whitelist expiry", label, index+1)
+			}
+		}
 	}
 	report["passed"] = true
 	raw, _ := json.Marshal(report)
