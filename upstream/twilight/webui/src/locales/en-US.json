@@ -4202,5 +4202,16 @@
     "durationMS": "{minutes}m {seconds}s",
     "durationS": "{seconds}s",
     "availablePoints": "Available points"
+  },
+  "capacity": {
+    "title": "Emby registration slots",
+    "total": "Total slots",
+    "registered": "Registered",
+    "remaining": "Available slots",
+    "unlimited": "Unlimited",
+    "unavailable": "Unavailable",
+    "occupied": "Registered and reserved slots",
+    "hint": "Availability is checked again when activating your account.",
+    "reservedHint": "{count} slots reserved for pending activations and valid registration cards."
   }
 }

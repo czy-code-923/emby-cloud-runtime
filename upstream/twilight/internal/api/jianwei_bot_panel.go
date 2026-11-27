@@ -39,12 +39,13 @@ func init() {
 
 func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.User) {
 	cfg := a.cfg()
-	text := "见微 Emby · 微光影院\n小见世界，细看生活。\n欢迎进入用户面板。\n签到、续期与设备，一处处理。\n点击「我的账户」查询个人信息。\n请选择下方功能。"
+	text := "见微 Emby · 微光影院\n小见世界，细看生活。\n欢迎进入用户面板。\n签到、续期与设备，一处处理。\n点击「我的账户」查看 Emby 详情。\n请选择下方功能。"
 	if user.EmbyID == "" {
+		registration := memberRegistrationText(a.memberRegistration())
 		if user.PendingEmby {
-			text = "见微 Emby · 微光影院\n开通资格已经就绪。\n点击「开通Emby」设置账号，\n创建后请保存仅显示一次的密码。\n请选择下方功能。"
+			text = "见微 Emby · 微光影院\n· 📊 当前状态 | 待开通\n" + registration + "\n点击「开通Emby」设置账号并备份密码。\n请选择下方功能。"
 		} else {
-			text = "见微 Emby · 微光影院\n欢迎加入见微。\n你尚未开通Emby，\n请先使用注册码，再开通媒体账号。\n请选择下方功能。"
+			text = "见微 Emby · 微光影院\n· 📊 当前状态 | 未注册\n" + registration + "\n请先使用注册码，再开通媒体账号。\n请选择下方功能。"
 		}
 	}
 	if cfg.TelegramBannerEnabled && strings.TrimSpace(cfg.TelegramBannerText) != "" {
@@ -426,7 +427,7 @@ func (a *App) telegramMemberCommand(ctx context.Context, c telegramCommandCtx) {
 				}
 			}
 		case "/lines":
-			message = "我的账号与播放线路\n账号：" + user.EmbyUsername + "\n密码：不可反查，请使用修改密码按钮设置\n"
+			message = "我的账号与播放线路\n· 💠 Emby账号 | " + user.EmbyUsername + "\n· 🔐 密码 | 不可反查，请使用修改密码按钮设置\n"
 			count := 0
 			if d, ok := data.(map[string]any); ok {
 				for _, key := range []string{"lines", "whitelist_lines"} {

@@ -1701,6 +1701,7 @@ export interface NetworkStatus extends NetworkProfileStatus {
 
 export interface MiniAccount {
 	viewing?:MiniViewingSummary;
+	registration?:MiniRegistrationSummary;
 	icon?:string; name?:string; role_label?:string;avatar?:string;
   uid:number; username:string; emby_username:string; media_enabled:boolean; has_emby:boolean;
   expired_at:number; points:number; signin_enabled:boolean; last_signin:string; can_register:boolean;
@@ -1711,4 +1712,8 @@ export interface MiniAccount {
 export interface MiniViewingSummary {
   available:boolean;window_start:number;window_end:number;seconds:number;has_window_records:boolean;
   last_watched_at:number;last_poll:number;quality:string;source:string;
+}
+
+export interface MiniRegistrationSummary {
+  limit:number;unlimited:boolean;registered:number;reserved:number;occupied:number;remaining:number|null;
 }

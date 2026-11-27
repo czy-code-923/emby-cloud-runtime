@@ -17,7 +17,8 @@ const positive={available:true,window_start:asOf-30*86400,window_end:asOf,second
  const results=[];
  try{
   for(const width of [360,768,1280]){
-   let signed=false,points=37,viewing={...positive};
+   let signed=false,points=37,viewing={...positive},hasEmby=true;
+   let registration={limit:100,unlimited:false,registered:23,reserved:7,occupied:30,remaining:70};
    const context=await browser.newContext({viewport:{width,height:900},locale:'zh-CN'});
    const page=await context.newPage();
    const errors=[];page.on('pageerror',e=>errors.push(e.message));
@@ -25,7 +26,7 @@ const positive={available:true,window_start:asOf-30*86400,window_end:asOf,second
    await page.route('**/api/**',async route=>{
     const url=new URL(route.request().url());let data={};
     if(url.pathname.endsWith('/miniapp/session'))data={authenticated:true};
-    else if(url.pathname.endsWith('/miniapp/account'))data={uid:42,username:'测试账号（样例数据）',emby_username:'fixture',role:0,role_label:'管理员',media_enabled:true,has_emby:true,expired_at:-1,points,signin_enabled:true,can_register:false,security_code_set:true,email_enabled:false,email_verified:false,email_masked:'',password_email_required:false,invite_enabled:false,requests_enabled:false,shop_url:'',banner:'',banner_url:'',viewing,signin:{summary:{today_signed:signed,current_points:points,renewal:{enabled:false}},config:{currency_name:'微光币',daily_min:18,daily_max:30},history:[]}};
+    else if(url.pathname.endsWith('/miniapp/account'))data={uid:42,username:'private-web-fixture',emby_username:hasEmby?'fixture':'',role:0,role_label:'管理员',media_enabled:hasEmby,has_emby:hasEmby,expired_at:-1,points,signin_enabled:true,can_register:false,security_code_set:true,email_enabled:false,email_verified:false,email_masked:'',password_email_required:false,invite_enabled:false,requests_enabled:false,shop_url:'',banner:'',banner_url:'',viewing,registration,signin:{summary:{today_signed:signed,current_points:points,renewal:{enabled:false}},config:{currency_name:'微光币',daily_min:18,daily_max:30},history:[]}};
     else if(url.pathname.endsWith('/miniapp/signin')){signed=true;points=57;}
     else if(url.pathname.endsWith('/miniapp/service'))data={online_users:0,watching_users:0,playing_sessions:0};
     else if(url.pathname.endsWith('/miniapp/retention'))data={account:{member:{permanent:true}}};
@@ -39,6 +40,8 @@ const positive={available:true,window_start:asOf-30*86400,window_end:asOf,second
    await page.goto(baseURL+'/miniapp');
    const nav=page.getByRole('navigation',{name:messages.mini.navigation});
    await nav.waitFor({timeout:90000});
+   const slots=page.getByRole('region',{name:messages.capacity.title});
+   assert.equal(await slots.count(),0,'registered member must hide capacity even if stale response contains it');
    await nav.getByRole('button',{name:messages.mini.account,exact:true}).click();
    await page.getByText('1小时1分1秒',{exact:true}).waitFor();
    assert.ok((await page.locator('main').innerText()).includes('00:01:02'));
@@ -60,8 +63,23 @@ const positive={available:true,window_start:asOf-30*86400,window_end:asOf,second
    await nav.getByRole('button',{name:messages.mini.account,exact:true}).click();
    await page.getByText(messages.viewing.noWindowRecords,{exact:true}).waitFor();
    await page.getByText(messages.viewing.noRecords,{exact:true}).waitFor();
+   hasEmby=false;
+   await page.reload();await nav.waitFor();
+   await slots.waitFor();
+   let values=await slots.locator('strong').allTextContents();
+   assert.deepEqual(values,['100','23','70']);
+   assert.ok(!(await page.locator('header').innerText()).includes('private-web-fixture'));
+   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+   await slots.screenshot({path:path.join(output,`fixture-registration-${width}.jpg`)});
+   registration={...registration,reserved:77,occupied:100,remaining:0};
+   await page.reload();await nav.waitFor();await slots.waitFor();
+   assert.deepEqual(await slots.locator('strong').allTextContents(),['100','23','0']);
+   registration={...registration,limit:-1,unlimited:true,remaining:null};
+   await page.reload();await nav.waitFor();await slots.waitFor();
+   values=await slots.locator('strong').allTextContents();
+   assert.deepEqual(values,[messages.capacity.unlimited,'23',messages.capacity.unlimited]);
    assert.deepEqual(errors,[]);
-   results.push({width,exact_seconds:true,beijing_timestamp:true,no_fabricated_empty_state:true,points_adjacent_and_refreshed:true,no_horizontal_overflow:true});
+   results.push({width,exact_seconds:true,beijing_timestamp:true,no_fabricated_empty_state:true,points_adjacent_and_refreshed:true,no_horizontal_overflow:true,registered_capacity_hidden:true,unregistered_capacity_visible:true,full_and_unlimited_correct:true,no_web_identity_fallback:true});
    await context.close();
   }
  }finally{await browser.close();}

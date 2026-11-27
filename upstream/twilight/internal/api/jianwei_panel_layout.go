@@ -58,19 +58,19 @@ func (a *App) telegramMemberAccountInfo(ctx context.Context, c telegramCommandCt
 		return
 	}
 	user = effectiveMember(user)
-	status := "尚未开通"
+	status := "未注册"
 	if user.EmbyID != "" {
 		status = "已开通"
 		if user.EmbyDisabled || !a.embyShouldEnableUser(user) {
 			status = "播放已停用"
 		}
 	}
-	text := fmt.Sprintf("见微 · 我的账户\n\n用户：%s\nTelegram ID：%d\n账户类别：%s\n当前状态：%s\n可用积分：%d\nEmby账号：%s", firstNonEmpty(user.EmbyUsername, user.TelegramUsername, user.Username), user.TelegramID, memberRoleName(user.Role), status, a.store().Wallet(user.UID).Available, firstNonEmpty(user.EmbyUsername, "尚未开通"))
+	text := fmt.Sprintf("见微 · 我的 Emby\n\n· 📊 当前状态 | %s\n· 💠 Emby账号 | %s\n· 🏷 账户类别 | %s\n· 🍒 可用积分 | %d", status, firstNonEmpty(user.EmbyUsername, "尚未开通"), memberRoleName(user.Role), a.store().Wallet(user.UID).Available)
 	if user.EmbyID != "" {
-		text += "\n有效期：" + telegramExpiryTimeLabel(user.ExpiredAt)
+		text += "\n· 🗓 有效期至 | " + telegramExpiryTimeLabel(user.ExpiredAt)
 	}
-	if user.SecurityCodeHash == "" {
-		text += "\n安全码：尚未设置"
+	if user.EmbyID != "" && user.SecurityCodeHash == "" {
+		text += "\n· 🔐 安全码 | 尚未设置"
 	}
 	viewing := a.memberViewing(user.UID)
 	watch, last := "暂无有效记录", "暂无记录"
@@ -84,7 +84,7 @@ func (a *App) telegramMemberAccountInfo(ctx context.Context, c telegramCommandCt
 			last = time.Unix(viewing.LastWatchedAt, 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04:05")
 		}
 	}
-	text += "\n近30天有效观影：" + watch + "\n最后观影：" + last + "（北京时间）"
+	text += "\n· 🎬 近30天观影 | " + watch + "\n· 🕒 最后观影 | " + last + "（北京时间）"
 	if viewing.Quality == "stale" {
 		text += "\n采集暂未更新，仅显示已确认记录"
 	} else if viewing.Quality == "disabled" {

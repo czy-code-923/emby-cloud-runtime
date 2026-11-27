@@ -18,6 +18,7 @@ import {MemberSecurity} from "./member-security";
 import {MemberRequests} from "./requests";
 import {MemberDevices} from "./member-devices";
 import {ViewingSummary} from "./viewing-summary";
+import {RegistrationCapacity} from "./registration-capacity";
 
 declare global { interface Window { Telegram?: {WebApp?: {initData:string;ready():void;expand():void;openLink?(url:string):void}} } }
 type Tab = "activity"|"discover"|"home"|"benefits"|"requests"|"account";
@@ -73,7 +74,7 @@ export default function MiniAppPage() {
   <Script src="https://telegram.org/js/telegram-web-app.js" strategy="afterInteractive" onReady={()=>setSdk(true)} onError={()=>setSdk(true)}/>
   <div className={styles.ambient} aria-hidden="true"/>
   <div className={styles.content}>
-   <header className={styles.header}><Image src={sanitizeImageUrl(data?.avatar||data?.icon)||"/brand/jianwei-mark.svg"} alt="" width={44} height={44} unoptimized onError={e=>{if(!e.currentTarget.src.endsWith("/brand/jianwei-mark.svg"))e.currentTarget.src="/brand/jianwei-mark.svg"}}/><div><h1>{t("mini.brand")}</h1><p>{data?`${data.emby_username||data.username} · ${data.role_label||t("mini.member")}`:t("jianwei.tagline")}</p></div><button className={styles.iconButton} aria-label={t("mini.refresh")} disabled={isLoading||busy} onClick={()=>{setRevision(v=>v+1);void execute()}}><RefreshCw size={19}/></button></header>
+   <header className={styles.header}><Image src={sanitizeImageUrl(data?.avatar||data?.icon)||"/brand/jianwei-mark.svg"} alt="" width={44} height={44} unoptimized onError={e=>{if(!e.currentTarget.src.endsWith("/brand/jianwei-mark.svg"))e.currentTarget.src="/brand/jianwei-mark.svg"}}/><div><h1>{t("mini.brand")}</h1><p>{data?`${data.emby_username||t("mini.pending")} · ${data.role_label||t("mini.member")}`:t("jianwei.tagline")}</p></div><button className={styles.iconButton} aria-label={t("mini.refresh")} disabled={isLoading||busy} onClick={()=>{setRevision(v=>v+1);void execute()}}><RefreshCw size={19}/></button></header>
    {error?<Glass><p role="alert">{error}</p><button onClick={()=>void execute()}>{t("common.retry")}</button></Glass>:isLoading&&!data||!data?<Glass><p>{t("common.loading")}</p></Glass>:<>
     {data.banner&&<aside className={styles.ad}>{data.banner_image&&<Image src={sanitizeImageUrl(data.banner_image)||"/brand/jianwei-panel.png"} alt="" width={600} height={200} unoptimized className="mb-3 w-full rounded-2xl"/>}<small>{t("mini.ad")}</small><p>{data.banner}</p>{data.banner_url&&<button onClick={()=>external(data.banner_url)}>{t("mini.learnMore")} <ArrowUpRight size={14}/></button>}</aside>}
     {retrySeconds>0&&<p role="status" className={styles.notice}>{t("v6.retrySeconds",{seconds:retrySeconds})}</p>}
@@ -81,6 +82,7 @@ export default function MiniAppPage() {
     {shopOpen&&<div role="dialog" aria-modal="true" aria-label={t("mini.shop")} className={styles.modal}><div><button className={styles.subtle} onClick={()=>setShopOpen(false)}>{t("common.close")}</button><ShopLoginCode autoIssue shopURL={data.shop_url} open={external}/></div></div>}
     {tab==="home"&&<>
      <Glass className={styles.hero}><div className={styles.eyebrow}><span className={`${styles.dot} ${data.media_enabled?styles.online:""}`}/>{data.media_enabled?t("mini.active"):data.has_emby?t("mini.suspended"):t("mini.pending")}</div><h2>{t("mini.welcome")}</h2><p>{t("mini.welcomeDetail")}</p><div className={styles.balance}><span>{data.points.toLocaleString()}<small>{data.signin.config.currency_name}</small></span><Sparkles size={35}/></div><div className={styles.expiry}><span>{t("mini.validUntil")}</span><strong>{expiryText(data,t)}</strong></div></Glass>
+     {!data.has_emby&&<RegistrationCapacity registration={data.registration}/>}
      <div className={styles.grid}>{tile(<Sparkles/>,t("mini.signin"),data.signin.summary.today_signed?t("mini.signed"):t("mini.signinRange",{min:data.signin.config.daily_min,max:data.signin.config.daily_max}),()=>void action("signin"),!data.signin_enabled||data.signin.summary.today_signed)}{tile(<Ticket/>,t("ops.activity"),t("ops.activityHint"),()=>setTab("activity"))}{tile(<Compass/>,t("mini.lines"),t("mini.linesHint"),()=>setTab("account"))}{tile(<Clapperboard/>,t("mini.requests"),t("mini.requestsHint"),()=>setTab("requests"),!data.requests_enabled)}</div>
      <div className={styles.grid}>{tile(<Film/>,t("mini.announcements"),t("mini.announcementsHint"),()=>openDiscovery("announcements"))}{tile(<Sparkles/>,t("mini.rank"),t("mini.rankHint"),()=>openDiscovery("rank"))}{tile(<Film/>,t("mini.favorites"),t("mini.favoritesHint"),()=>openDiscovery("favorites"))}{tile(<ShoppingBag/>,t("mini.shop"),t("mini.shopHint"),()=>setShopOpen(true),!data.shop_url)}</div>
      <LiveService/><MemberServices revision={revision}/>

@@ -124,7 +124,11 @@ func (a *App) handleMemberStatus(w http.ResponseWriter, r *http.Request, _ Param
 			}
 		}
 	}
-	ok(w, "OK", map[string]any{"online_users": len(online), "watching_users": len(watching), "playing_sessions": playing, "updated_at": now, "online_window_seconds": 300})
+	result := map[string]any{"online_users": len(online), "watching_users": len(watching), "playing_sessions": playing, "updated_at": now, "online_window_seconds": 300}
+	if registration := a.memberRegistrationFor(current(r).User); registration != nil {
+		result["registration"] = registration
+	}
+	ok(w, "OK", result)
 }
 func (a *App) telegramMemberStatus(ctx context.Context, c telegramCommandCtx) {
 	u, found := a.store().FindUserByTelegramID(c.FromID)
@@ -134,7 +138,11 @@ func (a *App) telegramMemberStatus(ctx context.Context, c telegramCommandCtx) {
 	success, message, data := a.invokeMember(ctx, u, a.handleMemberStatus, nil)
 	if success {
 		d, _ := data.(map[string]any)
-		message = fmt.Sprintf("见微 Emby · 服务状态\n\n在线人数：%v（近5分钟活动）\n观看人数：%v\n正在播放：%v 路\n\n只展示聚合人数，不展示其他用户信息。", d["online_users"], d["watching_users"], d["playing_sessions"])
+		message = fmt.Sprintf("见微 Emby · 服务状态\n\n· 🟢 在线人数 | %v（近5分钟活动）\n· 🎬 观看人数 | %v\n· ▶️ 正在播放 | %v 路", d["online_users"], d["watching_users"], d["playing_sessions"])
+		if registration := a.memberRegistrationFor(u); registration != nil {
+			message += "\n" + memberRegistrationText(*registration)
+		}
+		message += "\n\n仅展示服务汇总，不公开他人观影信息。"
 	}
 	a.memberSendButtons(ctx, c.ChatID, message, [][]map[string]any{{memberButton("刷新状态", "/service")}})
 }
@@ -147,7 +155,7 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 	items := a.memberPointsItems(effectiveMember(u))
 	p := a.store().RetentionPolicy()
 	rows := [][]map[string]any{}
-	text := fmt.Sprintf("见微 Emby · 积分商店\n\n可用：%d · 冻结：%d · 总额：%d\n月卡 %d积分 / 30天\n季卡 %d积分 / 90天\n年卡 %d积分 / 365天\n\n扣分后生成本人专属权益码，核销后保留剩余时长并增加免保号时长。", w.Available, w.Frozen, w.Balance, p.MonthPoints, p.QuarterPoints, p.YearPoints)
+	text := fmt.Sprintf("见微 Emby · 积分商店\n\n· 🍒 可用积分 | %d\n· 🧊 冻结积分 | %d · 总额 %d\n· 🎟 月卡 | %d积分 / 30天\n· 🎫 季卡 | %d积分 / 90天\n· 🗓 年卡 | %d积分 / 365天\n\n扣分后生成本人专属权益码，核销后保留剩余时长并增加免保号时长。", w.Available, w.Frozen, w.Balance, p.MonthPoints, p.QuarterPoints, p.YearPoints)
 	if len(c.Args) == 2 && c.Args[0] == "confirm" {
 		sku := strings.Split(c.Args[1], ":")
 		if (len(sku) != 3 && len(sku) != 4) || (len(sku[1]) != 16 && !(len(sku[1]) == 12 && strings.HasPrefix(sku[0], "svc-"))) {

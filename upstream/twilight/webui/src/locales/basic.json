@@ -4186,5 +4186,16 @@
     "durationMS": "{minutes}分{seconds}秒",
     "durationS": "{seconds}秒",
     "availablePoints": "剩余可用积分"
+  },
+  "capacity": {
+    "title": "Emby 注册席位",
+    "total": "总注册席位",
+    "registered": "已注册 Emby",
+    "remaining": "剩余可注册",
+    "unlimited": "不限",
+    "unavailable": "暂不可用",
+    "occupied": "已使用及预留席位",
+    "hint": "开通前查看余量，席位以实际核验为准。",
+    "reservedHint": "已预留 {count} 个席位，含待开通资格及有效注册卡。"
   }
 }

@@ -83,7 +83,7 @@ func (a *App) memberAccount(user store.User) map[string]any {
 		banner = truncateString(strings.TrimSpace(cfg.TelegramBannerText), 500)
 		bannerURL = publicHTTPSURL(cfg.TelegramBannerURL)
 	}
-	return map[string]any{
+	result := map[string]any{
 		"icon": a.publicServerIconURL(), "name": cfg.AppName,
 		"uid": user.UID, "username": user.Username, "emby_username": user.EmbyUsername,
 		"media_enabled": user.EmbyID != "" && !user.EmbyDisabled && a.embyShouldEnableUser(user), "has_emby": user.EmbyID != "",
@@ -96,6 +96,10 @@ func (a *App) memberAccount(user store.User) map[string]any {
 		"signin": a.signinPagePayload(user, 30), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.memberPasswordEmailRequired(user),
 		"viewing": a.memberViewing(user.UID),
 	}
+	if registration := a.memberRegistrationFor(user); registration != nil {
+		result["registration"] = registration
+	}
+	return result
 }
 
 func (a *App) memberViewing(uid int64) store.MemberViewing {

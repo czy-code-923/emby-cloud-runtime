@@ -235,7 +235,7 @@ func retentionNativeText(v store.RetentionView) string {
 		}
 		return time.Unix(value, 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04")
 	}
-	text := fmt.Sprintf("见微 Emby · 保号与签到\n\n· 当前方式  |  %s · %s\n· 播放截止  |  %s\n· 可用积分  |  %d · A需%d\n· 本窗签到  |  %d天\n· 可信观影  |  %d / %d分钟", mode, status, end, v.Balance, v.Policy.Cost, v.SigninDays, v.Seconds/60, v.Policy.WatchSeconds/60)
+	text := fmt.Sprintf("见微 Emby · 保号与签到\n\n· 🎯 当前方式 | %s · %s\n· 🗓 播放截止 | %s\n· 🍒 可用积分 | %d · A需%d\n· 📅 本窗签到 | %d天\n· 🎬 可信观影 | %d / %d分钟", mode, status, end, v.Balance, v.Policy.Cost, v.SigninDays, v.Seconds/60, v.Policy.WatchSeconds/60)
 	if !v.Policy.Enabled {
 		text += "\n\n活动保号尚未开启，当前不会自动扣分或按观影续期。"
 	}
