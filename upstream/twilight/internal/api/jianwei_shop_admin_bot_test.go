@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"github.com/prejudice-studio/twilight/internal/store"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 )
 
 func TestJianweiBotAdministratorReceiptRequiresRolePrivateAndConfirmation(t *testing.T) {
+	t.Setenv("TWILIGHT_TWO_FACTOR_KEY", base64.StdEncoding.EncodeToString([]byte(strings.Repeat("b", 32))))
 	a := newTestApp(t)
 	a.cfg().TelegramMode = true
 	a.cfg().TelegramBotToken = "fixture-admin-shop"
@@ -72,7 +74,7 @@ func TestJianweiBotAdministratorReceiptRequiresRolePrivateAndConfirmation(t *tes
 	call(admin.TelegramID, admin.TelegramID, "accept")
 	fresh, _ = a.store().ShopOrder(o.ID)
 	if fresh.Status != "issued" || fresh.ReceivedCents != 1999 || fresh.CheckedBy != admin.UID {
-		t.Fatal("approval failed", fresh.Status)
+		t.Fatal("approval failed", fresh.Status, requests[len(requests)-1]["text"])
 	}
 	key := fresh.CodeKey
 	call(admin.TelegramID, admin.TelegramID, "accept")
