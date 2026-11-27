@@ -6,6 +6,7 @@ import (
 	"html"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf16"
 )
 
@@ -38,12 +39,12 @@ func memberPanelCaption(text string, rows int, htmlText bool) string {
 		out.WriteRune(r)
 	}
 	text = out.String()
-	target := 20 - rows*2
-	if target < 6 {
-		target = 6
+	target := 18 - rows*2
+	if target < 5 {
+		target = 5
 	}
-	if target > 14 {
-		target = 14
+	if target > 12 {
+		target = 12
 	}
 	for strings.Count(text, "\n")+1 < target {
 		text += "\n\u2063"
@@ -64,16 +65,48 @@ func (a *App) telegramMemberAccountInfo(ctx context.Context, c telegramCommandCt
 			status = "播放已停用"
 		}
 	}
-	data := a.memberAccount(user)
 	text := fmt.Sprintf("见微 · 我的账户\n\n用户：%s\nTelegram ID：%d\n账户类别：%s\n当前状态：%s\n可用积分：%d\nEmby账号：%s", firstNonEmpty(user.EmbyUsername, user.TelegramUsername, user.Username), user.TelegramID, memberRoleName(user.Role), status, a.store().Wallet(user.UID).Available, firstNonEmpty(user.EmbyUsername, "尚未开通"))
 	if user.EmbyID != "" {
 		text += "\n有效期：" + telegramExpiryTimeLabel(user.ExpiredAt)
 	}
-	if data["security_code_set"] == false {
+	if user.SecurityCodeHash == "" {
 		text += "\n安全码：尚未设置"
+	}
+	viewing := a.memberViewing(user.UID)
+	watch, last := "暂无有效记录", "暂无记录"
+	if !viewing.Available {
+		watch, last = "暂不可用", "暂不可用"
+	} else {
+		if viewing.HasWindowRecords {
+			watch = memberViewingDuration(viewing.Seconds)
+		}
+		if viewing.LastWatchedAt > 0 {
+			last = time.Unix(viewing.LastWatchedAt, 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04:05")
+		}
+	}
+	text += "\n近30天有效观影：" + watch + "\n最后观影：" + last + "（北京时间）"
+	if viewing.Quality == "stale" {
+		text += "\n采集暂未更新，仅显示已确认记录"
+	} else if viewing.Quality == "disabled" {
+		text += "\n观影采集已关闭，仅显示已确认记录"
+	} else if viewing.Quality == "waiting" {
+		text += "\n等待服务器采样，不推算观影时长"
 	}
 	rows := [][]map[string]any{{memberButton("账号与线路", "/lines"), memberButton("设备管理", "/devices")}, {memberButton("签到与保号", "/retention"), memberButton("账户安全", "/account_security")}}
 	a.memberSendButtons(ctx, c.ChatID, text, rows)
+}
+
+func memberViewingDuration(seconds int64) string {
+	if seconds < 0 {
+		return "暂不可用"
+	}
+	if seconds >= 3600 {
+		return fmt.Sprintf("%d小时%d分%d秒", seconds/3600, seconds%3600/60, seconds%60)
+	}
+	if seconds >= 60 {
+		return fmt.Sprintf("%d分%d秒", seconds/60, seconds%60)
+	}
+	return fmt.Sprintf("%d秒", seconds)
 }
 
 func (a *App) telegramMemberMore(ctx context.Context, c telegramCommandCtx) {

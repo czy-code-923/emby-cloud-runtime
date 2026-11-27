@@ -11,7 +11,7 @@ import (
 // Grant facts and the single wallet survive, while transient credentials do not.
 func ValidateRetentionBackup(state *State) error {
 	r := &state.Retention
-	if r.Policy.Revision == 0 && len(r.Members) == 0 && len(r.Settlements) == 0 && len(r.Grants) == 0 {
+	if r.Policy.Revision == 0 && len(r.Members) == 0 && len(r.Settlements) == 0 && len(r.Grants) == 0 && len(r.Watches) == 0 && len(r.ViewingWatches) == 0 && len(r.LastWatchAt) == 0 {
 		return nil
 	}
 	if r.Policy.Validate() != nil || len(r.Members) > 100000 || len(r.Settlements) > 1000000 || len(r.Grants) > 1000000 {
@@ -60,6 +60,21 @@ func ValidateRetentionBackup(state *State) error {
 		for _, v := range items {
 			if v.Start < 0 || v.End <= v.Start || v.End-v.Start > 37*retention.Day {
 				return fmt.Errorf("invalid retention viewing interval")
+			}
+		}
+	}
+	for uid, last := range r.LastWatchAt {
+		if _, ok := state.Users[uid]; !ok || last <= 0 {
+			return fmt.Errorf("invalid last verified viewing timestamp")
+		}
+	}
+	for uid, items := range r.ViewingWatches {
+		if _, ok := state.Users[uid]; !ok || len(items) > 10000 {
+			return fmt.Errorf("invalid verified viewing history")
+		}
+		for _, item := range items {
+			if item.Start < 0 || item.End <= item.Start || item.End-item.Start > 37*retention.Day {
+				return fmt.Errorf("invalid verified viewing history interval")
 			}
 		}
 	}

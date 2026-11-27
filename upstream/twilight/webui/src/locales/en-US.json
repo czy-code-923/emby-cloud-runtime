@@ -4184,5 +4184,23 @@
     "serviceIneligible": "An existing account and eligible service history are required. Administrators and active whitelist members already have access.",
     "serviceDraftHelp": "Before creating dedicated libraries, keep the service disabled to save its name and domains as a draft. Enabling requires a real dedicated library. Do not select existing movie libraries accidentally. Points listings require a positive price.",
     "cashShop": "Membership card shop"
+  },
+  "viewing": {
+    "window": "Verified viewing in the last 30 days",
+    "last": "Last verified viewing",
+    "noWindowRecords": "No verified records",
+    "noRecords": "No records",
+    "unavailable": "Unavailable",
+    "timezone": "Beijing time · confirmed records only",
+    "stale": "Collection is out of date. Only confirmed records are shown.",
+    "disabled": "Viewing collection is disabled. Only confirmed records are shown.",
+    "waiting": "Waiting for server samples; viewing time is never estimated.",
+    "source": "Measurement and reporting",
+    "rule": "The rolling 30 days up to now, based on verified server playback progress. Pauses, seeks and reporting gaps earn no time. Overlapping devices count only once.",
+    "sampledAt": "Last server sample:",
+    "durationHMS": "{hours}h {minutes}m {seconds}s",
+    "durationMS": "{minutes}m {seconds}s",
+    "durationS": "{seconds}s",
+    "availablePoints": "Available points"
   }
 }

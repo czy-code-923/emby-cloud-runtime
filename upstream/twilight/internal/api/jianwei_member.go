@@ -94,7 +94,16 @@ func (a *App) memberAccount(user store.User) map[string]any {
 		"invite_enabled": cfg.InviteEnabled, "requests_enabled": cfg.MediaRequestEnabled, "request_daily_limit": cfg.MediaRequestDailyLimit,
 		"banner_image": publicHTTPSURL(cfg.TelegramBannerImageURL), "shop_url": shop, "banner": banner, "banner_url": bannerURL,
 		"signin": a.signinPagePayload(user, 30), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.memberPasswordEmailRequired(user),
+		"viewing": a.memberViewing(user.UID),
 	}
+}
+
+func (a *App) memberViewing(uid int64) store.MemberViewing {
+	v, err := a.store().MemberViewing(uid, time.Now().Unix())
+	if err != nil {
+		return store.MemberViewing{Quality: "unavailable"}
+	}
+	return v
 }
 
 func (a *App) handleMemberMediaRequests(w http.ResponseWriter, r *http.Request, _ Params) {

@@ -3159,6 +3159,14 @@ func (s *Store) deleteUserStateLocked(uid int64) error {
 
 	// 签到积分 / 历史。
 	delete(s.state.Signin, uid)
+	delete(s.state.Retention.LastWatchAt, uid)
+	delete(s.state.Retention.Watches, uid)
+	delete(s.state.Retention.ViewingWatches, uid)
+	for session, sample := range s.state.Retention.Samples {
+		if sample.UID == uid {
+			delete(s.state.Retention.Samples, session)
+		}
+	}
 
 	// 设备指纹：要必须清，否则同 UID 重新创建（管理员复用编号）会继承
 	// 旧设备的 trusted 标记，等价于"复用 UID 直接绕过设备校验"。

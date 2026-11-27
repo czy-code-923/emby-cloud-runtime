@@ -4184,5 +4184,23 @@
     "serviceIneligible": "需已有統一帳號且符合本服務開通/續期條件；管理員和有效白名單已包含，無需重複購買。",
     "serviceDraftHelp": "尚未建立專屬媒體庫時，可保持服務關閉後儲存名稱、網域等草稿。啟用必須選擇真實專屬庫；請勿誤選現有電影或劇集。積分商品啟用時需正整數價格。",
     "cashShop": "會員發卡商店"
+  },
+  "viewing": {
+    "window": "最近30天有效觀影",
+    "last": "最後一次有效觀影",
+    "noWindowRecords": "暫無有效紀錄",
+    "noRecords": "暫無紀錄",
+    "unavailable": "暫不可用",
+    "timezone": "北京時間 · 僅統計已確認的觀影紀錄",
+    "stale": "採集暫未更新，僅顯示已確認紀錄。",
+    "disabled": "觀影採集已關閉，僅顯示已確認紀錄。",
+    "waiting": "等待伺服器採樣，不推算觀影時長。",
+    "source": "統計口徑與回傳時間",
+    "rule": "統計截至目前的最近30天。以伺服器播放會話的有效進度為依據；暫停、跳進度、斷報不計入，同一時段多裝置不重複計算。",
+    "sampledAt": "最後伺服器採樣：",
+    "durationHMS": "{hours}小時{minutes}分{seconds}秒",
+    "durationMS": "{minutes}分{seconds}秒",
+    "durationS": "{seconds}秒",
+    "availablePoints": "剩餘可用積分"
   }
 }

@@ -12,15 +12,17 @@ var ErrRetentionModeLocked = fmt.Errorf("本窗口已选择保号方式，不能
 // All wallet debits, grant facts, window decisions and delivery intentions
 // share the state CAS transaction. Delivery retries never repeat a debit.
 type RetentionState struct {
-	Policy      retention.Policy              `json:"policy"`
-	Members     map[int64]RetentionMember     `json:"members"`
-	Quotes      map[string]RetentionQuote     `json:"quotes"`
-	Settlements map[string]RetentionLedger    `json:"settlements"`
-	Grants      map[string]RetentionGrant     `json:"grants"`
-	Samples     map[string]RetentionSample    `json:"samples"`
-	Watches     map[int64][]RetentionInterval `json:"watches"`
-	LastPoll    int64                         `json:"last_poll"`
-	Quality     string                        `json:"quality"`
+	Policy         retention.Policy              `json:"policy"`
+	Members        map[int64]RetentionMember     `json:"members"`
+	Quotes         map[string]RetentionQuote     `json:"quotes"`
+	Settlements    map[string]RetentionLedger    `json:"settlements"`
+	Grants         map[string]RetentionGrant     `json:"grants"`
+	Samples        map[string]RetentionSample    `json:"samples"`
+	Watches        map[int64][]RetentionInterval `json:"watches"`
+	ViewingWatches map[int64][]RetentionInterval `json:"viewing_watches,omitempty"`
+	LastWatchAt    map[int64]int64               `json:"last_watch_at,omitempty"`
+	LastPoll       int64                         `json:"last_poll"`
+	Quality        string                        `json:"quality"`
 }
 type RetentionMember struct {
 	Member          retention.Member `json:"member"`
@@ -113,6 +115,15 @@ func (r *RetentionState) ensure() {
 	}
 	if r.Watches == nil {
 		r.Watches = map[int64][]RetentionInterval{}
+	}
+	if r.LastWatchAt == nil {
+		r.LastWatchAt = map[int64]int64{}
+	}
+	if r.ViewingWatches == nil {
+		r.ViewingWatches = map[int64][]RetentionInterval{}
+		for uid, items := range r.Watches {
+			r.ViewingWatches[uid] = append([]RetentionInterval{}, items...)
+		}
 	}
 }
 func (s *Store) RetentionPolicy() retention.Policy {
@@ -458,7 +469,11 @@ func (s *Store) ObserveRetention(observations []RetentionObservation, now int64)
 			dt, dp := now-prev.At, v.Position-prev.Position
 			if found && prev.UID == v.UID && prev.Item == v.Item && dt > 0 && dt <= 90 && dp > 0 && dp <= dt+5 && dp >= max(int64(1), dt-10) {
 				sample.Start = prev.Start
-				r.Watches[v.UID] = append(r.Watches[v.UID], RetentionInterval{Start: prev.At, End: now})
+				// A short buffer/progress delay cannot earn more seconds than
+				// either elapsed time or the observed playback advancement.
+				r.Watches[v.UID] = append(r.Watches[v.UID], RetentionInterval{Start: now - min(dt, dp), End: now})
+				r.ViewingWatches[v.UID] = append(r.ViewingWatches[v.UID], RetentionInterval{Start: now - min(dt, dp), End: now})
+				r.LastWatchAt[v.UID] = max(r.LastWatchAt[v.UID], now)
 			}
 			next[v.Session] = sample
 		}
@@ -468,6 +483,17 @@ func (s *Store) ObserveRetention(observations []RetentionObservation, now int64)
 		for uid, items := range r.Watches {
 			merged, _ := unionRetentionIntervals(items, now-37*retention.Day, now)
 			r.Watches[uid] = merged
+		}
+		for uid, items := range r.ViewingWatches {
+			// Backfill only persisted verified evidence before trimming old
+			// intervals, so the last viewing time survives the 37-day buffer.
+			for _, item := range items {
+				if item.Start >= 0 && item.End > item.Start && item.End <= now {
+					r.LastWatchAt[uid] = max(r.LastWatchAt[uid], item.End)
+				}
+			}
+			merged, _ := unionRetentionIntervals(items, now-37*retention.Day, now)
+			r.ViewingWatches[uid] = merged
 		}
 		for uid := range r.Members {
 			s.evaluateRetentionLocked(uid, false, now)

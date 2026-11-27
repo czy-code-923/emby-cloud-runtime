@@ -4168,5 +4168,23 @@
     "serviceIneligible": "需已有统一账号且符合本服务开通/续期条件；管理员和有效白名单已包含，无需重复购买。",
     "serviceDraftHelp": "尚未创建专属媒体库时，可保持服务关闭后保存名称、域名等草稿。启用必须选择真实专属库；请勿误选现有电影或剧集。积分商品启用时需正整数价格。",
     "cashShop": "会员发卡商店"
+  },
+  "viewing": {
+    "window": "最近30天有效观影",
+    "last": "最后一次有效观影",
+    "noWindowRecords": "暂无有效记录",
+    "noRecords": "暂无记录",
+    "unavailable": "暂不可用",
+    "timezone": "北京时间 · 仅统计已确认的观影记录",
+    "stale": "采集暂未更新，仅显示已确认记录。",
+    "disabled": "观影采集已关闭，仅显示已确认记录。",
+    "waiting": "等待服务器采样，不推算观影时长。",
+    "source": "统计口径与回传时间",
+    "rule": "统计截至当前的最近30天。以服务器播放会话的有效进度为依据；暂停、跳进度、断报不计入，同一时段多设备不重复计算。",
+    "sampledAt": "最后服务器采样：",
+    "durationHMS": "{hours}小时{minutes}分{seconds}秒",
+    "durationMS": "{minutes}分{seconds}秒",
+    "durationS": "{seconds}秒",
+    "availablePoints": "剩余可用积分"
   }
 }
