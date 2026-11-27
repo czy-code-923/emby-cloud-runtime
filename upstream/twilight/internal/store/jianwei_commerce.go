@@ -123,6 +123,9 @@ func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) err
 		if c.ID == "" || channels[c.ID] || len(c.ID) > 40 || len(c.Name) > 80 || len(c.Account) > 100 || len(c.Instructions) > 4000 || len(c.QRURL) > 1000 || (c.Kind != "alipay_phrase" && c.Kind != "alipay_qr" && c.Kind != "wechat_qr") {
 			return ErrInvalid
 		}
+		if settings.Enabled && c.Enabled && (strings.TrimSpace(c.Account) == "" || strings.TrimSpace(c.Instructions) == "" || (c.Kind != "alipay_phrase" && c.QRURL == "")) {
+			return ErrInvalid
+		}
 		channels[c.ID] = true
 		if c.Enabled && strings.TrimSpace(c.Account) != "" && strings.TrimSpace(c.Instructions) != "" && (c.Kind == "alipay_phrase" || c.QRURL != "") {
 			if settings.DefaultChannel == c.ID {

@@ -11,6 +11,9 @@ import (
 )
 
 func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
+	if a.memberCooldown(w, r, "redeem-code", 5) {
+		return
+	}
 	p := current(r)
 	if a.requireEmailVerified(w, p.User) {
 		return

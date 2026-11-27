@@ -12,6 +12,9 @@ import (
 )
 
 func (a *App) handleMediaSearch(w http.ResponseWriter, r *http.Request, params Params) {
+	if a.memberCooldown(w, r, "metadata-search", 5) {
+		return
+	}
 	query := firstNonEmpty(r.URL.Query().Get("q"), r.URL.Query().Get("query"), r.URL.Query().Get("keyword"))
 	limit := clamp(queryInt(r, "limit", queryInt(r, "per_page", 20)), 1, 50)
 	// The source-specific aliases are part of the public API and take precedence
@@ -185,7 +188,7 @@ func (a *App) handleCreateMediaRequest(w http.ResponseWriter, r *http.Request, _
 		mediaID = int64(time.Now().UnixNano())
 	}
 
-	createOpts := store.MediaRequestCreateOptions{UserActiveLimit: a.cfg().MaxConcurrentRequestsPerUser}
+	createOpts := store.MediaRequestCreateOptions{UserActiveLimit: a.cfg().MaxConcurrentRequestsPerUser, DailyLimit: a.cfg().MediaRequestDailyLimit, CooldownSeconds: 30}
 	// Global queue limit does not apply to admins so they can still handle urgent requests.
 	if globalLimit := a.cfg().MaxConcurrentRequestsGlobal; globalLimit > 0 && p.User.Role != store.RoleAdmin {
 		createOpts.GlobalActiveLimit = globalLimit
@@ -204,6 +207,15 @@ func (a *App) handleCreateMediaRequest(w http.ResponseWriter, r *http.Request, _
 		Note:          note,
 		MediaInfo:     mediaInfo,
 	}, createOpts)
+	if errors.Is(err, store.ErrMediaRequestDailyLimit) {
+		fail(w, 429, fmt.Sprintf("每日最多求片%d部，明天再试；删除申请不返还名额", createOpts.DailyLimit))
+		return
+	}
+	if errors.Is(err, store.ErrMediaRequestCooldown) {
+		w.Header().Set("Retry-After", "30")
+		failWithCodeData(w, 429, ErrRateLimited, "求片提交后请等待30秒", map[string]any{"retry_after_seconds": 30})
+		return
+	}
 	if errors.Is(err, store.ErrMediaRequestUserActiveLimit) {
 		failWithCode(w, http.StatusTooManyRequests, ErrMediaRequestPendingLimit, "pending media request limit reached")
 		return

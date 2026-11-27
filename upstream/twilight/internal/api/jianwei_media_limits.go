@@ -188,16 +188,30 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 	entry := cache.items[key]
 	cache.mu.Unlock()
 	if time.Now().After(entry.until) {
-		endpoint, err := a.validatedEmbyEndpoint("/Users/Me")
+		login, known := a.store().MediaClientLogin(a.mediaTokenHash(token))
+		if !known {
+			fail(w, 401, "播放鉴权已更新，请退出播放器账号后重新登录一次")
+			return
+		}
+		endpoint, err := a.validatedEmbyEndpoint("/Sessions")
 		if err != nil {
 			fail(w, 503, "媒体服务暂不可用")
 			return
 		}
-		var remote map[string]any
-		if err = getJSON(ctx, endpoint, map[string]string{"X-Emby-Token": token}, &remote); err != nil {
-			fail(w, 401, "请重新登录 Emby")
+		var sessions []map[string]any
+		if err = getJSON(ctx, endpoint, map[string]string{"X-Emby-Token": token}, &sessions); err != nil {
+			fail(w, 401, "播放会话已失效，请重新登录")
 			return
 		}
+		remote, found, err := a.embyUserByID(ctx, login.EmbyID)
+		if err != nil || !found {
+			fail(w, 401, "无法验证播放账号")
+			return
+		}
+		if device == "" {
+			device = login.DeviceID
+		}
+
 		if embyRemoteIsAdministrator(remote) {
 			fail(w, 403, "Emby 服务器管理员请使用安全入口；播放请使用普通媒体账户")
 			return
@@ -213,6 +227,24 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 		}
 		cache.items[key] = entry
 		cache.mu.Unlock()
+	}
+	// A token subject cannot request another account's library or preferences.
+	if strings.HasPrefix(path, "/users/") {
+		subject := strings.Split(strings.TrimPrefix(path, "/users/"), "/")[0]
+		if !strings.EqualFold(subject, entry.id) {
+			fail(w, 403, "不能访问其他账号的媒体资源")
+			return
+		}
+	}
+	for k, values := range uri.Query() {
+		if strings.EqualFold(k, "UserId") {
+			for _, v := range values {
+				if v != "" && !strings.EqualFold(v, entry.id) {
+					fail(w, 403, "不能访问其他账号的媒体资源")
+					return
+				}
+			}
+		}
 	}
 	u, found := a.store().FindUserByEmbyID(entry.id)
 	u = effectiveMember(u)

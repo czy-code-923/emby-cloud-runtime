@@ -61,7 +61,7 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 	}
 	if cfg.TelegramShopEnabled {
 		if target := publicHTTPSURL(cfg.CommerceStoreURL); target != "" {
-			links = append(links, map[string]any{"text": "发卡商店 ↗", "url": target})
+			links = append(links, memberButton("发卡商店 ↗", "/shopcode"))
 		}
 	}
 	if len(links) > 0 {

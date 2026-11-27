@@ -91,9 +91,9 @@ func (a *App) memberAccount(user store.User) map[string]any {
 		"email_enabled": emailConfigured(cfg), "email_verified": user.EmailVerified, "email_masked": maskEmail(user.Email),
 		"signin_enabled": cfg.SigninEnabled, "last_signin": si.LastSignin,
 		"can_register":   user.EmbyID == "" && (user.PendingEmby || cfg.EmbyDirectRegisterEnabled),
-		"invite_enabled": cfg.InviteEnabled, "requests_enabled": cfg.MediaRequestEnabled,
+		"invite_enabled": cfg.InviteEnabled, "requests_enabled": cfg.MediaRequestEnabled, "request_daily_limit": cfg.MediaRequestDailyLimit,
 		"banner_image": publicHTTPSURL(cfg.TelegramBannerImageURL), "shop_url": shop, "banner": banner, "banner_url": bannerURL,
-		"signin": a.signinPagePayload(user, 12), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.memberPasswordEmailRequired(user),
+		"signin": a.signinPagePayload(user, 30), "role": user.Role, "security_code_set": user.SecurityCodeHash != "", "password_email_required": a.memberPasswordEmailRequired(user),
 	}
 }
 

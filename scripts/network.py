@@ -264,7 +264,17 @@ class Network:
    header_up X-JW-Method {http.request.method}
    header_up X-JW-Client-IP {http.request.remote.host}
   }
-  reverse_proxy 127.0.0.1:18096
+  @client_login path /Users/AuthenticateByName /emby/Users/AuthenticateByName
+  handle @client_login {
+   rewrite * /api/v2/internal/emby-login
+   reverse_proxy 127.0.0.1:13000 {
+    header_up X-JW-Gateway {$BOT_INTERNAL_SECRET}
+    header_up X-JW-Client-IP {http.request.remote.host}
+   }
+  }
+  handle {
+   reverse_proxy 127.0.0.1:18096
+  }
  }
 '''
             else:

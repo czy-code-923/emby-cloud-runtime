@@ -294,14 +294,14 @@ func (a *App) sendMemberHero(ctx context.Context, chatID int64, text string, row
 	cfg := a.cfg()
 	photo := publicHTTPSURL(cfg.TelegramPanelImageURL)
 	// The previous built-in URL is migrated without replacing custom artwork.
-	if photo != "" && photo == strings.TrimRight(cfg.PublicBaseURL, "/")+"/brand/jianwei-panel.png" {
-		photo = strings.TrimRight(cfg.PublicBaseURL, "/") + "/brand/jianwei-panel-v2.png"
+	if photo != "" && (photo == strings.TrimRight(cfg.PublicBaseURL, "/")+"/brand/jianwei-panel.png" || photo == strings.TrimRight(cfg.PublicBaseURL, "/")+"/brand/jianwei-panel-v2.png") {
+		photo = strings.TrimRight(cfg.PublicBaseURL, "/") + "/brand/jianwei-panel-v3.png"
 	}
 	if cfg.TelegramBannerEnabled && publicHTTPSURL(cfg.TelegramBannerImageURL) != "" {
 		photo = publicHTTPSURL(cfg.TelegramBannerImageURL)
 	}
 	if photo == "" && publicHTTPSURL(cfg.PublicBaseURL) != "" {
-		photo = strings.TrimRight(cfg.PublicBaseURL, "/") + "/brand/jianwei-panel-v2.png"
+		photo = strings.TrimRight(cfg.PublicBaseURL, "/") + "/brand/jianwei-panel-v3.png"
 	}
 	markup := map[string]any{"inline_keyboard": rows}
 	if cfg.TelegramPanelImageEnabled && photo != "" {

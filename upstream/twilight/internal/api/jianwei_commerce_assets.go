@@ -29,7 +29,7 @@ func (a *App) handleCommerceImageUpload(w http.ResponseWriter, r *http.Request, 
 	if !a.adminShopIntent(w, r, map[string]any{"password": r.FormValue("password")}) {
 		return
 	}
-	origin := publicHTTPSURL(a.cfg().CommerceStoreURL)
+	origin := shopSiteOrigin(a.cfg().CommerceStoreURL)
 	if origin == "" {
 		fail(w, 409, "请先配置商店HTTPS域名")
 		return

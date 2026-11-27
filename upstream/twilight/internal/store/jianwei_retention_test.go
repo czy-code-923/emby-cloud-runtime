@@ -68,7 +68,7 @@ func TestJianweiRetentionAtomicSigninSettlementAndFutureWindow(t *testing.T) {
 	if _, e = s.RetentionPreview(u.UID, "B", "quote-b", now+3); e == nil {
 		t.Fatal("cooldown bypass", e)
 	}
-	if e = s.RetentionWithdraw(u.UID); e != nil {
+	if e = s.RetentionWithdraw(u.UID); e != ErrRetentionModeLocked {
 		t.Fatal(e)
 	}
 	if _, e = s.RetentionPreview(u.UID, "B", "quote-b", now+4); e == nil {

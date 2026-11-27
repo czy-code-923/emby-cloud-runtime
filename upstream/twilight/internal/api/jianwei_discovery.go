@@ -65,6 +65,9 @@ func (a *App) handleMemberLibrary(w http.ResponseWriter, r *http.Request, _ Para
 	}
 	favorites := !strings.HasSuffix(r.URL.Path, "/library")
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if !favorites && a.memberCooldown(w, r, "library-search", 5) {
+		return
+	}
 	if !favorites && (len([]rune(query)) < 2 || len(query) > 120) {
 		fail(w, 400, "请输入2至120个字符的片名")
 		return

@@ -350,6 +350,7 @@ type Config struct {
 	SystemUpdateTime                  string
 
 	MediaRequestEnabled          bool
+	MediaRequestDailyLimit       int
 	MaxConcurrentRequestsPerUser int
 	MaxConcurrentRequestsGlobal  int
 	SigninEnabled                bool
@@ -575,6 +576,8 @@ func loadConfig(path string, overrides bool) (Config, error) {
 	cfg.RegCodeRandomAlgorithm = reader.stringValue(cfg.RegCodeRandomAlgorithm, "SAR.regcode_random_algorithm", "Register.regcode_random_algorithm", "regcode_random_algorithm")
 	cfg.InviteCodeRandomAlgorithm = reader.stringValue(cfg.InviteCodeRandomAlgorithm, "SAR.invite_code_random_algorithm", "Register.invite_code_random_algorithm", "invite_code_random_algorithm")
 	cfg.MediaRequestEnabled = reader.boolValue(cfg.MediaRequestEnabled, "SAR.media_request_enabled", "Register.media_request_enabled", "media_request_enabled")
+	cfg.MediaRequestDailyLimit = reader.intValue(5, "SAR.media_request_daily_limit")
+	cfg.MediaRequestDailyLimit = max(1, min(50, cfg.MediaRequestDailyLimit))
 	cfg.MaxConcurrentRequestsPerUser = reader.intValue(cfg.MaxConcurrentRequestsPerUser, "SAR.max_concurrent_requests_per_user", "Register.max_concurrent_requests_per_user", "max_concurrent_requests_per_user")
 	cfg.MaxConcurrentRequestsGlobal = reader.intValue(cfg.MaxConcurrentRequestsGlobal, "SAR.max_concurrent_requests_global", "Register.max_concurrent_requests_global", "max_concurrent_requests_global")
 	cfg.SigninEnabled = reader.boolValue(cfg.SigninEnabled, "SAR.signin_enabled", "Signin.enabled", "signin_enabled")

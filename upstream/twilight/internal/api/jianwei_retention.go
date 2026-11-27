@@ -20,6 +20,8 @@ func retentionError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, retention.ErrUnavailable), errors.Is(err, store.ErrEmbyRequired):
 		message = "当前尚不能选择保号方式，请先开通 Emby；免保号账号需剩余不足30天且管理员已开启功能"
+	case errors.Is(err, store.ErrRetentionModeLocked):
+		message = store.ErrRetentionModeLocked.Error()
 	case errors.Is(err, retention.ErrCooldown):
 		message = "距离上次实际选择或更换尚未满20天"
 	case errors.Is(err, retention.ErrStale), errors.Is(err, store.ErrConflict):
@@ -251,7 +253,7 @@ func retentionNativeText(v store.RetentionView) string {
 	if m.NextSwitchAt > now {
 		text += fmt.Sprintf("\n· 可更换于  |  %s（剩余%d天%d小时）", format(m.NextSwitchAt), (m.NextSwitchAt-now)/86400, ((m.NextSwitchAt-now)%86400)/3600)
 	} else {
-		text += "\n· 方式切换  |  可选择；真正变更后冷却20天"
+		text += "\n· 方式切换  |  可选择；选择后锁定，仅管理员可修改"
 	}
 	quality := map[string]string{"disabled": "功能未开启", "waiting": "等待首次服务器采样", "stale": "采样已过期，缺报不会记为有效观影", "server_session_samples": "服务器采样正常"}[v.Quality]
 	if quality == "" {
@@ -261,7 +263,7 @@ func retentionNativeText(v store.RetentionView) string {
 	if v.AccessUntil > v.End && now >= v.End {
 		text += "\n· 救济播放至  |  " + format(v.AccessUntil) + "；补救须单独确认，不静默追扣。"
 	}
-	text += fmt.Sprintf("\n\nA：明确授权后，每个30天窗口扣%d积分续30天，无签到次数硬门槛。\nB：本窗有效观影满30分钟，免费续30天。\n实际更换后冷却20天；随时可撤销未提交的A扣分授权。\n签到 /signin · 选择 /retention A 或 /retention B\n撤回 /retention off", v.Policy.Cost)
+	text += fmt.Sprintf("\n\nA：明确授权后，每个30天窗口扣%d积分续30天，无签到次数硬门槛。\nB：本窗有效观影满30分钟，免费续30天。\n确认选择后用户不能撤回或更换，只能联系管理员调整。\n签到 /signin · 选择 /retention A 或 /retention B\n需要修改请联系管理员", v.Policy.Cost)
 	return text
 }
 func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
@@ -296,9 +298,9 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 		d, _ := data.(map[string]any)
 		q, _ := d["quote"].(map[string]any)
 		token := asString(d["token"])
-		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分，顺延30天，可随时撤回。B不扣积分。\n下一次可更换时间：%s\n确认120秒内有效。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"], time.Unix(int64(numeric(q["next_switch_at"])), 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04"))
+		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分，顺延30天，可随时撤回。B不扣积分。\n下一次可更换时间：%s\n确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"], time.Unix(int64(numeric(q["next_switch_at"])), 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04"))
 		if purchase, _ := d["purchase"].(bool); purchase {
-			message = fmt.Sprintf("积分免保号卡 · %s\n本次扣除%v积分，保留当前剩余时长，追加卡券天数并暂停活动自动扣分。\n这是独立的单次交易，不会开启自动购买订阅。确认120秒内有效。", q["target_mode"], q["cost"])
+			message = fmt.Sprintf("积分免保号卡 · %s\n本次扣除%v积分，保留当前剩余时长，追加卡券天数并暂停活动自动扣分。\n这是独立的单次交易，不会开启自动购买订阅。确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["cost"])
 		}
 		if rescue, _ := d["rescue"].(bool); rescue {
 			message = fmt.Sprintf("明确补救确认\n本次需%v积分，已有可信观影%v秒。成功按原截止顺延30天，已使用的救济时间包含在内。A需本次明确授权，不静默追扣。", q["cost"], q["watch_seconds"])
@@ -320,7 +322,7 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 			if v.Selectable {
 				rows = append([][]map[string]any{{{"text": "A · 签到积分", "callback_data": "jw:/retention A"}, {"text": "B · 观影保号", "callback_data": "jw:/retention B"}}}, rows...)
 			}
-			if v.Member.Member.Participation {
+			if false && v.Member.Member.Participation {
 				rows = append([][]map[string]any{{{"text": "撤回自动保号参与", "callback_data": "jw:/retention off"}}}, rows...)
 			}
 		}
@@ -334,4 +336,27 @@ func init() {
 	for _, name := range []string{"retention", "retention_confirm"} {
 		telegramCommandRegistry["/"+name] = telegramCommandSpec{name: name, label: "/" + name, description: "查看与选择签到或观影保号", usage: "/retention [A|B|off|month|quarter|year|rescue]", category: "user", order: 45, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramRetention(ctx, c) }}
 	}
+}
+
+func (a *App) handleAdminRetentionMode(w http.ResponseWriter, r *http.Request, p Params) {
+	b := decodeMap(r)
+	if requireAdmin(w, r) || !requireWebUIIntent(w, r, "retention-admin") || !a.twoFactorPassword(w, r, b) {
+		return
+	}
+	uid, e := int64Param(p, "uid")
+	if e != nil {
+		fail(w, 400, "无效用户")
+		return
+	}
+	mode := stringValue(b, "mode")
+	note := strings.TrimSpace(stringValue(b, "note"))
+	if len(note) < 3 || len(note) > 500 {
+		fail(w, 400, "请填写调整原因（3–500字）")
+		return
+	}
+	if retentionError(w, a.store().AdminRetentionMode(uid, mode, time.Now().Unix())) {
+		return
+	}
+	a.audit(r, "admin_retention_mode_changed", "retention", uid, map[string]any{"mode": mode, "note": note})
+	ok(w, "已调整保号方式", nil)
 }

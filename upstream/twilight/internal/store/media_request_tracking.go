@@ -219,6 +219,7 @@ func ValidateMediaRequestTrackingBackup(state *State) error {
 	}
 	// Host liveness and delivery leases are operational, not imported facts.
 	state.MediaWorkerLastSeen = 0
+	state.MediaClientLogins = nil
 	for id, request := range state.MediaRequests {
 		request.NotificationLeaseUntil = 0
 		state.MediaRequests[id] = request

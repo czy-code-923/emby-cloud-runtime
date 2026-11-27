@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+var ErrRetentionModeLocked = fmt.Errorf("已选择保号方式，用户不能撤回或更换；请联系管理员")
+
 // All wallet debits, grant facts, window decisions and delivery intentions
 // share the state CAS transaction. Delivery retries never repeat a debit.
 type RetentionState struct {
@@ -250,7 +252,7 @@ func (s *Store) retentionViewLocked(uid, now int64) (RetentionView, error) {
 	} else if now-s.state.Retention.LastPoll > 90 {
 		quality = "stale"
 	}
-	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.availablePointsLocked(uid), Frozen: s.state.Finance.Holds[uid], Selectable: u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: quality, Username: u.Username, EmbyName: u.EmbyUsername, Ledger: ledger}, nil
+	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.availablePointsLocked(uid), Frozen: s.state.Finance.Holds[uid], Selectable: r.Member.Mode == "" && u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: quality, Username: u.Username, EmbyName: u.EmbyUsername, Ledger: ledger}, nil
 }
 func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (RetentionQuote, error) {
 	s.mu.Lock()
@@ -279,6 +281,9 @@ func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (Re
 			s.state.Retention.Quotes[token] = quote
 			s.state.Retention.Members[uid] = r
 			return nil
+		}
+		if r.Member.Mode != "" {
+			return ErrRetentionModeLocked
 		}
 		selection, err := retention.Preview(r.Member, s.walletLocked(uid), s.retentionProgressLocked(r, now), p, target, now)
 		if err != nil {
@@ -323,6 +328,9 @@ func (s *Store) RetentionConfirm(uid int64, token string, risk, consent bool, ca
 			delete(s.state.Retention.Quotes, token)
 			return nil
 		}
+		if r.Member.Mode != "" {
+			return ErrRetentionModeLocked
+		}
 		m, err := retention.Confirm(r.Member, s.walletLocked(uid), s.retentionProgressLocked(r, now), p, q.Selection, risk, consent, cap, now)
 		if err != nil {
 			return err
@@ -334,21 +342,8 @@ func (s *Store) RetentionConfirm(uid int64, token string, risk, consent bool, ca
 		return nil
 	})
 }
-func (s *Store) RetentionWithdraw(uid int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.mutateAndSaveLocked(func() error {
-		s.state.Retention.ensure()
-		u, ok := s.state.Users[uid]
-		if !ok {
-			return ErrNotFound
-		}
-		r := s.retentionMemberLocked(u)
-		r.Member = retention.Withdraw(r.Member)
-		s.state.Retention.Members[uid] = r
-		return nil
-	})
-}
+func (s *Store) RetentionWithdraw(uid int64) error { return ErrRetentionModeLocked }
+
 func (s *Store) evaluateRetentionLocked(uid int64, rescue bool, now int64) bool {
 	r, ok := s.state.Retention.Members[uid]
 	if !ok {
@@ -469,6 +464,46 @@ func (s *Store) RetentionDelivery(uid, version int64, notified bool) error {
 			r.AppliedVersion = version
 		}
 		s.state.Retention.Members[uid] = r
+		return nil
+	})
+}
+
+func (s *Store) AdminRetentionMode(uid int64, mode string, now int64) error {
+	if mode != "A" && mode != "B" && mode != "off" {
+		return ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateAndSaveLocked(func() error {
+		s.state.Retention.ensure()
+		u, ok := s.state.Users[uid]
+		if !ok {
+			return ErrNotFound
+		}
+		if u.EmbyID == "" || u.Role != RoleNormal || u.ExpiredAt < 0 {
+			return ErrEmbyRequired
+		}
+		r := s.retentionMemberLocked(u)
+		r.Member.Mode = mode
+		r.Member.Participation = mode != "off"
+		r.Member.Consent = mode == "A"
+		r.Member.ConsentCap = 0
+		if mode == "A" {
+			r.Member.ConsentCap = r.Policy.Cost
+		}
+		if mode == "off" {
+			r.Member.Mode = ""
+		}
+		r.Member.Version++
+		r.Member.Epoch++
+		r.Member.LastChangedAt = now
+		r.Member.NextSwitchAt = 0
+		s.state.Retention.Members[uid] = r
+		for token, q := range s.state.Retention.Quotes {
+			if q.UID == uid {
+				delete(s.state.Retention.Quotes, token)
+			}
+		}
 		return nil
 	})
 }

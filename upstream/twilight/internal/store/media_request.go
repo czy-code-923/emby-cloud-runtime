@@ -17,7 +17,15 @@ const (
 	MediaRequestStatusFailed      = "FAILED"
 )
 
+type MediaRequestQuota struct {
+	Date   string `json:"date"`
+	Count  int    `json:"count"`
+	LastAt int64  `json:"last_at"`
+}
+
 type MediaRequestCreateOptions struct {
+	DailyLimit        int
+	CooldownSeconds   int64
 	UserActiveLimit   int
 	GlobalActiveLimit int
 }

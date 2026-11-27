@@ -128,6 +128,9 @@ func (a *App) handlePointsCatalog(w http.ResponseWriter, r *http.Request, _ Para
 	ok(w, "OK", map[string]any{"enabled": p.Enabled, "can_purchase": u.EmbyID != "" && u.Active && u.ExpiredAt >= 0 && u.Role != store.RoleAdmin, "wallet": a.store().Wallet(u.UID), "items": items})
 }
 func (a *App) handlePointsPurchase(w http.ResponseWriter, r *http.Request, _ Params) {
+	if a.memberCooldown(w, r, "points-exchange", 10) {
+		return
+	}
 	b := decodeMap(r)
 	if !boolValue(b, "confirm", false) {
 		fail(w, 400, "请确认积分价格及单次定向发码")

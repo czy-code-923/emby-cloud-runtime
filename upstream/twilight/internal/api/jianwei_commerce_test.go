@@ -120,7 +120,7 @@ func TestJianweiPanelCallbacksEditOriginatingMessage(t *testing.T) {
 		t.Fatal("wrong message edited")
 	}
 	raw, _ := json.Marshal(m)
-	if !strings.Contains(string(raw), "jw:/panel") || !strings.Contains(string(raw), "https://shop.example.test") {
+	if !strings.Contains(string(raw), "jw:/panel") || !strings.Contains(string(raw), "jw:/shopcode") {
 		t.Fatal("result lost return or shop navigation")
 	}
 	method, _ = a.memberPanelEdit(ctx, "sendMessage", telegramSendMessageRequest{ChatID: int64(999), Text: "admin notification"})

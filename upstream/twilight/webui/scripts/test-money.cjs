@@ -21,3 +21,10 @@ vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname,'../sr
 test('worker failure remains a failure in member and administrator projections',()=>{
  for(const input of ['failed','FAILED',' failed ']){assert.equal(statusExports.normalizeMediaRequestStatus(input,'admin'),'failed');assert.equal(statusExports.normalizeMediaRequestStatus(input,'user'),'FAILED')}
 });
+
+const calendarExports={};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname,'../src/lib/signin-calendar.ts'),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,{exports:calendarExports,Intl,Date,Map});
+test('30 check-in cells use Shanghai midnight and preserve zero credited check-ins',()=>{
+ const cells=calendarExports.signinCalendar([{date:'2026-11-27',total:0}],new Date('2026-11-26T16:01:00Z'));
+ assert.equal(cells.length,30);assert.equal(cells[29].date,'2026-11-27');assert.equal(cells[29].signed,true);assert.equal(cells[0].date,'2026-10-29');
+});

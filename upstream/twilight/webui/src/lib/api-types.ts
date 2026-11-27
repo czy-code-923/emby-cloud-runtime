@@ -1703,6 +1703,6 @@ export interface MiniAccount {
 	icon?:string; name?:string; role_label?:string;avatar?:string;
   uid:number; username:string; emby_username:string; media_enabled:boolean; has_emby:boolean;
   expired_at:number; points:number; signin_enabled:boolean; last_signin:string; can_register:boolean;
-  email_enabled:boolean;email_verified:boolean;email_masked:string;security_code_set:boolean;password_email_required:boolean; invite_enabled:boolean; requests_enabled:boolean; shop_url:string; banner:string; banner_url:string; banner_image?:string; role:number;
+  email_enabled:boolean;email_verified:boolean;email_masked:string;security_code_set:boolean;password_email_required:boolean; invite_enabled:boolean; requests_enabled:boolean;request_daily_limit?:number; shop_url:string; banner:string; banner_url:string; banner_image?:string; role:number;
   signin:{summary:SigninSummary;config:SigninPublicConfig;history:SigninHistoryRecord[]};
 }

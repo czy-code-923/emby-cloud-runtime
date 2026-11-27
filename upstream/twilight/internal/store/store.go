@@ -121,6 +121,8 @@ type PostgresTargetStatus struct {
 }
 
 type State struct {
+	MediaRequestQuotas      map[int64]MediaRequestQuota            `json:"media_request_quotas,omitempty"`
+	MediaClientLogins       map[string]MediaClientLogin            `json:"media_client_logins,omitempty"`
 	MediaWorkerLastSeen     int64                                  `json:"media_worker_last_seen,omitempty"`
 	Finance                 FinanceState                           `json:"finance,omitempty"`
 	Console                 ConsoleState                           `json:"console,omitempty"`
@@ -4097,6 +4099,25 @@ func (s *Store) CreateMediaRequestWithOptions(r MediaRequest, opts MediaRequestC
 			}
 		}
 		now := time.Now().Unix()
+		if opts.DailyLimit > 0 || opts.CooldownSeconds > 0 {
+			date := time.Unix(now, 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")
+			q := s.state.MediaRequestQuotas[r.UID]
+			if q.Date != date {
+				q = MediaRequestQuota{Date: date}
+			}
+			if opts.DailyLimit > 0 && q.Count >= opts.DailyLimit {
+				return ErrMediaRequestDailyLimit
+			}
+			if q.LastAt > 0 && now-q.LastAt < opts.CooldownSeconds {
+				return ErrMediaRequestCooldown
+			}
+			if s.state.MediaRequestQuotas == nil {
+				s.state.MediaRequestQuotas = map[int64]MediaRequestQuota{}
+			}
+			q.Count++
+			q.LastAt = now
+			s.state.MediaRequestQuotas[r.UID] = q
+		}
 		r.ID = s.state.NextRequestID
 		s.state.NextRequestID++
 		if r.RequireKey == "" {
@@ -6007,6 +6028,8 @@ var (
 	ErrTicketNotClosed               = errors.New("ticket not closed")
 	ErrTicketUserOpenLimit           = errors.New("ticket user open limit reached")
 	ErrTicketGlobalOpenLimit         = errors.New("ticket global open limit reached")
+	ErrMediaRequestDailyLimit        = errors.New("daily media request limit reached")
+	ErrMediaRequestCooldown          = errors.New("media request cooldown active")
 	ErrMediaRequestUserActiveLimit   = errors.New("media request user active limit reached")
 	ErrMediaRequestGlobalActiveLimit = errors.New("media request global active limit reached")
 	ErrInsufficientPoints            = errors.New("insufficient points")

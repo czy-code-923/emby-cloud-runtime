@@ -3861,7 +3861,7 @@
     "none": "Not selected",
     "a": "A · Sign-in points",
     "b": "B · Qualified viewing",
-    "rules": "Each exact 30-day window: A renews for 300 points with explicit authorization; B needs 30 minutes of qualified viewing. Actual method changes have a 20-day cooldown.",
+    "rules": "A：窗口内累计300签到积分续30天；B：窗口内可信观影累计30分钟续30天。确认选择后用户不能撤回或更换，仅管理员可调整。",
     "window": "Current window",
     "watch": "Qualified viewing",
     "minutes": "minutes",
@@ -3892,7 +3892,7 @@
     "sync": "Media synchronization",
     "pending": "Pending",
     "applied": "Applied",
-    "policy": "30-day windows, A costs 300 points, B requires 30 minutes, 20-day change cooldown, 3600 organic reward cap. Daily rewards are 10–20 points. Point cards cost 300/850/3000 for 30/90/365 days; policy tightening requires a separate reviewed release and authorization.",
+    "policy": "A：窗口内累计300签到积分续30天；B：窗口内可信观影累计30分钟续30天。确认选择后用户不能撤回或更换，仅管理员可调整。",
     "month": "30-day exempt card",
     "quarter": "90-day exempt card",
     "year": "365-day exempt card",
@@ -4068,5 +4068,18 @@
     "manualProgress": "下载与入库进度由工作器回传；这里仅审核或拒绝请求。",
     "activityNav": "签到保号",
     "onlineSessions": "在线会话"
+  },
+  "v7": {
+    "signin30": "近30天签到",
+    "notSigned": "未签到",
+    "calendarHint": "北京时间 · 深色方格为已签到",
+    "retentionRules": "A：窗口内累计300签到积分续30天；B：窗口内可信观影累计30分钟续30天。确认选择后用户不能撤回或更换，仅管理员可调整。",
+    "modeLock": "方式锁定",
+    "locked": "已锁定当前方式，需要调整请联系管理员",
+    "lockConfirm": "确认后不能自行撤回或切换，请核对选择。B只要求本窗累计30分钟有效观影，不扣积分。",
+    "adminMode": "管理员调整保号方式",
+    "adminUnlock": "解除选择，允许重新选择",
+    "reason": "调整原因（至少3字）",
+    "dailyLimit": "每日最多 {limit} 部，提交间隔30秒；搜索间隔5秒。"
   }
 }

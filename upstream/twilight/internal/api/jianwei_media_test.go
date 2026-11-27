@@ -117,12 +117,12 @@ func TestJianweiGatewayAuthAndQuota(t *testing.T) {
 	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/Users/Me":
+		case "/Sessions":
 			if r.Header.Get("X-Emby-Token") != "fixture-token" {
 				w.WriteHeader(401)
 				return
 			}
-			_, _ = w.Write([]byte(`{"Id":"media-fixture"}`))
+			_, _ = w.Write([]byte(`[]`))
 		case "/Users/media-fixture":
 			_, _ = w.Write([]byte(`{"Id":"media-fixture","Policy":{"IsAdministrator":false,"SimultaneousStreamLimit":0}}`))
 		case "/Users/media-fixture/Policy":
@@ -143,6 +143,9 @@ func TestJianweiGatewayAuthAndQuota(t *testing.T) {
 	a.cfg().MediaNormalStreams = 2
 	u, err := a.store().CreateUser(store.User{Username: "media-owner", Role: store.RoleNormal, EmbyID: "media-fixture", ExpiredAt: time.Now().Add(time.Hour).Unix()})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.store().RememberMediaClientLogin(a.mediaTokenHash("fixture-token"), "media-fixture", "one"); err != nil {
 		t.Fatal(err)
 	}
 	request := func(secret, token, device, path, method string) int {

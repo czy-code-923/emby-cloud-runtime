@@ -21,6 +21,9 @@ type v2MediaRequestListResponse struct {
 }
 
 func (a *App) handleV2MediaSearch(w http.ResponseWriter, r *http.Request, params Params) {
+	if a.memberCooldown(w, r, "metadata-search", 5) {
+		return
+	}
 	query := firstNonEmpty(r.URL.Query().Get("q"), r.URL.Query().Get("query"), r.URL.Query().Get("keyword"))
 	query = truncateString(strings.TrimSpace(query), 120)
 	limit := clamp(queryInt(r, "limit", queryInt(r, "per_page", 20)), 1, 50)

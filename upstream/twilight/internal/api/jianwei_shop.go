@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -43,7 +45,7 @@ func (a *App) shopIntent(w http.ResponseWriter, r *http.Request) bool {
 	if !requireWebUIIntent(w, r, "shop-action") {
 		return false
 	}
-	if a.cfg().CommerceStoreURL == "" || r.Header.Get("Origin") != a.cfg().CommerceStoreURL {
+	if a.cfg().CommerceStoreURL == "" || r.Header.Get("Origin") != shopSiteOrigin(a.cfg().CommerceStoreURL) {
 		fail(w, 403, "请从独立商店页面操作")
 		return false
 	}
@@ -274,7 +276,12 @@ func (a *App) handleAdminShopConfig(w http.ResponseWriter, r *http.Request, _ Pa
 		fail(w, 400, "赞赏码必须为HTTPS图片地址")
 		return
 	}
-	if err := a.store().SaveShopConfiguration(settings, revision); statusFromError(w, err) {
+	if err := a.store().SaveShopConfiguration(settings, revision); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			fail(w, 409, "商店配置已变化，请先刷新；本次没有覆盖其他修改")
+		} else {
+			fail(w, 400, "保存未通过：请检查商品天数/售价、默认渠道已启用、收款人及支付说明；静态码渠道还需图片")
+		}
 		return
 	}
 	a.audit(r, "shop_settings_updated", "commerce", current(r).User.UID, nil)
@@ -392,4 +399,12 @@ func (a *App) telegramShopCode(ctx context.Context, c telegramCommandCtx) {
 
 func init() {
 	telegramCommandRegistry["/shopcode"] = telegramCommandSpec{name: "shopcode", label: "/shopcode", description: "获取独立商店一次性登录码", usage: "/shopcode", category: "user", order: 48, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramShopCode(ctx, c) }}
+}
+
+func shopSiteOrigin(raw string) string {
+	u, e := url.Parse(raw)
+	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
