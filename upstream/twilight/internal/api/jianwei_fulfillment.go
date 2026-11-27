@@ -26,6 +26,7 @@ func (a *App) runShopDeliveries(ctx context.Context) {
 				return
 			}
 			rows = append([][]map[string]any{{{"text": "复制专属卡码", "copy_text": map[string]string{"text": code}}}}, rows...)
+			rows = append(rows, []map[string]any{{"text": "兼容复制卡码", "callback_data": "jwc:value:0"}})
 			identity, identityErr := a.telegramGetMe(ctx)
 			if bot := strings.TrimPrefix(identity.Username, "@"); identityErr == nil && bot != "" {
 				rows = append(rows, []map[string]any{{"text": "验证并使用卡码", "url": "https://t.me/" + bot + "?start=redeem_" + code}})

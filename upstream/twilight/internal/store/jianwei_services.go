@@ -104,6 +104,19 @@ func validateMemberServices(items []MemberService) error {
 	}
 	return nil
 }
+
+// Validation errors contain only fixed messages, safe for admin forms.
+func ValidateMemberServices(items []MemberService) error { return validateMemberServices(items) }
+
+func (s *Store) serviceShopEligibleLocked(u User, p ShopProduct, now int64) bool {
+	v, exists := s.serviceLocked(p.ServiceID)
+	if !exists || !v.Enabled || u.EmbyID == "" || !u.Active || u.RebindingInProgress || u.EmbyDisabled && !u.EmbyAutoDisabled || ServiceAccess(u, v, 0, now) {
+		return false
+	}
+	end := s.state.Services.Grants[u.UID][v.ID]
+	return p.Kind == 1 && v.RegisterEnabled && end <= now || p.Kind == 2 && v.RenewEnabled && end != 0
+}
+
 func (s *Store) SaveServices(items []MemberService, revision int64) error {
 	if e := validateMemberServices(items); e != nil {
 		return e

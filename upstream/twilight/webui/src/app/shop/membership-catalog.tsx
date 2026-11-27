@@ -18,15 +18,16 @@ export function MembershipCatalog({catalog,logged,busy,eligibility,onPurchase}:{
  const {t}=useI18n();const [kind,setKind]=useState(1),[product,setProduct]=useState<ShopProduct>(),[channel,setChannel]=useState("");
  useEffect(()=>{if(eligibility?.has_emby)setKind(2)},[eligibility?.has_emby]);
  const channels=catalog?.channels?.filter(c=>c.enabled)||[];
- const title=(type:number)=>t(type===1?"v8.categoryRegister":type===2?"v8.categoryRenew":"v8.categoryWhite");
- const reason=(p:ShopProduct)=>p.recommendation||t(p.kind===1?"v8.reasonRegister":p.kind===2?"v8.reasonRenew":"v8.reasonWhite");
+ const title=(type:number)=>t(type===4?"v10.serviceCategory":type===1?"v8.categoryRegister":type===2?"v8.categoryRenew":"v8.categoryWhite");
+ const reason=(p:ShopProduct)=>p.recommendation||t(p.service_id?"v10.serviceReason":p.kind===1?"v8.reasonRegister":p.kind===2?"v8.reasonRenew":"v8.reasonWhite");
  const protectedPurchase=!!eligibility?.protected;
- const eligible=(p:ShopProduct)=>p.kind===1?!eligibility?.has_emby:p.kind===2?!!eligibility?.has_emby&&!protectedPurchase:!protectedPurchase;
- const blocked=(p:ShopProduct)=>p.kind===1?t("v8.alreadyRegistered"):protectedPurchase?t("v8.noPurchaseRequired"):t("v8.registerFirst");
- const items=catalog?.products.filter(p=>p.kind===kind)||[];
+ const eligible=(p:ShopProduct)=>p.service_id?!!eligibility?.eligible_service_products?.includes(p.id):p.kind===1?!eligibility?.has_emby:p.kind===2?!!eligibility?.has_emby&&!protectedPurchase:!protectedPurchase;
+ const blocked=(p:ShopProduct)=>p.service_id?t("v10.serviceIneligible"):p.kind===1?t("v8.alreadyRegistered"):protectedPurchase?t("v8.noPurchaseRequired"):t("v8.registerFirst");
+ const inCategory=(p:ShopProduct,k:number)=>k===4?!!p.service_id:!p.service_id&&p.kind===k;
+ const items=catalog?.products.filter(p=>inCategory(p,kind))||[];
  return <section className={s.catalog}>
-  <div className={s.categoryTabs} aria-label={t("v8.productCategories")}>{[1,2,3].map(k=><button key={k} type="button" aria-pressed={kind===k} className={kind===k?s.categoryActive:""} onClick={()=>setKind(k)}>{title(k)}<small>{catalog?.products.filter(p=>p.kind===k).length||0}</small></button>)}</div>
-  <p className={s.sub}>{t(kind===1?"v8.reasonRegister":kind===2?"v8.reasonRenew":"v8.reasonWhite")}</p>
+  <div className={s.categoryTabs} aria-label={t("v8.productCategories")}>{[1,2,3,...(catalog?.products.some(p=>p.service_id)?[4]:[])].map(k=><button key={k} type="button" aria-pressed={kind===k} className={kind===k?s.categoryActive:""} onClick={()=>setKind(k)}>{title(k)}<small>{catalog?.products.filter(p=>inCategory(p,k)).length||0}</small></button>)}</div>
+  <p className={s.sub}>{t(kind===4?"v10.serviceReason":kind===1?"v8.reasonRegister":kind===2?"v8.reasonRenew":"v8.reasonWhite")}</p>
   <div className={s.grid}>{items.map(p=><article className={s.product} key={p.id}>
    <div className={s.row}><span className={s.productKind}>{title(p.kind)}</span><span className={s.duration}>{p.days} {t("mini.days")}</span></div>
    <h2>{p.name}</h2><p className={s.price}>{money(p.price_cents)}</p>

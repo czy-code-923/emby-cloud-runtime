@@ -65,6 +65,14 @@ func (a *App) handleAdminServices(w http.ResponseWriter, r *http.Request, _ Para
 			fail(w, 400, "服务配置无效")
 			return
 		}
+		if err := store.ValidateMemberServices(body.Items); err != nil {
+			if err == store.ErrInvalid {
+				fail(w, 400, "请检查服务名称、天数、积分价格和分区数量")
+			} else {
+				fail(w, 400, err.Error())
+			}
+			return
+		}
 		// Reserve different domains; reusing the ordinary host would either leak a
 		// protected service or lock ordinary movie clients out of their existing line.
 		known := map[string]bool{}

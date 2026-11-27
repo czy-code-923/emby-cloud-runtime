@@ -11,6 +11,14 @@ type telegramUpdate struct {
 }
 
 type telegramMessage struct {
+	ReplyMarkup struct {
+		InlineKeyboard [][]struct {
+			Text     string `json:"text"`
+			CopyText *struct {
+				Text string `json:"text"`
+			} `json:"copy_text,omitempty"`
+		} `json:"inline_keyboard"`
+	} `json:"reply_markup,omitempty"`
 	Photo []struct {
 		FileID string `json:"file_id"`
 	} `json:"photo,omitempty"`

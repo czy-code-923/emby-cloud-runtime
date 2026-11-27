@@ -81,6 +81,17 @@ func (a *App) handleShopCatalog(w http.ResponseWriter, r *http.Request, _ Params
 	if cfg.Enabled {
 		for _, p := range cfg.Products {
 			if p.Enabled {
+				if p.ServiceID != "" {
+					valid := false
+					for _, svc := range a.store().Services().Items {
+						if svc.ID == p.ServiceID && svc.Enabled && (p.Kind == 1 && svc.RegisterEnabled || p.Kind == 2 && svc.RenewEnabled) {
+							valid = true
+						}
+					}
+					if !valid {
+						continue
+					}
+				}
 				products = append(products, p)
 			}
 		}
@@ -176,7 +187,7 @@ func (a *App) handleShopOrders(w http.ResponseWriter, r *http.Request, _ Params)
 	for _, o := range orders[start:end] {
 		items = append(items, a.shopOrderView(o, false))
 	}
-	ok(w, "OK", map[string]any{"username": u.Username, "has_emby": u.EmbyID != "", "whitelist_until": u.WhitelistUntil, "protected": u.Role == store.RoleAdmin || u.ExpiredAt < 0 || u.Role == store.RoleWhitelist && u.WhitelistUntil == 0, "items": items, "page": page, "total": len(orders), "has_next": end < len(orders)})
+	ok(w, "OK", map[string]any{"username": u.Username, "has_emby": u.EmbyID != "", "whitelist_until": u.WhitelistUntil, "protected": u.Role == store.RoleAdmin || u.ExpiredAt < 0 || u.Role == store.RoleWhitelist && u.WhitelistUntil == 0, "eligible_service_products": a.store().ShopEligibleProductIDs(u.UID), "items": items, "page": page, "total": len(orders), "has_next": end < len(orders)})
 }
 func shopPage(r *http.Request, total int) (page, start, end int) {
 	page, _ = strconv.Atoi(r.URL.Query().Get("page"))
@@ -240,6 +251,7 @@ func (a *App) handleShopPaymentSubmit(w http.ResponseWriter, r *http.Request, p 
 		return
 	}
 	a.audit(r, "shop_payment_reported", "commerce", current(r).User.UID, map[string]any{"order_id": order.ID, "status": order.Status})
+	a.runShopAdminNotices(r.Context())
 	ok(w, "已记录，请等待管理员核实到账", a.shopOrderView(order, false))
 }
 func (a *App) handleAdminShop(w http.ResponseWriter, r *http.Request, _ Params) {
@@ -250,7 +262,7 @@ func (a *App) handleAdminShop(w http.ResponseWriter, r *http.Request, _ Params) 
 	for _, o := range orders[start:end] {
 		items = append(items, a.shopOrderView(o, true))
 	}
-	ok(w, "OK", map[string]any{"settings": a.store().ShopConfiguration(), "orders": items, "total": len(orders), "page": page, "has_next": end < len(orders)})
+	ok(w, "OK", map[string]any{"settings": a.store().ShopConfiguration(), "services": a.store().Services().Items, "orders": items, "total": len(orders), "page": page, "has_next": end < len(orders)})
 }
 func (a *App) adminShopIntent(w http.ResponseWriter, r *http.Request, body map[string]any) bool {
 	if requireAdmin(w, r) || !requireWebUIIntent(w, r, "shop-admin") {

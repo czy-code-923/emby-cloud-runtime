@@ -147,6 +147,7 @@ func (a *App) handleAdminRetention(w http.ResponseWriter, r *http.Request, _ Par
 
 func (a *App) runRetention(ctx context.Context) (map[string]any, []string, error) {
 	a.runShopDeliveries(ctx)
+	a.runShopAdminNotices(ctx)
 	a.runMediaRequestNotices(ctx)
 	if !a.store().RetentionPolicy().Enabled {
 		return map[string]any{"success": true, "enabled": false}, nil, nil

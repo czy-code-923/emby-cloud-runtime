@@ -126,6 +126,38 @@ func TestJianweiServiceAdminRoutesRejectAnonymousAndOrdinarySessions(t *testing.
 	}
 }
 
+func TestJianweiServiceDraftValidationAndCertificateOrigins(t *testing.T) {
+	a := newTestApp(t)
+	items := a.store().Services().Items
+	items[0].Lines = []string{"https://music.example.test"}
+	if e := store.ValidateMemberServices(items); e != nil {
+		t.Fatal("disabled draft rejected", e)
+	}
+	if e := a.store().SaveServices(items, 0); e != nil {
+		t.Fatal(e)
+	}
+	for _, origin := range a.configuredIngressOrigins() {
+		if origin == items[0].Lines[0] {
+			t.Fatal("disabled service published")
+		}
+	}
+	items[0].Enabled = true
+	if e := store.ValidateMemberServices(items); e == nil || !strings.Contains(e.Error(), "媒体库") {
+		t.Fatal("missing library accepted", e)
+	}
+	items[0].LibraryIDs = []string{"music"}
+	if e := a.store().SaveServices(items, 1); e != nil {
+		t.Fatal(e)
+	}
+	found := false
+	for _, origin := range a.configuredIngressOrigins() {
+		found = found || origin == items[0].Lines[0]
+	}
+	if !found {
+		t.Fatal("enabled service missing certificate profile")
+	}
+}
+
 func TestJianweiTelegramRequestBudgetReservesFallbackTime(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {

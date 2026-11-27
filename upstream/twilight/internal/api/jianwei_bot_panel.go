@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +78,40 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 }
 
 func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegramCallbackQuery) bool {
+	if strings.HasPrefix(callback.Data, "jwc:value:") {
+		if callback.Message == nil || callback.From.ID <= 0 || callback.Message.Chat.ID != callback.From.ID || callback.From.IsBot {
+			return true
+		}
+		u, exists := a.store().FindUserByTelegramID(callback.From.ID)
+		if !exists || !u.Active {
+			return true
+		}
+		index, err := strconv.Atoi(strings.TrimPrefix(callback.Data, "jwc:value:"))
+		if err != nil || index < 0 || index > 20 {
+			return true
+		}
+		values := []string{}
+		for _, row := range callback.Message.ReplyMarkup.InlineKeyboard {
+			for _, b := range row {
+				if b.CopyText != nil {
+					values = append(values, b.CopyText.Text)
+				}
+			}
+		}
+		if index >= len(values) || len(values[index]) > 1024 {
+			return true
+		}
+		_ = a.telegramAnswerCallbackQuery(ctx, callback.ID, "长按完整内容复制；客户端支持时也可使用一键复制。", true)
+		ctx = context.WithValue(ctx, memberPanelContextKey{}, memberPanelTarget{ChatID: callback.From.ID, MessageID: callback.Message.MessageID, Photo: len(callback.Message.Photo) > 0})
+		a.memberSendButtons(ctx, callback.From.ID, "见微 · 复制内容\n\n"+values[index]+"\n\n请长按上方完整内容复制。不要向他人发送密码或一次性登录码。", [][]map[string]any{{{"text": "一键复制", "copy_text": map[string]string{"text": values[index]}}}})
+		return true
+	}
+	if callback.Data == "jwc:copyhelp" {
+		if callback.Message != nil && callback.From.ID > 0 && callback.Message.Chat.ID == callback.From.ID && !callback.From.IsBot {
+			_ = a.telegramAnswerCallbackQuery(ctx, callback.ID, "Telegram X 等客户端若未实现 Bot 的复制按钮，机器人无法直接写入其剪贴板。请长按上方完整文字复制，或进入 Mini App 点复制；官方客户端可继续一键复制。", true)
+		}
+		return true
+	}
 	if !strings.HasPrefix(callback.Data, "jw:") {
 		return false
 	}

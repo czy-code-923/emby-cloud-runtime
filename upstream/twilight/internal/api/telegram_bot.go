@@ -270,6 +270,9 @@ func (a *App) handleTelegramUpdate(ctx context.Context, update *telegramUpdate) 
 	}
 	a.observeTelegramRoster(update)
 	if callback := update.CallbackQuery; callback != nil {
+		if a.telegramHandleShopAdminCallback(ctx, callback) {
+			return
+		}
 		if a.telegramHandleMemberCallback(ctx, callback) {
 			return
 		}

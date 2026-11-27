@@ -4173,5 +4173,16 @@
     "accessRequired": "Service benefit required",
     "included": "Included for administrators and valid whitelist members; no extra code needed.",
     "useServiceCode": "Use a service-specific code or exchange points in the shop."
+  },
+  "v10": {
+    "productScope": "Product service",
+    "mainMovies": "Main movie membership",
+    "enableScopeFirst": "Enable the service and its registration/renewal switch before listing this product.",
+    "serviceShopHelp": "Service products require an existing unified Emby account and only extend the selected service. They do not change the main expiry or role.",
+    "serviceCategory": "Extra services",
+    "serviceReason": "Use your unified Emby account for music, audiobooks or private cinema. Rights apply only to the selected service.",
+    "serviceIneligible": "An existing account and eligible service history are required. Administrators and active whitelist members already have access.",
+    "serviceDraftHelp": "Before creating dedicated libraries, keep the service disabled to save its name and domains as a draft. Enabling requires a real dedicated library. Do not select existing movie libraries accidentally. Points listings require a positive price.",
+    "cashShop": "Membership card shop"
   }
 }

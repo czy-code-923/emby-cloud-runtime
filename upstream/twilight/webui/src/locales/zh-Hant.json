@@ -4173,5 +4173,16 @@
     "accessRequired": "需专属权益",
     "included": "管理员或有效白名单已包含此服务，无需额外兑换。",
     "useServiceCode": "使用此服务专属卡码，或到积分商店兑换。"
+  },
+  "v10": {
+    "productScope": "商品所屬服務",
+    "mainMovies": "普通影視會員",
+    "enableScopeFirst": "分區商品上架前，請先啟用對應服務和註冊/續期碼開關。",
+    "serviceShopHelp": "分區商品只增加對應分區權益，需要已有統一 Emby 帳號；不增加主影視時長，不改變用戶身份。",
+    "serviceCategory": "分區權益",
+    "serviceReason": "統一 Emby 帳號開通音樂、有聲小說或專屬影視；權益僅限所選服務。",
+    "serviceIneligible": "需已有統一帳號且符合本服務開通/續期條件；管理員和有效白名單已包含，無需重複購買。",
+    "serviceDraftHelp": "尚未建立專屬媒體庫時，可保持服務關閉後儲存名稱、網域等草稿。啟用必須選擇真實專屬庫；請勿誤選現有電影或劇集。積分商品啟用時需正整數價格。",
+    "cashShop": "會員發卡商店"
   }
 }
