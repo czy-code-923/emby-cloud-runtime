@@ -112,7 +112,7 @@ func TestJianweiLegacyCopyRefreshesPrivatePanelWithoutHelperButtons(t *testing.T
 	if !a.telegramHandleMemberCallback(context.Background(), &callback) {
 		t.Fatal("copy unhandled")
 	}
-	if len(texts) != 2 || !strings.Contains(texts[1], "欢迎加入见微") || strings.Contains(texts[1], "fixture-copy-value") {
+	if len(texts) != 2 || !strings.Contains(texts[1], "当前状态 | 未注册") || strings.Contains(texts[1], "fixture-copy-value") {
 		t.Fatal("obsolete copy panel was not replaced safely", texts)
 	}
 	before := len(texts)

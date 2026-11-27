@@ -24,7 +24,7 @@ func TestJianweiRegistrationSummaryMatchesCapacityWithoutCountingWebProfiles(t *
 		{Code: "MAIN-CAPACITY", Type: 1, Active: true, ValidityTime: -1, UseCount: 1, UseCountLimit: 3},
 		{Code: "SCOPE-ONLY", Type: 1, ServiceID: "music", Active: true, ValidityTime: -1, UseCountLimit: 20},
 		{Code: "RENEW-ONLY", Type: 2, Active: true, ValidityTime: -1, UseCountLimit: 20},
-		{Code: "EXPIRED", Type: 1, Active: true, ValidityTime: time.Now().Unix() - 1, UseCountLimit: 20},
+		{Code: "EXPIRED", Type: 1, Active: true, CreatedAt: time.Now().Add(-2 * time.Hour).Unix(), ValidityTime: 1, UseCountLimit: 20},
 	} {
 		if err := s.UpsertRegCode(code); err != nil {
 			t.Fatal(err)
