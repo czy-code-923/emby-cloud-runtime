@@ -3870,7 +3870,7 @@
     "switch": "Next method change",
     "choose": "Choose method",
     "confirm": "Confirm and authorize",
-    "consent": "I authorize the quoted points debit for a 30-day renewal; I can withdraw uncommitted authorization.",
+    "consent": "I authorize the quoted points debit for 30-day renewals. Once selected, only an administrator can change my retention mode.",
     "risk": "I understand the shortfall and confirm an immediate near-expiry change without fallback to the previous method.",
     "withdraw": "Withdraw participation",
     "preview": "Review before confirmation",

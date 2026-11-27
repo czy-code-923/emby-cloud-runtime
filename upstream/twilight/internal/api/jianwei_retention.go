@@ -250,8 +250,8 @@ func retentionNativeText(v store.RetentionView) string {
 	if m.HoldUntil > now {
 		text += "\n· 事故保护至 | " + format(m.HoldUntil) + "；已暂停活动结算，等待管理员核实补偿。"
 	}
-	if m.NextSwitchAt > now {
-		text += fmt.Sprintf("\n· 可更换于  |  %s（剩余%d天%d小时）", format(m.NextSwitchAt), (m.NextSwitchAt-now)/86400, ((m.NextSwitchAt-now)%86400)/3600)
+	if m.Mode != "" {
+		text += "\n· 方式修改  |  已锁定，仅管理员可修改"
 	} else {
 		text += "\n· 方式切换  |  可选择；选择后锁定，仅管理员可修改"
 	}
@@ -298,7 +298,7 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 		d, _ := data.(map[string]any)
 		q, _ := d["quote"].(map[string]any)
 		token := asString(d["token"])
-		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分续30天；B累计30分钟观影、不扣积分。\n确认后仅管理员可修改；原冷却记录：%s\n确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"], time.Unix(int64(numeric(q["next_switch_at"])), 0).In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04"))
+		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分续30天；B累计30分钟观影、不扣积分。\n确认120秒内有效；选择后不能自行撤回或更换，仅管理员可修改。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"])
 		if purchase, _ := d["purchase"].(bool); purchase {
 			message = fmt.Sprintf("积分免保号卡 · %s\n本次扣除%v积分，保留当前剩余时长，追加卡券天数并暂停活动自动扣分。\n这是独立的单次交易，不会开启自动购买订阅。确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["cost"])
 		}
@@ -322,9 +322,6 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 			if v.Selectable {
 				rows = append([][]map[string]any{{{"text": "A · 签到积分", "callback_data": "jw:/retention A"}, {"text": "B · 观影保号", "callback_data": "jw:/retention B"}}}, rows...)
 			}
-			if false && v.Member.Member.Participation {
-				rows = append([][]map[string]any{{{"text": "撤回自动保号参与", "callback_data": "jw:/retention off"}}}, rows...)
-			}
 		}
 	}
 	_, _ = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: c.ChatID, Text: message, ReplyMarkup: map[string]any{"inline_keyboard": rows}}, 20*time.Second)
@@ -334,7 +331,7 @@ func handlerNamePreview(command string, args []string) bool {
 }
 func init() {
 	for _, name := range []string{"retention", "retention_confirm"} {
-		telegramCommandRegistry["/"+name] = telegramCommandSpec{name: name, label: "/" + name, description: "查看与选择签到或观影保号", usage: "/retention [A|B|off|month|quarter|year|rescue]", category: "user", order: 45, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramRetention(ctx, c) }}
+		telegramCommandRegistry["/"+name] = telegramCommandSpec{name: name, label: "/" + name, description: "查看与选择签到或观影保号", usage: "/retention [A|B|month|quarter|year|rescue]", category: "user", order: 45, private: true, handler: func(a *App, ctx context.Context, c telegramCommandCtx) { a.telegramRetention(ctx, c) }}
 	}
 }
 

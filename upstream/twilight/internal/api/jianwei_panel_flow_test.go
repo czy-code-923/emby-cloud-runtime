@@ -66,10 +66,13 @@ func TestJianweiNativeRetentionSummaryShowsFutureAndCollectionGap(t *testing.T) 
 	v.Policy.Enabled = true
 	v.Member.Member = retention.Member{PlaybackEnd: v.End, Mode: "B", Participation: true, NextSwitchAt: now + 86400}
 	text := retentionNativeText(v)
-	for _, expected := range []string{"下一窗尚未开始", "采样已过期", "窗口起止", "可更换于"} {
+	for _, expected := range []string{"下一窗尚未开始", "采样已过期", "窗口起止", "已锁定，仅管理员可修改"} {
 		if !strings.Contains(text, expected) {
 			t.Fatal("missing member-facing state:", expected)
 		}
+	}
+	if strings.Contains(text, "可更换于") {
+		t.Fatal("locked selection advertised a future member switch")
 	}
 	v.Policy.Enabled = false
 	if !strings.Contains(retentionNativeText(v), "不会自动扣分或按观影续期") {
