@@ -1,16 +1,49 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/prejudice-studio/twilight/internal/store"
+	"image"
+	"image/png"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func shopFixtureImage(t *testing.T, a *App, path, intent, origin string, cookies []*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	var content bytes.Buffer
+	writer := multipart.NewWriter(&content)
+	part, e := writer.CreateFormFile("file", "fixture.png")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = png.Encode(part, image.NewRGBA(image.Rect(0, 0, 32, 32))); e != nil {
+		t.Fatal(e)
+	}
+	if e = writer.Close(); e != nil {
+		t.Fatal(e)
+	}
+	r := httptest.NewRequest("POST", path, &content)
+	r.Header.Set("Content-Type", writer.FormDataContentType())
+	r.Header.Set("X-Twilight-Client", "webui")
+	r.Header.Set("X-Twilight-Intent", intent)
+	if origin != "" {
+		r.Header.Set("Origin", origin)
+	}
+	for _, cookie := range cookies {
+		r.AddCookie(cookie)
+	}
+	w := httptest.NewRecorder()
+	a.ServeHTTP(w, r)
+	return w
+}
 
 func TestJianweiShopPublishOrderReviewDeliveryEndToEnd(t *testing.T) {
 	a := newTestApp(t)
@@ -50,7 +83,9 @@ func TestJianweiShopPublishOrderReviewDeliveryEndToEnd(t *testing.T) {
 		return w
 	}
 	settings := store.ShopSettings{Enabled: true, DefaultChannel: "static", Channels: []store.PaymentChannel{{ID: "static", Name: "测试静态码", Kind: "alipay_qr", Enabled: true, Account: "isolated-fixture", Instructions: "仅隔离测试，不收款", QRURL: "https://shop.example.test/api/v2/commerce/assets/fixture.png", Version: 1}}, Products: []store.ShopProduct{{ID: "reg-month", Name: "隔离测试月卡", Kind: 1, Days: 30, PriceCents: 1999, Stock: 2, Enabled: true}}}
-	w := call("PUT", "/api/v2/admin/commerce", map[string]any{"settings": settings, "revision": 0, "password": factorTestPassword}, false)
+	qr := factorData(t, shopFixtureImage(t, a, "/api/v2/admin/commerce/image", "shop-admin", "", cookies))
+	settings.Channels[0].QRURL = asString(qr["url"])
+	w := call("PUT", "/api/v2/admin/commerce", map[string]any{"settings": settings, "revision": 0}, false)
 	if w.Code != 200 {
 		t.Fatal("publish", w.Code, w.Body)
 	}
@@ -63,14 +98,41 @@ func TestJianweiShopPublishOrderReviewDeliveryEndToEnd(t *testing.T) {
 	if d["payment_qr"] == nil || id == "" {
 		t.Fatal("order missing payment snapshot", d)
 	}
+	memberCookies := []*http.Cookie{{Name: shopCookie, Value: strings.Repeat("c", 64)}}
+	for i := 0; i < 3; i++ {
+		factorData(t, shopFixtureImage(t, a, "/api/v2/commerce/orders/"+id+"/proof", "shop-action", "https://shop.example.test", memberCookies))
+	}
+	if limited := shopFixtureImage(t, a, "/api/v2/commerce/orders/"+id+"/proof", "shop-action", "https://shop.example.test", memberCookies); limited.Code != 409 {
+		t.Fatal("proof replacements unbounded", limited.Code)
+	}
+	if own := call("GET", "/api/v2/commerce/orders/"+id+"/proof", nil, true); own.Code != 200 || !strings.Contains(own.Header().Get("Cache-Control"), "no-store") {
+		t.Fatal("owner cannot read private proof", own.Code)
+	}
+	if review := call("GET", "/api/v2/admin/commerce/orders/"+id+"/proof", nil, false); review.Code != 200 {
+		t.Fatal("administrator cannot review proof", review.Code)
+	}
+	if anonymous := doJSON(a, "GET", "/api/v2/commerce/orders/"+id+"/proof", "", nil); anonymous.Code != 401 {
+		t.Fatal("proof exposed anonymously", anonymous.Code)
+	}
+	wrong := httptest.NewRequest("GET", "/api/v2/commerce/orders/"+id+"/proof", nil)
+	wrong = wrong.WithContext(context.WithValue(wrong.Context(), principalKey, principal{User: store.User{UID: buyer.UID + 100, Role: store.RoleAdmin}}))
+	denied := httptest.NewRecorder()
+	a.handleShopProof(denied, wrong, Params{"order_id": id})
+	if denied.Code != 404 {
+		t.Fatal("public shop audience crossed owner boundary", denied.Code)
+	}
+	// Removing a product does not change an existing order's price or delivery.
+	settings.Enabled = false
+	settings.Products = []store.ShopProduct{}
+	factorData(t, call("PUT", "/api/v2/admin/commerce", map[string]any{"settings": settings, "revision": 1}, false))
 	w = call("POST", "/api/v2/commerce/orders/"+id+"/payment", map[string]any{"note": "隔离模拟付款，无真实资金"}, true)
 	factorData(t, w)
 	order, _ := a.store().ShopOrder(id)
-	review := map[string]any{"action": "confirm_payment", "revision": order.Revision, "password": factorTestPassword, "verified_actual_receipt": true, "payment_reference": "isolated-fixture-receipt-123", "received_cents": 1999, "paid_at": time.Now().Unix(), "note": "隔离数据库模拟核验"}
+	review := map[string]any{"action": "approve", "revision": order.Revision, "note": "隔离数据库模拟核验"}
 	w = call("POST", "/api/v2/admin/commerce/orders/"+id+"/review", review, false)
 	factorData(t, w)
 	order, _ = a.store().ShopOrder(id)
-	if order.Status != "issued" || order.ReceivedCents != 1999 {
+	if order.Status != "issued" || order.ReceivedCents != 1999 || order.ReceiptKind != "manual_order_confirmation" || order.PaidAt <= 0 || order.PaymentProof == "" {
 		t.Fatal("review failed", order.Status)
 	}
 	view := a.shopOrderView(order, false)

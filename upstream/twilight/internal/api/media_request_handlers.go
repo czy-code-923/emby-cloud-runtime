@@ -29,6 +29,10 @@ func (a *App) handleMediaSearch(w http.ResponseWriter, r *http.Request, params P
 		}
 	}
 	source := normalizeSource(firstNonEmpty(routeSource, r.URL.Query().Get("source"), "all"))
+	if source == "tmdb" && strings.TrimSpace(a.cfg().TMDBAPIKey) == "" {
+		failWithCode(w, http.StatusConflict, ErrMediaSearchSourceFailed, "TMDB 尚未配置 API Key 或读取令牌，请联系管理员在资料源设置中保存后重试")
+		return
+	}
 	mediaType := firstNonEmpty(r.URL.Query().Get("type"), r.URL.Query().Get("media_type"))
 	results, message, sourceErrors := a.searchMedia(r.Context(), query, source, mediaType, limit, false)
 	if source != "all" {

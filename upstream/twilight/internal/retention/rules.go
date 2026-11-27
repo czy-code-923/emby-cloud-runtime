@@ -23,6 +23,7 @@ var (
 	ErrRisk        = errors.New("explicit shortfall acknowledgement required")
 	ErrStale       = errors.New("preview changed or expired")
 	ErrNotReady    = errors.New("window does not qualify")
+	ErrSelected    = errors.New("retention mode already selected in this window")
 )
 
 type Policy struct {
@@ -64,6 +65,7 @@ type Member struct {
 	ExemptEnd      int64       `json:"exempt_end"`
 	Permanent      bool        `json:"permanent"`
 	Mode           string      `json:"selected_mode"`
+	SelectedWindow string      `json:"selected_window_id,omitempty"`
 	Participation  bool        `json:"participation_enabled"`
 	Consent        bool        `json:"a_consent"`
 	ConsentCap     int         `json:"a_consent_cap"`
@@ -91,11 +93,18 @@ type Progress struct {
 }
 
 func WindowID(m Member) string { return fmt.Sprintf("%d:%d", m.UID, m.PlaybackEnd) }
+func SelectionOpensAt(m Member, p Policy) int64 {
+	start := m.PlaybackEnd - p.CycleSeconds
+	if m.ExemptEnd >= m.PlaybackEnd && m.ExemptEnd > 0 {
+		start++
+	}
+	return start
+}
 func Selectable(m Member, p Policy, now int64) bool {
-	if !p.Enabled || m.Permanent || m.PlaybackEnd <= now || m.HoldUntil > now {
+	if !p.Enabled || m.Permanent || m.PlaybackEnd <= now || m.HoldUntil > now || now < SelectionOpensAt(m, p) {
 		return false
 	}
-	return !(m.ExemptEnd > now && m.PlaybackEnd-now >= p.CycleSeconds)
+	return m.SelectedWindow != WindowID(m)
 }
 func ready(mode string, w Wallet, progress Progress, p Policy) bool {
 	if mode == ModeA {
@@ -123,6 +132,9 @@ type Selection struct {
 }
 
 func Preview(m Member, w Wallet, progress Progress, p Policy, target string, now int64) (Selection, error) {
+	if m.SelectedWindow == WindowID(m) {
+		return Selection{}, ErrSelected
+	}
 	if p.Validate() != nil || !Selectable(m, p, now) || (target != ModeA && target != ModeB) {
 		return Selection{}, ErrUnavailable
 	}
@@ -130,14 +142,8 @@ func Preview(m Member, w Wallet, progress Progress, p Policy, target string, now
 		return Selection{}, ErrStale
 	}
 	changed := m.Mode != target
-	if changed && m.Mode != "" && now < m.NextSwitchAt {
-		return Selection{}, ErrCooldown
-	}
 	risk := (!m.Participation || changed) && now >= m.PlaybackEnd-p.RiskSeconds && !ready(target, w, progress, p)
-	next := m.NextSwitchAt
-	if changed {
-		next = now + p.CooldownSeconds
-	}
+	next := m.PlaybackEnd
 	snapshot := struct {
 		Member   Member
 		Wallet   Wallet
@@ -173,9 +179,10 @@ func Confirm(m Member, w Wallet, progress Progress, p Policy, quote Selection, a
 	}
 	if m.Mode != quote.Target {
 		m.LastChangedAt = now
-		m.NextSwitchAt = now + p.CooldownSeconds
+		m.NextSwitchAt = m.PlaybackEnd
 	}
 	m.Mode = quote.Target
+	m.SelectedWindow = WindowID(m)
 	m.Participation = true
 	m.Version++
 	m.Epoch++
@@ -239,18 +246,26 @@ func ApplySettlement(m Member, decision Settlement) (Member, error) {
 	}
 	m.PlaybackEnd = decision.NewEnd
 	m.LastSettlement = &decision
+	// Every window needs its own explicit A/B choice. Never silently carry an
+	// old A debit authorization into the next window after an early renewal.
+	m.Mode = ""
+	m.Participation = false
+	m.Consent = false
+	m.ConsentCap = 0
 	m.Version++
 	return m, nil
 }
 
-// A paid/points exemption preserves unused time, pauses participation and
-// invalidates uncommitted candidates; historical preference/cooldown remains.
+// A paid/points exemption preserves unused time and cancels the old window's
+// mode and debit authorization. The new expiry defines the next choice window.
 func AddExemption(m Member, seconds, now int64) (Member, error) {
 	if m.Permanent || seconds <= 0 || seconds > 10*365*Day {
 		return m, ErrUnavailable
 	}
 	m.PlaybackEnd = max(m.PlaybackEnd, now) + seconds
 	m.ExemptEnd = m.PlaybackEnd
+	m.Mode = ""
+	m.SelectedWindow = ""
 	m.Participation = false
 	m.Consent = false
 	m.ConsentCap = 0

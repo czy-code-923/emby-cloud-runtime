@@ -25,6 +25,7 @@ var migrationResourceRoots = []struct {
 	{source: "server-icon", target: "server-icon"},
 	{source: "auth-background", target: "auth-background"},
 	{source: "commerce", target: "commerce"},
+	{source: "commerce-proof", target: "commerce-proof"},
 	{source: "bangumi", target: "bangumi"},
 }
 

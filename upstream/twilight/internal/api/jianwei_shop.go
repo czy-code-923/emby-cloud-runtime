@@ -85,7 +85,11 @@ func (a *App) handleShopCatalog(w http.ResponseWriter, r *http.Request, _ Params
 			}
 		}
 	}
-	ok(w, "OK", map[string]any{"enabled": cfg.Enabled, "revision": cfg.Revision, "products": products, "brand": "见微 Emby", "currency": "CNY", "channels": cfg.Channels, "default_channel": cfg.DefaultChannel, "donation_qr": cfg.DonationQR})
+	icon := "/api/v2/commerce/brand-icon"
+	if _, version, found := strings.Cut(a.publicServerIconURL(), "?"); found {
+		icon += "?" + version
+	}
+	ok(w, "OK", map[string]any{"enabled": cfg.Enabled, "revision": cfg.Revision, "products": products, "brand": a.cfg().AppName, "icon": icon, "currency": "CNY", "channels": cfg.Channels, "default_channel": cfg.DefaultChannel, "donation_qr": cfg.DonationQR})
 }
 func (a *App) handleShopLogin(w http.ResponseWriter, r *http.Request, _ Params) {
 	if !a.shopIntent(w, r) {
@@ -134,6 +138,13 @@ func (a *App) handleShopLogout(w http.ResponseWriter, r *http.Request, _ Params)
 }
 func (a *App) shopOrderView(o store.ShopOrder, admin bool) map[string]any {
 	out := map[string]any{"id": o.ID, "revision": o.Revision, "points_cost": o.PointsCost, "product": o.Product, "payment_kind": o.PaymentKind, "payment_qr": o.PaymentQR, "channel": o.Channel, "receiving_account": o.ReceivingAccount, "instructions": o.Instructions, "status": o.Status, "created_at": o.CreatedAt, "updated_at": o.UpdatedAt, "pay_before": o.PayBefore, "note": o.Note, "admin_note": o.AdminNote}
+	if o.PaymentProof != "" {
+		prefix := "/api/v2/commerce/orders/"
+		if admin {
+			prefix = "/api/v2/admin/commerce/orders/"
+		}
+		out["payment_proof_url"] = prefix + o.ID + "/proof"
+	}
 	if o.CodeKey != "" {
 		if rc, ok := a.store().RegCode(o.CodeKey); ok {
 			out["redeemed"] = rc.UseCount > 0 || o.RedeemedAt > 0
@@ -152,6 +163,7 @@ func (a *App) shopOrderView(o store.ShopOrder, admin bool) map[string]any {
 		out["received_cents"] = o.ReceivedCents
 		out["paid_at"] = o.PaidAt
 		out["checked_by"] = o.CheckedBy
+		out["receipt_kind"] = o.ReceiptKind
 		out["refund_at"] = o.RefundAt
 	}
 	return out
@@ -164,7 +176,7 @@ func (a *App) handleShopOrders(w http.ResponseWriter, r *http.Request, _ Params)
 	for _, o := range orders[start:end] {
 		items = append(items, a.shopOrderView(o, false))
 	}
-	ok(w, "OK", map[string]any{"username": u.Username, "items": items, "page": page, "total": len(orders), "has_next": end < len(orders)})
+	ok(w, "OK", map[string]any{"username": u.Username, "has_emby": u.EmbyID != "", "whitelist_until": u.WhitelistUntil, "protected": u.Role == store.RoleAdmin || u.ExpiredAt < 0 || u.Role == store.RoleWhitelist && u.WhitelistUntil == 0, "items": items, "page": page, "total": len(orders), "has_next": end < len(orders)})
 }
 func shopPage(r *http.Request, total int) (page, start, end int) {
 	page, _ = strconv.Atoi(r.URL.Query().Get("page"))
@@ -244,12 +256,13 @@ func (a *App) adminShopIntent(w http.ResponseWriter, r *http.Request, body map[s
 	if requireAdmin(w, r) || !requireWebUIIntent(w, r, "shop-admin") {
 		return false
 	}
-	factor, err := a.store().TwoFactorAccount(r.Context(), current(r).User.UID)
-	if err != nil || factor.EnabledAt <= 0 {
-		fail(w, 403, "请先为管理员启用双重验证，再管理收款与发卡")
-		return false
+	// The owner explicitly chose a signed-in administrator workflow for shop
+	// settings and receipt approval. Keep auth, CSRF intent, audit and CAS.
+	// Refunds retain their existing password proof as a separate operation.
+	if strings.HasPrefix(stringValue(body, "action"), "refund_") {
+		return a.twoFactorPassword(w, r, body)
 	}
-	return a.twoFactorPassword(w, r, body)
+	return true
 }
 func (a *App) handleAdminShopConfig(w http.ResponseWriter, r *http.Request, _ Params) {
 	body := decodeMap(r)
@@ -300,6 +313,23 @@ func (a *App) handleAdminShopReview(w http.ResponseWriter, r *http.Request, p Pa
 		return
 	}
 	action := stringValue(body, "action")
+	automaticReceipt := action == "approve"
+	if automaticReceipt {
+		action = "confirm_payment"
+		body["received_cents"] = float64(o.Product.PriceCents)
+		body["paid_at"] = float64(time.Now().Unix())
+		body["payment_reference"] = "manual-order-confirmation:" + o.ID
+		body["verified_actual_receipt"] = true
+		// A repeated Alipay phrase cannot be approved for another order.
+		if o.PaymentKind == "alipay_phrase" && o.PaymentSecretCipher != "" {
+			secret, err := a.shopCipher("payment-secret:"+o.ID, o.PaymentSecretCipher, true)
+			if err != nil {
+				fail(w, 503, "付款口令无法读取，请检查商店密钥")
+				return
+			}
+			body["payment_reference"] = "alipay-phrase:" + strings.TrimSpace(secret)
+		}
+	}
 	if action == "reveal_payment" {
 		if !a.allowRate(r.Context(), rateKey("payment-reveal:", current(r).User.UID), 5, time.Minute) {
 			fail(w, 429, "读取过于频繁")
@@ -360,7 +390,11 @@ func (a *App) handleAdminShopReview(w http.ResponseWriter, r *http.Request, p Pa
 			fail(w, 503, "发码暂不可用")
 			return
 		}
-		result, err = a.store().ConfirmShopPayment(id, revision, current(r).User.UID, received, paidAt, receipt, codeKey, sealed, stringValue(body, "note"), a.cfg().EmbyUserLimit, a.cfg().EmbyDirectRegisterEnabled)
+		receiptKind := ""
+		if automaticReceipt {
+			receiptKind = "manual_order_confirmation"
+		}
+		result, err = a.store().ConfirmShopPayment(id, revision, current(r).User.UID, received, paidAt, receipt, codeKey, sealed, stringValue(body, "note"), a.cfg().EmbyUserLimit, a.cfg().EmbyDirectRegisterEnabled, receiptKind)
 	} else {
 		result, err = a.store().ReviewShopOrder(id, action, stringValue(body, "note"), stringValue(body, "refund_reference"), revision, current(r).User.UID)
 	}

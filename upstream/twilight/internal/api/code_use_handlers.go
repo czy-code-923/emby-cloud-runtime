@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -190,17 +191,21 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 				u.PendingEmbyDays = &days
 			case 3:
 				if paidWhitelist {
-					if u.Role == store.RoleAdmin || (u.Role == store.RoleWhitelist && u.WhitelistUntil == 0) {
+					if u.Role == store.RoleAdmin || u.ExpiredAt < 0 || (u.Role == store.RoleWhitelist && u.WhitelistUntil == 0) {
 						return store.ErrConflict
 					}
 					if u.Role != store.RoleAdmin {
+						whiteBase := time.Now().Unix()
+						if u.Role == store.RoleWhitelist && u.WhitelistUntil > whiteBase {
+							whiteBase = u.WhitelistUntil
+						}
 						u.Role = store.RoleWhitelist
 						base := u.ExpiredAt
 						if base < time.Now().Unix() {
 							base = time.Now().Unix()
 						}
 						u.ExpiredAt = base + int64(days)*86400
-						u.WhitelistUntil = u.ExpiredAt
+						u.WhitelistUntil = whiteBase + int64(days)*86400
 					}
 					if u.EmbyID == "" {
 						u.PendingEmby = true
@@ -277,6 +282,28 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 		return
 	}
 	data := preview
+	// Entitlements are committed once. Remote reconciliation failure must not
+	// ask the member to redeem again or consume another code.
+	if u.EmbyID != "" && (u.Role != p.User.Role || (u.EmbyDisabled && u.EmbyAutoDisabled)) {
+		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+		pending := false
+		if u.EmbyDisabled && u.EmbyAutoDisabled && a.embyShouldEnableUser(u) {
+			pending = a.embyApplyEnabledState(ctx, u.UID, u.EmbyID, true) != nil
+		}
+		if a.cfg().MediaLimitsEnabled || u.MediaPolicyManaged {
+			pending = a.applyMediaStreamLimit(ctx, u) != nil || pending
+		}
+		cancel()
+		data["media_sync_pending"] = pending
+		if latest, found := a.store().User(u.UID); found {
+			u = latest
+		}
+	}
+	if view, err := a.store().RetentionView(u.UID, time.Now().Unix()); err == nil {
+		data["retention_selectable_at"] = view.SelectableAt
+		data["retention_choice_locked"] = view.ChoiceLocked
+	}
+	data["whitelist_until"] = u.WhitelistUntil
 	data["pending"] = u.PendingEmby && u.EmbyID == ""
 	data["user"] = publicUser(u)
 	data["expire_status"] = expireStatus(u.ExpiredAt)
@@ -292,7 +319,11 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 		detail["inviter_uid"] = inviteForUse.InviterUID
 	}
 	a.audit(r, "use_code", "user", 0, detail)
-	ok(w, "使用成功", data)
+	message := "使用成功"
+	if pending, _ := data["media_sync_pending"].(bool); pending {
+		message = "卡码已生效，播放权限同步中，请稍后刷新；无需重复兑换"
+	}
+	ok(w, message, data)
 }
 
 func codeGrantsEmbyRegistration(source string, codeType int) bool {

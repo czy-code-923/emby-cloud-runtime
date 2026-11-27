@@ -62,11 +62,11 @@ func TestJianweiNativeMenuHonorsIndependentFeatureSwitches(t *testing.T) {
 
 func TestJianweiNativeRetentionSummaryShowsFutureAndCollectionGap(t *testing.T) {
 	now := time.Now().Unix()
-	v := store.RetentionView{Policy: retention.DefaultPolicy(), Start: now + 3600, End: now + 31*86400, Quality: "stale"}
+	v := store.RetentionView{Policy: retention.DefaultPolicy(), Start: now + 3600, End: now + 31*86400, Quality: "stale", ChoiceLocked: true}
 	v.Policy.Enabled = true
 	v.Member.Member = retention.Member{PlaybackEnd: v.End, Mode: "B", Participation: true, NextSwitchAt: now + 86400}
 	text := retentionNativeText(v)
-	for _, expected := range []string{"下一窗尚未开始", "采样已过期", "窗口起止", "已锁定，仅管理员可修改"} {
+	for _, expected := range []string{"下一窗尚未开始", "采样已过期", "窗口起止", "本窗口已锁定"} {
 		if !strings.Contains(text, expected) {
 			t.Fatal("missing member-facing state:", expected)
 		}

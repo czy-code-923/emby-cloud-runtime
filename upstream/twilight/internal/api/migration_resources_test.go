@@ -13,12 +13,14 @@ import (
 func TestCollectMigrationResourcesUsesLogicalPaths(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
-		"avatar/user.jpg":                 "avatar",
-		"background/dark.webp":            "background",
-		"tickets/42/reply/image.png":      "ticket",
-		"server-icon/site.png":            "icon",
-		"auth-background/background.jpeg": "auth",
-		"bangumi/123.jpg":                 "cover",
+		"avatar/user.jpg":                     "avatar",
+		"background/dark.webp":                "background",
+		"tickets/42/reply/image.png":          "ticket",
+		"server-icon/site.png":                "icon",
+		"auth-background/background.jpeg":     "auth",
+		"bangumi/123.jpg":                     "cover",
+		"commerce/0123456789abcdef.png":       "payment QR",
+		"commerce-proof/fedcba9876543210.jpg": "private proof",
 	}
 	for relative, content := range files {
 		filename := filepath.Join(root, filepath.FromSlash(relative))
@@ -48,12 +50,14 @@ func TestCollectMigrationResourcesUsesLogicalPaths(t *testing.T) {
 		}
 	}
 	want := map[string]string{
-		"resources/avatars/user.jpg":                "avatar",
-		"resources/backgrounds/dark.webp":           "background",
-		"resources/tickets/42/reply/image.png":      "ticket",
-		"resources/server-icon/site.png":            "icon",
-		"resources/auth-background/background.jpeg": "auth",
-		"resources/bangumi/123.jpg":                 "cover",
+		"resources/avatars/user.jpg":                    "avatar",
+		"resources/backgrounds/dark.webp":               "background",
+		"resources/tickets/42/reply/image.png":          "ticket",
+		"resources/server-icon/site.png":                "icon",
+		"resources/auth-background/background.jpeg":     "auth",
+		"resources/bangumi/123.jpg":                     "cover",
+		"resources/commerce/0123456789abcdef.png":       "payment QR",
+		"resources/commerce-proof/fedcba9876543210.jpg": "private proof",
 	}
 	for path, content := range want {
 		if seen[path] != content {

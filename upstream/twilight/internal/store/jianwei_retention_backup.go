@@ -3,6 +3,8 @@ package store
 import (
 	"fmt"
 	"github.com/prejudice-studio/twilight/internal/retention"
+	"strconv"
+	"strings"
 )
 
 // Import never trusts cached grants, queued previews or live sampling cursors.
@@ -22,6 +24,14 @@ func ValidateRetentionBackup(state *State) error {
 		}
 		if v.Member.Mode != "" && v.Member.Mode != retention.ModeA && v.Member.Mode != retention.ModeB {
 			return fmt.Errorf("invalid retention method backup")
+		}
+		if window := v.Member.SelectedWindow; window != "" {
+			owner, end, valid := strings.Cut(window, ":")
+			windowUID, e1 := strconv.ParseInt(owner, 10, 64)
+			deadline, e2 := strconv.ParseInt(end, 10, 64)
+			if !valid || len(window) > 128 || e1 != nil || e2 != nil || windowUID != uid || deadline <= 0 || deadline > v.Member.PlaybackEnd {
+				return fmt.Errorf("invalid retention selection window")
+			}
 		}
 		if v.Member.Consent && (v.Member.Mode != retention.ModeA || !v.Member.Participation || v.Member.ConsentCap < v.Policy.Cost) {
 			return fmt.Errorf("invalid retention authorization backup")

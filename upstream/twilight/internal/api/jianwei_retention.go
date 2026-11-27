@@ -20,7 +20,7 @@ func retentionError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, retention.ErrUnavailable), errors.Is(err, store.ErrEmbyRequired):
 		message = "当前尚不能选择保号方式，请先开通 Emby；免保号账号需剩余不足30天且管理员已开启功能"
-	case errors.Is(err, store.ErrRetentionModeLocked):
+	case errors.Is(err, store.ErrRetentionModeLocked), errors.Is(err, retention.ErrSelected):
 		message = store.ErrRetentionModeLocked.Error()
 	case errors.Is(err, retention.ErrCooldown):
 		message = "距离上次实际选择或更换尚未满20天"
@@ -132,10 +132,13 @@ func (a *App) handleAdminRetention(w http.ResponseWriter, r *http.Request, _ Par
 	}
 	items := []store.RetentionView{}
 	for _, u := range a.store().ListUsers() {
+		if u.EmbyID == "" || u.Role != store.RoleNormal || u.ExpiredAt < 0 {
+			continue
+		}
 		if len(items) >= 200 {
 			break
 		}
-		if v, err := a.store().RetentionView(u.UID, time.Now().Unix()); err == nil && v.Member.Member.Participation {
+		if v, err := a.store().RetentionView(u.UID, time.Now().Unix()); err == nil {
 			items = append(items, v)
 		}
 	}
@@ -238,6 +241,13 @@ func retentionNativeText(v store.RetentionView) string {
 	if m.Permanent {
 		return text + "\n\n受保护或长期有效账户，免活动保号要求。"
 	}
+	if now < v.SelectableAt {
+		notice := "当前无需保号。普通账户在到期前30天内可选择本窗口的A或B。"
+		if m.LastSettlement != nil {
+			notice = "本窗口保号已完成，下一窗口开放后可重新选择A或B。"
+		}
+		return text + "\n\n" + notice + "\n· 开放选择  |  " + format(v.SelectableAt) + "\n· 当前有效期 | " + format(v.End)
+	}
 	if m.PlaybackEnd > 0 {
 		text += "\n· 窗口起止  |  " + format(v.Start) + " → " + format(v.End)
 	}
@@ -250,8 +260,8 @@ func retentionNativeText(v store.RetentionView) string {
 	if m.HoldUntil > now {
 		text += "\n· 事故保护至 | " + format(m.HoldUntil) + "；已暂停活动结算，等待管理员核实补偿。"
 	}
-	if m.Mode != "" {
-		text += "\n· 方式修改  |  已锁定，仅管理员可修改"
+	if v.ChoiceLocked {
+		text += "\n· 方式修改  |  本窗口已锁定，下个窗口可重新选择；管理员可调整本用户"
 	} else {
 		text += "\n· 方式切换  |  可选择；选择后锁定，仅管理员可修改"
 	}
@@ -263,7 +273,7 @@ func retentionNativeText(v store.RetentionView) string {
 	if v.AccessUntil > v.End && now >= v.End {
 		text += "\n· 救济播放至  |  " + format(v.AccessUntil) + "；补救须单独确认，不静默追扣。"
 	}
-	text += fmt.Sprintf("\n\nA：明确授权后，每个30天窗口扣%d积分续30天，无签到次数硬门槛。\nB：本窗有效观影满30分钟，免费续30天。\n确认选择后用户不能撤回或更换，只能联系管理员调整。\n签到 /signin · 选择 /retention A 或 /retention B\n需要修改请联系管理员", v.Policy.Cost)
+	text += fmt.Sprintf("\n\nA：明确授权后，每个30天窗口扣%d积分续30天，无签到次数硬门槛。\nB：本窗有效观影满30分钟，免费续30天。\n本窗口确认后不能撤回或更换；下一窗口可重新选择。管理员可调整单个用户。\n签到 /signin · 选择 /retention A 或 /retention B\n需要修改请联系管理员", v.Policy.Cost)
 	return text
 }
 func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
@@ -298,7 +308,7 @@ func (a *App) telegramRetention(ctx context.Context, c telegramCommandCtx) {
 		d, _ := data.(map[string]any)
 		q, _ := d["quote"].(map[string]any)
 		token := asString(d["token"])
-		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分续30天；B累计30分钟观影、不扣积分。\n确认120秒内有效；选择后不能自行撤回或更换，仅管理员可修改。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"])
+		message = fmt.Sprintf("选择保号方式 %s\n当前积分 %v · 观影 %v秒\nA授权：每个符合条件的窗口最多扣%v积分续30天；B累计30分钟观影、不扣积分。\n确认120秒内有效；本窗口选择后不能撤回或更换，下一窗口可重新选择；管理员可调整本用户。", q["target_mode"], q["available"], q["watch_seconds"], q["cost"])
 		if purchase, _ := d["purchase"].(bool); purchase {
 			message = fmt.Sprintf("积分免保号卡 · %s\n本次扣除%v积分，保留当前剩余时长，追加卡券天数并暂停活动自动扣分。\n这是独立的单次交易，不会开启自动购买订阅。确认120秒内有效；选择后不能自行撤回或更换。", q["target_mode"], q["cost"])
 		}

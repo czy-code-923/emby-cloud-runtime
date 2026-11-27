@@ -64,43 +64,49 @@ func TestRetentionSettlementAdvancesOldEndAndWaitsForNextWindow(t *testing.T) {
 	}
 }
 
-func TestRetentionModeChangeCooldownTracksActualChange(t *testing.T) {
+func TestRetentionOneChoicePerWindowAndFreshChoiceAfterRenewal(t *testing.T) {
 	m, w, g, p, now := fixture()
-	quote, err := Preview(m, w, g, p, ModeA, now)
+	q, err := Preview(m, w, g, p, ModeA, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err = Confirm(m, w, g, p, quote, false, true, 300, now)
+	m, err = Confirm(m, w, g, p, q, false, true, 300, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.NextSwitchAt != now+20*Day {
-		t.Fatal("wrong first cooldown")
+	if m.SelectedWindow != WindowID(m) {
+		t.Fatal("choice not scoped to current window")
 	}
-	if _, err = Preview(m, w, g, p, ModeB, now+10*Day); !errors.Is(err, ErrCooldown) {
-		t.Fatal("early switch accepted")
+	for _, target := range []string{ModeA, ModeB} {
+		if _, err = Preview(m, w, g, p, target, now+20*Day); !errors.Is(err, ErrSelected) {
+			t.Fatal("second choice accepted", target, err)
+		}
 	}
-	// Extend P as a committed renewal would, without resetting the mode clock.
-	m.PlaybackEnd += 30 * Day
-	g.WindowID = WindowID(m)
-	quote, err = Preview(m, w, g, p, ModeB, now+35*Day)
+	decision, err := Evaluate(m, w, g, p, false, now+1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err = Confirm(m, w, g, p, quote, false, false, 0, now+35*Day)
+	m, err = ApplySettlement(m, decision)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.NextSwitchAt != now+55*Day {
-		t.Fatal("unspent unlock right expired")
+	if m.Participation || m.Consent || m.Mode != "" {
+		t.Fatal("old debit authorization carried into next window")
 	}
-	quote, err = Preview(m, w, g, p, ModeB, now+36*Day)
+	if Selectable(m, p, now+2) {
+		t.Fatal("future window opened early")
+	}
+	g = Progress{WindowID: WindowID(m)}
+	q, err = Preview(m, w, g, p, ModeB, decision.OldEnd+1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("next window did not reopen", err)
 	}
-	again, err := Confirm(m, w, g, p, quote, false, false, 0, now+36*Day)
-	if err != nil || again.NextSwitchAt != m.NextSwitchAt || again.Version != m.Version {
-		t.Fatal("repeating the selected mode changed the cooldown")
+	m, err = Confirm(m, w, g, p, q, false, false, 0, decision.OldEnd+1)
+	if err != nil || m.Mode != ModeB {
+		t.Fatal("next window could not select B", err)
+	}
+	if _, err = Preview(m, w, g, p, ModeA, decision.OldEnd+2); !errors.Is(err, ErrSelected) {
+		t.Fatal("new window was not locked", err)
 	}
 }
 
@@ -209,8 +215,8 @@ func TestRetentionCardPausesParticipationWithoutLosingTimeOrCooldown(t *testing.
 	m.Consent = true
 	m.ConsentCap = 300
 	updated, err := AddExemption(m, 30*Day, now)
-	if err != nil || updated.PlaybackEnd != now+40*Day || updated.ExemptEnd != updated.PlaybackEnd || updated.Participation || updated.Consent || updated.NextSwitchAt != m.NextSwitchAt || updated.Mode != ModeA {
-		t.Fatal("card corrupted retained time, consent or cooldown")
+	if err != nil || updated.PlaybackEnd != now+40*Day || updated.ExemptEnd != updated.PlaybackEnd || updated.Participation || updated.Consent || updated.Mode != "" || updated.SelectedWindow != "" {
+		t.Fatal("card corrupted retained time or retained old authorization")
 	}
 }
 

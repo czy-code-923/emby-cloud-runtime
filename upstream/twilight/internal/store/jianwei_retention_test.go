@@ -101,8 +101,8 @@ func TestJianweiRetentionTrustedSamplingUnionSeeksAndWindows(t *testing.T) {
 		}
 		if seconds == 90 {
 			v, _ := s.RetentionView(u.UID, now+seconds)
-			if v.Seconds != 0 {
-				t.Fatal("short segment credited")
+			if v.Seconds != 90 {
+				t.Fatal("verified short segments were not accumulated")
 			}
 		}
 		if seconds == 900 {

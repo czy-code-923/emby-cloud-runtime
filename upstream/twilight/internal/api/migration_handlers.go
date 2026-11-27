@@ -98,6 +98,8 @@ func (a *App) handleMigrationStatus(w http.ResponseWriter, r *http.Request, _ Pa
 			"resources/tickets/",
 			"resources/server-icon/",
 			"resources/auth-background/",
+			"resources/commerce/",
+			"resources/commerce-proof/",
 			"resources/bangumi/",
 		},
 	})
@@ -403,6 +405,8 @@ func migrationResourcePathParts(logical string) (string, string, error) {
 		{"resources/tickets/", "tickets"},
 		{"resources/server-icon/", "server-icon"},
 		{"resources/auth-background/", "auth-background"},
+		{"resources/commerce/", "commerce"},
+		{"resources/commerce-proof/", "commerce-proof"},
 		{"resources/bangumi/", "bangumi"},
 	} {
 		if strings.HasPrefix(logical, prefix.prefix) {
@@ -429,7 +433,7 @@ var (
 //   - bangumi：<条目 ID>.<图片扩展名>。
 func migrationResourceNameAllowed(source, relative string) bool {
 	switch source {
-	case "avatar", "background", "server-icon":
+	case "avatar", "background", "server-icon", "commerce", "commerce-proof":
 		return uploadFilenamePattern.MatchString(relative)
 	case "auth-background":
 		return migrationAuthBackgroundNamePattern.MatchString(relative) || uploadFilenamePattern.MatchString(relative)

@@ -74,41 +74,38 @@ export const userNavItems: SidebarNavItem[] = [
 ];
 
 export const adminNavItems: SidebarNavItem[] = [
-  {href:"/admin/control",labelKey:"ops.control",icon:LayoutDashboard},
-  {href:"/admin/finance",labelKey:"ops.finance",icon:Coins},
   { href: "/admin", labelKey: "navigation.adminHome", icon: LayoutDashboard },
-  { href: "/admin/users", labelKey: "navigation.users", icon: Users },
-  { href: "/admin/regcodes", labelKey: "navigation.regcodes", icon: FileText },
-  { href: "/admin/retention", labelKey: "retention.title", icon: Shield },
-  { href: "/admin/commerce", labelKey: "commerce.adminTitle", icon: Coins },
-  { href: "/admin/invite", labelKey: "navigation.inviteForest", icon: Network },
-
-  { href: "/admin/emby", labelKey: "navigation.embyAdmin", icon: Server, category: "service" },
-  { href: "/admin/playrank", labelKey: "navigation.playRankAdmin", icon: BarChart3, category: "service" },
-  { href: "/admin/metadata", labelKey: "v6.metadataTitle", icon: BookOpen, category: "service" },
-  { href: "/admin/bangumi", labelKey: "navigation.bangumiAdmin", icon: BookOpen, category: "service" },
-  { href: "/admin/email", labelKey: "navigation.emailAdmin", icon: Mail, category: "service" },
-  { href: "/admin/telegram", labelKey: "navigation.telegramAdmin", icon: MessageSquare, category: "service" },
-
-  { href: "/admin/announcements", labelKey: "navigation.adminAnnouncements", icon: Megaphone, category: "content" },
-  { href: "/admin/tickets", labelKey: "navigation.adminTickets", icon: MessageSquareMore, category: "content" },
+  { href: "/admin/users", labelKey: "navigation.users", icon: Users, category: "members" },
+  { href: "/admin/retention", labelKey: "retention.title", icon: Shield, category: "members" },
+  { href: "/admin/regcodes", labelKey: "navigation.regcodes", icon: FileText, category: "members" },
+  { href: "/admin/commerce", labelKey: "commerce.adminTitle", icon: Coins, category: "members" },
+  {href:"/admin/finance",labelKey:"ops.finance",icon:Coins, category: "members" },
+  { href: "/admin/invite", labelKey: "navigation.inviteForest", icon: Network, category: "members" },
   { href: "/admin/requests", labelKey: "navigation.requestReview", icon: Film, category: "content" },
-
-  { href: "/admin/security", labelKey: "navigation.securityCenter", icon: Shield, category: "security" },
-  { href: "/admin/audit-logs", labelKey: "navigation.auditLogs", icon: ClipboardList, category: "security" },
-  { href: "/admin/violations", labelKey: "navigation.violations", icon: ShieldAlert, category: "security" },
-
+  { href: "/admin/announcements", labelKey: "navigation.adminAnnouncements", icon: Megaphone, category: "content" },
+  { href: "/admin/playrank", labelKey: "navigation.playRankAdmin", icon: BarChart3, category: "content" },
+  { href: "/admin/tickets", labelKey: "navigation.adminTickets", icon: MessageSquareMore, category: "content" },
+  { href: "/admin/emby", labelKey: "navigation.embyAdmin", icon: Server, category: "service" },
+  { href: "/admin/telegram", labelKey: "navigation.telegramAdmin", icon: MessageSquare, category: "service" },
+  { href: "/admin/metadata", labelKey: "v6.metadataTitle", icon: BookOpen, category: "service" },
+  { href: "/admin/bangumi", labelKey: "v8.bangumiTasks", icon: BookOpen, category: "service" },
+  { href: "/admin/email", labelKey: "navigation.emailAdmin", icon: Mail, category: "service" },
+  {href:"/admin/control",labelKey:"v8.featureControl",icon:LayoutDashboard, category: "system" },
   { href: "/admin/entries", labelKey: "entrySettings.title", icon: Network, category: "system" },
-  { href: "/admin/config", labelKey: "navigation.configAdmin", icon: FileCode, category: "system" },
+  { href: "/admin/config", labelKey: "v8.advancedConfig", icon: FileCode, category: "system" },
   { href: "/admin/updates", labelKey: "deploymentUpdate.title", icon: Download, category: "system" },
-  { href: "/admin/database", labelKey: "navigation.databaseBackup", icon: Database, category: "system" },
   { href: "/admin/scheduler", labelKey: "navigation.scheduler", icon: TimerReset, category: "system" },
-  { href: "/admin/logs", labelKey: "navigation.runtimeLogs", icon: ScrollText, category: "system" },
+  { href: "/admin/database", labelKey: "navigation.databaseBackup", icon: Database, category: "system" },
   { href: "/admin/test", labelKey: "navigation.serverInfo", icon: TestTube, category: "system" },
   { href: "/admin/developer", labelKey: "navigation.developerMode", icon: Code2, category: "system" },
+  { href: "/admin/security", labelKey: "navigation.securityCenter", icon: Shield, category: "security" },
+  { href: "/admin/violations", labelKey: "navigation.violations", icon: ShieldAlert, category: "security" },
+  { href: "/admin/audit-logs", labelKey: "navigation.auditLogs", icon: ClipboardList, category: "security" },
+  { href: "/admin/logs", labelKey: "navigation.runtimeLogs", icon: ScrollText, category: "security" },
 ];
 
 export const adminCategoryLabelKeys: Record<string, MessageKey> = {
+  members: "v8.catMembers",
   service: "navigation.catService",
   content: "navigation.catContent",
   security: "navigation.catSecurity",
@@ -227,7 +224,9 @@ export function Sidebar() {
   const safeSystemIcon = useMemo(() => sanitizeImageUrl(systemInfo?.icon || envIcon), [envIcon, systemInfo?.icon]);
   const safeProfileAvatar = useMemo(() => sanitizeImageUrl(profileAvatar), [profileAvatar]);
   const visibleUserNavItems = useMemo(
-    () => filterNavItems(userNavItems, systemInfo?.features, isAdmin),
+    () => filterNavItems(userNavItems, systemInfo?.features, isAdmin)
+      .filter(item=>!isAdmin||!["/dashboard","/announcements","/playrank","/invite"].includes(item.href))
+      .map((item):SidebarNavItem=>isAdmin&&item.href==="/media"?{...item,labelKey:"v8.mediaSearch"}:item),
     [isAdmin, systemInfo?.features],
   );
   const visibleAdminNavItems = useMemo(
@@ -272,31 +271,6 @@ export function Sidebar() {
         </div>
 
         <nav className="sidebar-nav">
-          <p className="sidebar-label">{t("navigation.userMenu")}</p>
-          <Fragment>
-            {visibleUserNavItems.map((item) => {
-              const active = isActivePath(pathname, item.href);
-              return (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  prefetch={false}
-                  ref={active ? activeLinkRef : undefined}
-                  aria-current={active ? "page" : undefined}
-                  className={cn("sidebar-link", active && "sidebar-link-active")}
-                >
-                  {active && (
-                    <span className="sidebar-active-bg animate-in fade-in duration-150" />
-                  )}
-                  <item.icon className="relative z-10 h-4 w-4 shrink-0" />
-                  <span className="relative z-10">{item.label || (item.labelKey ? t(item.labelKey) : "")}</span>
-                  {active && (
-                    <span className="sidebar-dot animate-in fade-in duration-150" />
-                  )}
-                </Link>
-              );
-            })}
-          </Fragment>
           {isAdmin && (
             <>
               <p className="sidebar-label mt-5">{t("navigation.adminMenu")}</p>
@@ -333,6 +307,31 @@ export function Sidebar() {
               </Fragment>
             </>
           )}
+          <p className="sidebar-label">{t(isAdmin?"v8.accountMenu":"navigation.userMenu")}</p>
+          <Fragment>
+            {visibleUserNavItems.map((item) => {
+              const active = isActivePath(pathname, item.href);
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  prefetch={false}
+                  ref={active ? activeLinkRef : undefined}
+                  aria-current={active ? "page" : undefined}
+                  className={cn("sidebar-link", active && "sidebar-link-active")}
+                >
+                  {active && (
+                    <span className="sidebar-active-bg animate-in fade-in duration-150" />
+                  )}
+                  <item.icon className="relative z-10 h-4 w-4 shrink-0" />
+                  <span className="relative z-10">{item.label || (item.labelKey ? t(item.labelKey) : "")}</span>
+                  {active && (
+                    <span className="sidebar-dot animate-in fade-in duration-150" />
+                  )}
+                </Link>
+              );
+            })}
+          </Fragment>
         </nav>
 
         <div className="sidebar-footer">

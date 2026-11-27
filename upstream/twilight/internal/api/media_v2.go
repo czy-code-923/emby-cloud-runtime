@@ -29,11 +29,15 @@ func (a *App) handleV2MediaSearch(w http.ResponseWriter, r *http.Request, params
 	limit := clamp(queryInt(r, "limit", queryInt(r, "per_page", 20)), 1, 50)
 	routeSource := params["source"]
 	source := normalizeSource(firstNonEmpty(routeSource, r.URL.Query().Get("source"), "all"))
+	if source == "tmdb" && strings.TrimSpace(a.cfg().TMDBAPIKey) == "" {
+		failWithCode(w, http.StatusConflict, ErrMediaSearchSourceFailed, "TMDB 尚未配置 API Key 或读取令牌，请联系管理员在资料源设置中保存后重试")
+		return
+	}
 	mediaType := firstNonEmpty(r.URL.Query().Get("type"), r.URL.Query().Get("media_type"))
 	results, _, sourceErrors := a.searchMedia(r.Context(), query, source, mediaType, limit, false)
 	if source != "all" {
 		if _, failed := sourceErrors[source]; failed {
-			failWithCode(w, http.StatusBadGateway, ErrMediaSearchSourceFailed, "媒体搜索暂时不可用，请稍后重试")
+			failWithCode(w, http.StatusBadGateway, ErrMediaSearchSourceFailed, "资料源搜索暂时不可用，请稍后重试；管理员可检查资料源凭据和服务器连通性")
 			return
 		}
 	}

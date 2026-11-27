@@ -311,6 +311,7 @@ function buildHttpErrorMessage(
   method: string,
   apiVersion: ApiVersion,
   backendMessage?: string,
+  backendErrorCode?: string,
 ): string {
   const target = describeApiTarget(endpoint, method, apiVersion);
   const detail = backendMessage && backendMessage !== "接口不存在" ? `后端返回：${backendMessage}` : "";
@@ -351,6 +352,7 @@ function buildHttpErrorMessage(
     ].filter(Boolean).join("\n");
   }
   if (status === 502 || status === 503 || status === 504) {
+    if (backendErrorCode === "MEDIA_SEARCH_SOURCE_FAILED" && backendMessage) return backendMessage;
     return `后端服务暂不可用 (${status})：${target}\n请确认 API 服务、反向代理或网关正在运行。`;
   }
   return backendMessage || `请求失败 (${status})：${target}`;
@@ -556,7 +558,7 @@ export async function apiRequest<T>(
         method,
         errorCode: data?.error_code,
         backendMessage: data?.message,
-        message: buildHttpErrorMessage(response.status, endpoint, method, apiVersion, data?.message),
+        message: buildHttpErrorMessage(response.status, endpoint, method, apiVersion, data?.message, data?.error_code),
         data: data?.data,
       });
     }
@@ -639,7 +641,7 @@ export async function apiRequestForm<T>(
         method: methodName,
         errorCode: data?.error_code,
         backendMessage: data?.message,
-        message: buildHttpErrorMessage(response.status, endpoint, methodName, apiVersion, data?.message),
+        message: buildHttpErrorMessage(response.status, endpoint, methodName, apiVersion, data?.message, data?.error_code),
         data: data?.data,
       });
     }

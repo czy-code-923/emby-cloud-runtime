@@ -11,13 +11,14 @@ import (
 )
 
 type ShopProduct struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Kind       int    `json:"kind"` // 1 registration, 2 renewal. Whitelist is not sold implicitly.
-	Days       int    `json:"days"`
-	PriceCents int64  `json:"price_cents"`
-	Enabled    bool   `json:"enabled"`
-	Stock      int    `json:"stock"` // -1 unlimited; otherwise includes pending reservations.
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Kind           int    `json:"kind"` // 1 registration, 2 renewal. Whitelist is not sold implicitly.
+	Days           int    `json:"days"`
+	PriceCents     int64  `json:"price_cents"`
+	Enabled        bool   `json:"enabled"`
+	Stock          int    `json:"stock"` // -1 unlimited; otherwise includes pending reservations.
+	Recommendation string `json:"recommendation,omitempty"`
 }
 type ShopSettings struct {
 	Channels         []PaymentChannel `json:"channels,omitempty"`
@@ -63,6 +64,9 @@ type ShopOrder struct {
 	PayBefore           int64       `json:"pay_before"`
 	CapacityReserved    bool        `json:"capacity_reserved"`
 	Note                string      `json:"note,omitempty"`
+	PaymentProof        string      `json:"payment_proof,omitempty"`
+	ProofUploads        int         `json:"proof_uploads,omitempty"`
+	ReceiptKind         string      `json:"receipt_kind,omitempty"`
 	AdminNote           string      `json:"admin_note,omitempty"`
 	ReceiptHash         string      `json:"receipt_hash,omitempty"`
 	ReceivedCents       int64       `json:"received_cents,omitempty"`
@@ -83,7 +87,7 @@ func (s *Store) ShopConfiguration() ShopSettings {
 	// editors and snapshots can legitimately have no products yet.
 	v.Products = append([]ShopProduct{}, v.Products...)
 	v.Channels = append([]PaymentChannel{}, v.Channels...)
-	if len(v.Products) == 0 && !v.Enabled {
+	if len(v.Products) == 0 && !v.Enabled && v.Revision == 0 {
 		for _, days := range []int{30, 90, 365} {
 			for _, kind := range []int{1, 2, 3} {
 				name := map[int]string{1: "注册卡", 2: "续期卡", 3: "限期白名单卡"}[kind]
@@ -91,7 +95,7 @@ func (s *Store) ShopConfiguration() ShopSettings {
 			}
 		}
 	}
-	if len(v.Channels) == 0 && !v.Enabled && v.Channel == "" {
+	if len(v.Channels) == 0 && !v.Enabled && v.Channel == "" && v.Revision == 0 {
 		v.DefaultChannel = "alipay_phrase"
 		for _, item := range []struct{ id, name string }{{"alipay_phrase", "支付宝口令"}, {"alipay_qr", "支付宝个人静态码"}, {"wechat_qr", "微信个人静态码"}} {
 			v.Channels = append(v.Channels, PaymentChannel{ID: item.id, Kind: item.id, Name: item.name, Version: 1})
@@ -106,7 +110,7 @@ func (s *Store) SaveShopConfiguration(settings ShopSettings, expected int64) err
 	ids := map[string]bool{}
 	readyProduct := false
 	for _, p := range settings.Products {
-		if p.ID == "" || len(p.ID) > 40 || ids[p.ID] || strings.TrimSpace(p.Name) == "" || len(p.Name) > 120 || p.Days < 1 || p.Days > 3650 || p.PriceCents < 0 || (p.Enabled && p.PriceCents < 1) || p.PriceCents > 10000000 || (p.Kind != 1 && p.Kind != 2 && p.Kind != 3) || p.Stock < -1 {
+		if p.ID == "" || len(p.ID) > 40 || ids[p.ID] || strings.TrimSpace(p.Name) == "" || len(p.Name) > 120 || len(p.Recommendation) > 720 || p.Days < 1 || p.Days > 3650 || p.PriceCents < 0 || (p.Enabled && p.PriceCents < 1) || p.PriceCents > 10000000 || (p.Kind != 1 && p.Kind != 2 && p.Kind != 3) || p.Stock < -1 {
 			return ErrInvalid
 		}
 		ids[p.ID] = true
@@ -212,7 +216,7 @@ func (s *Store) CreateShopOrder(uid int64, id, productID, requestKey string, rev
 		if product.ID == "" {
 			return ErrNotFound
 		}
-		if product.Kind == 3 && (u.Role == RoleAdmin || u.Role == RoleWhitelist && u.WhitelistUntil == 0) {
+		if product.Kind == 3 && (u.Role == RoleAdmin || u.ExpiredAt < 0 || u.Role == RoleWhitelist && u.WhitelistUntil == 0) {
 			return ErrInvalid
 		}
 		if product.Kind == 1 && (u.EmbyID != "" || u.PendingEmby || u.EmbyGrantLocked) {
@@ -317,7 +321,7 @@ func (s *Store) SubmitShopPayment(uid int64, id, note string, cancel bool, secre
 
 // ConfirmShopPayment commits the verified receipt and the single-use code in
 // one state CAS transaction. Repeated confirmations never mint another code.
-func (s *Store) ConfirmShopPayment(id string, revision, admin, received, paidAt int64, receiptHash, codeKey, cipher, note string, limit int, countActive bool) (ShopOrder, error) {
+func (s *Store) ConfirmShopPayment(id string, revision, admin, received, paidAt int64, receiptHash, codeKey, cipher, note string, limit int, countActive bool, receiptKind ...string) (ShopOrder, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var result ShopOrder
@@ -351,10 +355,13 @@ func (s *Store) ConfirmShopPayment(id string, revision, admin, received, paidAt 
 		o.ReceiptHash = receiptHash
 		o.ReceivedCents = received
 		o.PaidAt = paidAt
+		if len(receiptKind) > 0 && receiptKind[0] == "manual_order_confirmation" {
+			o.ReceiptKind = receiptKind[0]
+		}
 		o.CheckedBy = admin
 		o.AdminNote = note
 		ready := ok && u.Active && u.TelegramID > 0
-		if o.Product.Kind == 3 && (u.Role == RoleAdmin || u.Role == RoleWhitelist && u.WhitelistUntil == 0) {
+		if o.Product.Kind == 3 && (u.Role == RoleAdmin || u.ExpiredAt < 0 || u.Role == RoleWhitelist && u.WhitelistUntil == 0) {
 			ready = false
 		}
 		if o.Product.Kind == 2 && (u.Role == RoleAdmin || u.ExpiredAt < 0) {

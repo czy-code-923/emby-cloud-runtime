@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-var ErrRetentionModeLocked = fmt.Errorf("已选择保号方式，用户不能撤回或更换；请联系管理员")
+var ErrRetentionModeLocked = fmt.Errorf("本窗口已选择保号方式，不能撤回或更换；下一窗口可重新选择，管理员可调整本用户")
 
 // All wallet debits, grant facts, window decisions and delivery intentions
 // share the state CAS transaction. Delivery retries never repeat a debit.
@@ -72,22 +72,24 @@ type RetentionObservation struct {
 	Playing  bool
 }
 type RetentionView struct {
-	Policy      retention.Policy  `json:"policy"`
-	Member      RetentionMember   `json:"account"`
-	WindowID    string            `json:"window_id"`
-	Start       int64             `json:"window_start"`
-	End         int64             `json:"window_end"`
-	Seconds     int64             `json:"watch_seconds"`
-	SigninDays  int               `json:"signin_days"`
-	Balance     int               `json:"balance"`
-	Frozen      int               `json:"frozen"`
-	Selectable  bool              `json:"selectable"`
-	AccessUntil int64             `json:"access_until"`
-	LastPoll    int64             `json:"last_poll"`
-	Quality     string            `json:"quality"`
-	Username    string            `json:"username"`
-	EmbyName    string            `json:"emby_username"`
-	Ledger      []RetentionLedger `json:"ledger"`
+	Policy       retention.Policy  `json:"policy"`
+	Member       RetentionMember   `json:"account"`
+	WindowID     string            `json:"window_id"`
+	Start        int64             `json:"window_start"`
+	End          int64             `json:"window_end"`
+	Seconds      int64             `json:"watch_seconds"`
+	SigninDays   int               `json:"signin_days"`
+	Balance      int               `json:"balance"`
+	Frozen       int               `json:"frozen"`
+	Selectable   bool              `json:"selectable"`
+	SelectableAt int64             `json:"selectable_at"`
+	ChoiceLocked bool              `json:"choice_locked"`
+	AccessUntil  int64             `json:"access_until"`
+	LastPoll     int64             `json:"last_poll"`
+	Quality      string            `json:"quality"`
+	Username     string            `json:"username"`
+	EmbyName     string            `json:"emby_username"`
+	Ledger       []RetentionLedger `json:"ledger"`
 }
 
 func (r *RetentionState) ensure() {
@@ -148,13 +150,38 @@ func (s *Store) retentionMemberLocked(u User) RetentionMember {
 	// External card/admin changes revoke old candidates and preserve cooldown.
 	if r.Member.PlaybackEnd != u.ExpiredAt {
 		r.Member = retention.Withdraw(r.Member)
+		r.Member.Mode = ""
+		r.Member.SelectedWindow = ""
 		r.Member.PlaybackEnd = u.ExpiredAt
 		r.Member.ExemptEnd = u.ExpiredAt
 		r.Member.Version++
 		r.Member.LastSettlement = nil
 		r.QualifiedAt = 0
 	}
+	// Migrate v0.7's lifetime lock: a settled window must not keep its mode
+	// or points authorization active in the following window.
+	if r.Member.SelectedWindow == "" && r.Member.Mode != "" {
+		if !r.Member.Participation {
+			r.Member.Mode = ""
+			r.Member.Consent = false
+			r.Member.ConsentCap = 0
+		} else if r.Member.LastSettlement != nil && r.Member.LastSettlement.NewEnd == r.Member.PlaybackEnd {
+			r.Member.SelectedWindow = r.Member.LastSettlement.WindowID
+			r.Member.Mode = ""
+			r.Member.Participation = false
+			r.Member.Consent = false
+			r.Member.ConsentCap = 0
+		} else {
+			r.Member.SelectedWindow = retention.WindowID(r.Member)
+		}
+	}
 	r.Member.Permanent = u.Role != RoleNormal || u.ExpiredAt < 0
+	if r.Member.Permanent && (r.Member.Participation || r.Member.Mode != "") {
+		r.Member = retention.Withdraw(r.Member)
+		r.Member.Mode = ""
+		r.Member.SelectedWindow = ""
+		r.QualifiedAt = 0
+	}
 	return r
 }
 func (s *Store) reconcileRetentionEntitlementsLocked() {
@@ -252,7 +279,7 @@ func (s *Store) retentionViewLocked(uid, now int64) (RetentionView, error) {
 	} else if now-s.state.Retention.LastPoll > 90 {
 		quality = "stale"
 	}
-	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.availablePointsLocked(uid), Frozen: s.state.Finance.Holds[uid], Selectable: r.Member.Mode == "" && u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: quality, Username: u.Username, EmbyName: u.EmbyUsername, Ledger: ledger}, nil
+	return RetentionView{Policy: p, Member: r, WindowID: progress.WindowID, Start: r.Member.PlaybackEnd - 30*retention.Day, End: r.Member.PlaybackEnd, Seconds: progress.Seconds, SigninDays: days, Balance: s.availablePointsLocked(uid), Frozen: s.state.Finance.Holds[uid], Selectable: u.EmbyID != "" && u.Active && retention.Selectable(r.Member, p, now), SelectableAt: retention.SelectionOpensAt(r.Member, p), ChoiceLocked: r.Member.SelectedWindow == progress.WindowID, AccessUntil: retention.AccessUntil(r.Member, p, r.Member.Participation), LastPoll: s.state.Retention.LastPoll, Quality: quality, Username: u.Username, EmbyName: u.EmbyUsername, Ledger: ledger}, nil
 }
 func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (RetentionQuote, error) {
 	s.mu.Lock()
@@ -282,7 +309,7 @@ func (s *Store) RetentionPreview(uid int64, target, token string, now int64) (Re
 			s.state.Retention.Members[uid] = r
 			return nil
 		}
-		if r.Member.Mode != "" {
+		if r.Member.SelectedWindow == retention.WindowID(r.Member) {
 			return ErrRetentionModeLocked
 		}
 		selection, err := retention.Preview(r.Member, s.walletLocked(uid), s.retentionProgressLocked(r, now), p, target, now)
@@ -328,7 +355,7 @@ func (s *Store) RetentionConfirm(uid int64, token string, risk, consent bool, ca
 			delete(s.state.Retention.Quotes, token)
 			return nil
 		}
-		if r.Member.Mode != "" {
+		if r.Member.SelectedWindow == retention.WindowID(r.Member) {
 			return ErrRetentionModeLocked
 		}
 		m, err := retention.Confirm(r.Member, s.walletLocked(uid), s.retentionProgressLocked(r, now), p, q.Selection, risk, consent, cap, now)
@@ -423,7 +450,7 @@ func (s *Store) ObserveRetention(observations []RetentionObservation, now int64)
 				break
 			}
 			u, ok := s.state.Users[v.UID]
-			if !ok || !u.Active || u.EmbyID == "" || !v.Playing || v.Session == "" || v.Item == "" {
+			if !ok || !u.Active || u.EmbyDisabled || u.EmbyID == "" || !v.Playing || v.Session == "" || v.Item == "" {
 				continue
 			}
 			prev, found := r.Samples[v.Session]
@@ -431,9 +458,7 @@ func (s *Store) ObserveRetention(observations []RetentionObservation, now int64)
 			dt, dp := now-prev.At, v.Position-prev.Position
 			if found && prev.UID == v.UID && prev.Item == v.Item && dt > 0 && dt <= 90 && dp > 0 && dp <= dt+5 && dp >= max(int64(1), dt-10) {
 				sample.Start = prev.Start
-				if now-sample.Start >= 120 {
-					r.Watches[v.UID] = append(r.Watches[v.UID], RetentionInterval{Start: sample.Start, End: now})
-				}
+				r.Watches[v.UID] = append(r.Watches[v.UID], RetentionInterval{Start: prev.At, End: now})
 			}
 			next[v.Session] = sample
 		}
@@ -485,6 +510,7 @@ func (s *Store) AdminRetentionMode(uid int64, mode string, now int64) error {
 		}
 		r := s.retentionMemberLocked(u)
 		r.Member.Mode = mode
+		r.Member.SelectedWindow = retention.WindowID(r.Member)
 		r.Member.Participation = mode != "off"
 		r.Member.Consent = mode == "A"
 		r.Member.ConsentCap = 0
@@ -493,6 +519,7 @@ func (s *Store) AdminRetentionMode(uid int64, mode string, now int64) error {
 		}
 		if mode == "off" {
 			r.Member.Mode = ""
+			r.Member.SelectedWindow = ""
 		}
 		r.Member.Version++
 		r.Member.Epoch++
