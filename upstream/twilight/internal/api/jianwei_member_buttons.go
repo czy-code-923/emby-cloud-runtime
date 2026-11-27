@@ -23,28 +23,9 @@ func memberButton(text, command string) map[string]any {
 	return map[string]any{"text": text, "callback_data": "jw:" + command}
 }
 func (a *App) memberSendButtons(ctx context.Context, chatID int64, text string, rows [][]map[string]any) {
-	copyValues := []string{}
-	for _, row := range rows {
-		for _, button := range row {
-			if value, ok := button["copy_text"].(map[string]string); ok && value["text"] != "" {
-				copyValues = append(copyValues, value["text"])
-			}
-		}
-	}
-	if len(copyValues) > 0 {
-		for _, value := range copyValues {
-			if !strings.Contains(text, value) {
-				text += "\n" + value
-			}
-		}
-		text += "\n\n第三方客户端若不支持一键复制，可长按上方文字复制，或到 Mini App 使用复制按钮。"
-		rows = append(rows, []map[string]any{{"text": "第三方客户端复制帮助", "callback_data": "jwc:copyhelp"}})
-		for i := range copyValues {
-			rows = append(rows, []map[string]any{{"text": fmt.Sprintf("兼容复制 · %d", i+1), "callback_data": fmt.Sprintf("jwc:value:%d", i)}})
-		}
-	}
+	text = memberCopyText(text, rows)
 	rows = append(rows, []map[string]any{memberButton("‹ 返回主面板", "/panel")})
-	_, _ = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: chatID, Text: text, ReplyMarkup: map[string]any{"inline_keyboard": rows}}, 20*time.Second)
+	_, _ = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: chatID, Text: text, Entities: memberCopyEntities(text, rows), ReplyMarkup: map[string]any{"inline_keyboard": rows}}, 20*time.Second)
 }
 func (a *App) beginMemberInput(ctx context.Context, c telegramCommandCtx, command, device, prompt string) {
 	target, _ := ctx.Value(memberPanelContextKey{}).(memberPanelTarget)

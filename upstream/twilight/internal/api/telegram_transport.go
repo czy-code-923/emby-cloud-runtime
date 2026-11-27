@@ -33,11 +33,18 @@ type telegramMessageResult struct {
 }
 
 type telegramSendMessageRequest struct {
-	ChatID                any    `json:"chat_id"`
-	Text                  string `json:"text"`
-	ParseMode             string `json:"parse_mode,omitempty"`
-	DisableWebPagePreview bool   `json:"disable_web_page_preview"`
-	ReplyMarkup           any    `json:"reply_markup,omitempty"`
+	ChatID                any                     `json:"chat_id"`
+	Text                  string                  `json:"text"`
+	ParseMode             string                  `json:"parse_mode,omitempty"`
+	Entities              []telegramMessageEntity `json:"entities,omitempty"`
+	DisableWebPagePreview bool                    `json:"disable_web_page_preview"`
+	ReplyMarkup           any                     `json:"reply_markup,omitempty"`
+}
+
+type telegramMessageEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
 }
 
 type telegramEditMessageRequest struct {

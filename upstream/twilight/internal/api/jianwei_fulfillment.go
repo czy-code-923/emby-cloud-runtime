@@ -26,7 +26,6 @@ func (a *App) runShopDeliveries(ctx context.Context) {
 				return
 			}
 			rows = append([][]map[string]any{{{"text": "复制专属卡码", "copy_text": map[string]string{"text": code}}}}, rows...)
-			rows = append(rows, []map[string]any{{"text": "兼容复制卡码", "callback_data": "jwc:value:0"}})
 			identity, identityErr := a.telegramGetMe(ctx)
 			if bot := strings.TrimPrefix(identity.Username, "@"); identityErr == nil && bot != "" {
 				rows = append(rows, []map[string]any{{"text": "验证并使用卡码", "url": "https://t.me/" + bot + "?start=redeem_" + code}})
@@ -35,7 +34,8 @@ func (a *App) runShopDeliveries(ctx context.Context) {
 		} else {
 			text += map[string]string{"paid_hold": "已核实收款，交付暂挂；请联系管理员处理名额或资格。", "refund_pending": "已进入退款处理，相关卡码已冻结；原订单可证明的未消费权益已撤回。实际资金退款请等待管理员核实。", "refunded": "退款完成已登记；现金以本方实际到账为准，积分订单已退回原钱包。"}[o.Status]
 		}
-		_, e = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: telegramID, Text: text, ReplyMarkup: map[string]any{"inline_keyboard": rows}}, 15*time.Second)
+		text = memberCopyText(text, rows)
+		_, e = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: telegramID, Text: text, Entities: memberCopyEntities(text, rows), ReplyMarkup: map[string]any{"inline_keyboard": rows}}, 15*time.Second)
 		if e != nil {
 			return
 		}

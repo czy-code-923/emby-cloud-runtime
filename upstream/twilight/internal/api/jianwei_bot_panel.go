@@ -78,7 +78,16 @@ func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.
 }
 
 func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegramCallbackQuery) bool {
-	if strings.HasPrefix(callback.Data, "jwc:value:") {
+	if strings.HasPrefix(callback.Data, "jwc:") {
+		action, indexText, hasIndex := strings.Cut(strings.TrimPrefix(callback.Data, "jwc:"), ":")
+		if action == "value" && hasIndex {
+			index, err := strconv.Atoi(indexText)
+			if err != nil || index < 0 || index > 20 || strconv.Itoa(index) != indexText {
+				return true
+			}
+		} else if action != "copyhelp" || hasIndex {
+			return true
+		}
 		if callback.Message == nil || callback.From.ID <= 0 || callback.Message.Chat.ID != callback.From.ID || callback.From.IsBot {
 			return true
 		}
@@ -86,30 +95,14 @@ func (a *App) telegramHandleMemberCallback(ctx context.Context, callback *telegr
 		if !exists || !u.Active {
 			return true
 		}
-		index, err := strconv.Atoi(strings.TrimPrefix(callback.Data, "jwc:value:"))
-		if err != nil || index < 0 || index > 20 {
+		if !a.allowRate(ctx, rateKey("member-callback:", callback.From.ID), 30, time.Minute) {
 			return true
 		}
-		values := []string{}
-		for _, row := range callback.Message.ReplyMarkup.InlineKeyboard {
-			for _, b := range row {
-				if b.CopyText != nil {
-					values = append(values, b.CopyText.Text)
-				}
-			}
-		}
-		if index >= len(values) || len(values[index]) > 1024 {
-			return true
-		}
-		_ = a.telegramAnswerCallbackQuery(ctx, callback.ID, "长按完整内容复制；客户端支持时也可使用一键复制。", true)
+		// Old messages may still contain removed v0.10.0 helper buttons. Refresh
+		// that same private panel rather than rebuilding the obsolete layout.
+		_ = a.telegramAnswerCallbackQuery(ctx, callback.ID, "面板已更新", false)
 		ctx = context.WithValue(ctx, memberPanelContextKey{}, memberPanelTarget{ChatID: callback.From.ID, MessageID: callback.Message.MessageID, Photo: len(callback.Message.Photo) > 0})
-		a.memberSendButtons(ctx, callback.From.ID, "见微 · 复制内容\n\n"+values[index]+"\n\n请长按上方完整内容复制。不要向他人发送密码或一次性登录码。", [][]map[string]any{{{"text": "一键复制", "copy_text": map[string]string{"text": values[index]}}}})
-		return true
-	}
-	if callback.Data == "jwc:copyhelp" {
-		if callback.Message != nil && callback.From.ID > 0 && callback.Message.Chat.ID == callback.From.ID && !callback.From.IsBot {
-			_ = a.telegramAnswerCallbackQuery(ctx, callback.ID, "Telegram X 等客户端若未实现 Bot 的复制按钮，机器人无法直接写入其剪贴板。请长按上方完整文字复制，或进入 Mini App 点复制；官方客户端可继续一键复制。", true)
-		}
+		a.telegramMemberPanel(ctx, callback.From.ID, u)
 		return true
 	}
 	if !strings.HasPrefix(callback.Data, "jw:") {
@@ -182,6 +175,9 @@ func (a *App) memberPanelEdit(ctx context.Context, method string, body any) (str
 		method = "editMessageCaption"
 	}
 	result := map[string]any{"chat_id": target.ChatID, "message_id": target.MessageID, "text": message.Text, "parse_mode": message.ParseMode, "disable_web_page_preview": true, "reply_markup": markup}
+	if len(message.Entities) > 0 {
+		result["entities"] = message.Entities
+	}
 	if target.Photo {
 		delete(result, "text")
 		rows := 1
@@ -191,6 +187,16 @@ func (a *App) memberPanelEdit(ctx context.Context, method string, body any) (str
 			}
 		}
 		result["caption"] = memberPanelCaption(message.Text, rows, message.ParseMode == "HTML")
+		delete(result, "entities")
+		if message.ParseMode == "" {
+			if m, ok := markup.(map[string]any); ok {
+				if keyboard, ok := m["inline_keyboard"].([][]map[string]any); ok {
+					if entities := memberCopyEntities(result["caption"].(string), keyboard); len(entities) > 0 {
+						result["caption_entities"] = entities
+					}
+				}
+			}
+		}
 		delete(result, "parse_mode")
 	}
 	return method, result

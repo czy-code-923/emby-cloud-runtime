@@ -87,7 +87,7 @@ func TestJianweiBotAdministratorReceiptRequiresRolePrivateAndConfirmation(t *tes
 	}
 }
 
-func TestJianweiCompatibleCopyUsesPrivateMessageValue(t *testing.T) {
+func TestJianweiLegacyCopyRefreshesPrivatePanelWithoutHelperButtons(t *testing.T) {
 	a := newTestApp(t)
 	a.cfg().TelegramMode = true
 	a.cfg().TelegramBotToken = "fixture-copy"
@@ -112,13 +112,21 @@ func TestJianweiCompatibleCopyUsesPrivateMessageValue(t *testing.T) {
 	if !a.telegramHandleMemberCallback(context.Background(), &callback) {
 		t.Fatal("copy unhandled")
 	}
-	if len(texts) != 2 || !strings.Contains(texts[1], "fixture-copy-value") {
-		t.Fatal("copy value lost", texts)
+	if len(texts) != 2 || !strings.Contains(texts[1], "欢迎加入见微") || strings.Contains(texts[1], "fixture-copy-value") {
+		t.Fatal("obsolete copy panel was not replaced safely", texts)
 	}
 	before := len(texts)
 	callback.Message.Chat.ID = -100
 	a.telegramHandleMemberCallback(context.Background(), &callback)
 	if len(texts) != before {
 		t.Fatal("copy leaked to group")
+	}
+	callback.Message.Chat.ID = callback.From.ID
+	for _, data := range []string{"jwc:value:", "jwc:value:0:extra", "jwc:value:-1", "jwc:value:01", "jwc:value:21", "jwc:copyhelp:extra"} {
+		callback.Data = data
+		a.telegramHandleMemberCallback(context.Background(), &callback)
+	}
+	if len(texts) != before {
+		t.Fatal("malformed legacy callbacks triggered panel actions")
 	}
 }
