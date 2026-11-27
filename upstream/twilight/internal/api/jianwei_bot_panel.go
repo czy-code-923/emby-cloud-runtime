@@ -39,12 +39,12 @@ func init() {
 
 func (a *App) telegramMemberPanel(ctx context.Context, chatID int64, user store.User) {
 	cfg := a.cfg()
-	text := "见微 Emby · 微光影院\n小见世界，细看生活。\n\n欢迎进入用户面板。\n签到、续期与设备，一处处理。\n点击「我的账户」查询个人信息。\n\n请选择下方功能。"
+	text := "见微 Emby · 微光影院\n小见世界，细看生活。\n欢迎进入用户面板。\n签到、续期与设备，一处处理。\n点击「我的账户」查询个人信息。\n请选择下方功能。"
 	if user.EmbyID == "" {
 		if user.PendingEmby {
-			text = "见微 Emby · 微光影院\n\n开通资格已经就绪。\n点击「开通Emby」设置账号，\n创建后请保存仅显示一次的密码。\n\n请选择下方功能。"
+			text = "见微 Emby · 微光影院\n开通资格已经就绪。\n点击「开通Emby」设置账号，\n创建后请保存仅显示一次的密码。\n请选择下方功能。"
 		} else {
-			text = "见微 Emby · 微光影院\n\n欢迎加入见微。\n你尚未开通Emby，\n请先使用注册码，再开通媒体账号。\n\n请选择下方功能。"
+			text = "见微 Emby · 微光影院\n欢迎加入见微。\n你尚未开通Emby，\n请先使用注册码，再开通媒体账号。\n请选择下方功能。"
 		}
 	}
 	if cfg.TelegramBannerEnabled && strings.TrimSpace(cfg.TelegramBannerText) != "" {
