@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"github.com/prejudice-studio/twilight/internal/store"
 	"net/http"
 	"strconv"
 	"strings"
@@ -144,6 +143,7 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 		return
 	}
 	w := a.store().Wallet(u.UID)
+	items := a.memberPointsItems(effectiveMember(u))
 	p := a.store().RetentionPolicy()
 	rows := [][]map[string]any{}
 	text := fmt.Sprintf("见微 Emby · 积分商店\n\n可用：%d · 冻结：%d · 总额：%d\n月卡 %d积分 / 30天\n季卡 %d积分 / 90天\n年卡 %d积分 / 365天\n\n扣分后生成本人专属续期码，核销后保留剩余时长并增加免保号时长。", w.Available, w.Frozen, w.Balance, p.MonthPoints, p.QuarterPoints, p.YearPoints)
@@ -162,18 +162,21 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 		}
 	} else if len(c.Args) == 1 {
 		sku := c.Args[0]
-		if sku != "month" && sku != "quarter" && sku != "year" {
+		cost := 0
+		can := false
+		label := ""
+		for _, item := range items {
+			if item["id"] == sku {
+				cost, _ = item["points"].(int)
+				can, _ = item["can_purchase"].(bool)
+				label, _ = item["name"].(string)
+			}
+		}
+		if cost <= 0 || !can {
+			a.memberSendButtons(ctx, c.ChatID, "此商品尚未启用、已包含此服务或需先开通统一Emby账号；没有扣分。", nil)
 			return
 		}
-		cost := map[string]int{"month": p.MonthPoints, "quarter": p.QuarterPoints, "year": p.YearPoints}[sku]
-		if !p.Enabled {
-			a.memberSendButtons(ctx, c.ChatID, "积分商店尚未开启，没有扣除积分。", nil)
-			return
-		}
-		if u.EmbyID == "" || u.ExpiredAt < 0 || u.Role == store.RoleAdmin {
-			a.memberSendButtons(ctx, c.ChatID, "当前账户尚未开通或已长期有效，无需兑换普通续期卡；没有扣除积分。", [][]map[string]any{{memberButton("返回积分商店", "/points")}})
-			return
-		}
+		text = fmt.Sprintf("见微 · 积分兑换\n\n%s · %d积分\n可用积分%d，兑换后发本人专属单次码。", label, cost, w.Available)
 		if w.Available < cost {
 			a.memberSendButtons(ctx, c.ChatID, fmt.Sprintf("可用积分%d，本卡需要%d积分，还差%d积分；没有扣分。", w.Available, cost, cost-w.Available), [][]map[string]any{{memberButton("每日签到", "/signin"), memberButton("返回积分商店", "/points")}})
 			return
@@ -181,9 +184,13 @@ func (a *App) telegramPoints(ctx context.Context, c telegramCommandCtx) {
 		nonce := fmt.Sprintf("%016x", time.Now().UnixNano())
 
 		text += "\n\n确认兑换？本次将扣除对应可用积分。"
-		rows = append(rows, []map[string]any{memberButton("确认扣分并发码", "/points confirm "+sku+":"+nonce+":"+fmt.Sprint(map[string]int{"month": p.MonthPoints, "quarter": p.QuarterPoints, "year": p.YearPoints}[sku])), memberButton("取消", "/points")})
+		rows = append(rows, []map[string]any{memberButton("确认扣分并发码", "/points confirm "+sku+":"+nonce+":"+fmt.Sprint(cost)), memberButton("取消", "/points")})
 	} else {
-		rows = append(rows, []map[string]any{memberButton("兑换月卡", "/points month"), memberButton("兑换季卡", "/points quarter"), memberButton("兑换年卡", "/points year")})
+		for _, item := range items {
+			if item["can_purchase"] == true {
+				rows = append(rows, []map[string]any{memberButton(fmt.Sprintf("%s · %v积分", item["name"], item["points"]), "/points "+asString(item["id"]))})
+			}
+		}
 	}
 	a.memberSendButtons(ctx, c.ChatID, text, rows)
 }
@@ -306,14 +313,22 @@ func (a *App) sendMemberHero(ctx context.Context, chatID int64, text string, row
 	markup := map[string]any{"inline_keyboard": rows}
 	if cfg.TelegramPanelImageEnabled && photo != "" {
 		target, editing := ctx.Value(memberPanelContextKey{}).(memberPanelTarget)
-		method := "sendPhoto"
-		body := map[string]any{"chat_id": chatID, "photo": photo, "caption": memberPanelCaption(text, len(rows), false), "reply_markup": markup}
-		if editing {
-			method = "editMessageMedia"
-			body = map[string]any{"chat_id": chatID, "message_id": target.MessageID, "media": map[string]any{"type": "photo", "media": photo, "caption": memberPanelCaption(text, len(rows), false)}, "reply_markup": markup}
-		}
-		if _, e := telegramPostResult[telegramDiscardResult](a, ctx, method, body, 20*time.Second); e == nil {
-			return
+		builtin := photo == strings.TrimRight(cfg.PublicBaseURL, "/")+"/brand/jianwei-panel-v4.png"
+		if builtin && !editing {
+			if a.sendBuiltinMemberHero(ctx, chatID, memberPanelCaption(text, len(rows), false), markup) == nil {
+				return
+			}
+			// Photo upload is optional: preserve the functional keyboard below.
+		} else {
+			method := "sendPhoto"
+			body := map[string]any{"chat_id": chatID, "photo": photo, "caption": memberPanelCaption(text, len(rows), false), "reply_markup": markup}
+			if editing {
+				method = "editMessageMedia"
+				body = map[string]any{"chat_id": chatID, "message_id": target.MessageID, "media": map[string]any{"type": "photo", "media": photo, "caption": memberPanelCaption(text, len(rows), false)}, "reply_markup": markup}
+			}
+			if _, e := telegramPostResult[telegramDiscardResult](a, ctx, method, body, 8*time.Second); e == nil {
+				return
+			}
 		}
 	}
 	_, _ = telegramPostResult[telegramDiscardResult](a, ctx, "sendMessage", telegramSendMessageRequest{ChatID: chatID, Text: memberPanelCaption(text, len(rows), false), DisableWebPagePreview: true, ReplyMarkup: markup}, 20*time.Second)

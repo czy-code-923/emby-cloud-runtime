@@ -330,9 +330,16 @@ func (a *App) handleBatchGrantAllLibraries(w http.ResponseWriter, r *http.Reques
 			addBatchOutcomeWithCode(result, uid, ErrEmbyAdminBlocked, fmt.Errorf("refusing to modify Emby administrator policy"))
 			continue
 		}
-		err = a.embyUpdatePolicy(r.Context(), target.EmbyID, func(policy map[string]any) {
-			embyGrantAllLibraryAccess(policy)
-		})
+		policy := embyPolicy(remote)
+		embyGrantAllLibraryAccess(policy)
+		err = a.applyServiceLibraryPolicy(r.Context(), effectiveMember(target), policy)
+		if err == nil {
+			err = a.embyUpdatePolicy(r.Context(), target.EmbyID, func(next map[string]any) {
+				for k, v := range policy {
+					next[k] = v
+				}
+			})
+		}
 		addBatchOutcome(result, uid, err)
 	}
 	result["selected_all"] = boolValue(payload, "select_all", false)

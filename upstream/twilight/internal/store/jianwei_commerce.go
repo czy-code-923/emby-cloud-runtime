@@ -11,6 +11,7 @@ import (
 )
 
 type ShopProduct struct {
+	ServiceID      string `json:"service_id,omitempty"`
 	ID             string `json:"id"`
 	Name           string `json:"name"`
 	Kind           int    `json:"kind"` // 1 registration, 2 renewal. Whitelist is not sold implicitly.

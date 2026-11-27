@@ -4145,5 +4145,33 @@
     "bangumiTasks": "Bangumi sync management",
     "whiteRenewalNote": "A normal renewal card does not extend whitelist days. Remaining normal membership time is preserved.",
     "retentionCompleted": "This window is complete. Choose again when the next window opens."
+  },
+  "v9": {
+    "services": "Service libraries and benefits",
+    "servicesHelp": "Music, audiobooks and exclusive cinema share this Emby instance. Ordinary users need service-specific codes or points cards; administrators and valid whitelist members are included. New services start disabled.",
+    "currentEmby": "Current Emby backend",
+    "publishLines": "Certificates and publishing",
+    "codeRecords": "All card records",
+    "libraryUnavailable": "Emby libraries are unavailable; check the backend connection.",
+    "enableService": "Enable this service",
+    "serviceName": "Service name",
+    "libraryScope": "Exclusive libraries",
+    "libraryScopeHelp": "Selected libraries are removed from ordinary movie access. Each library belongs to one service only.",
+    "serviceLines": "Dedicated HTTPS entrances (one per line; optional)",
+    "registerCodes": "Allow service registration codes",
+    "renewCodes": "Allow service renewal codes",
+    "pointsListing": "List a service card in the points shop",
+    "cardDays": "Benefit days",
+    "pointsPrice": "Available points required",
+    "issueServiceCodes": "Create service codes",
+    "serviceCodesHelp": "Enable the service and relevant switch first. Codes are single-use and valid for 30 days. An existing unified Emby account is required; movie expiry and user role stay unchanged.",
+    "codeType": "Code type",
+    "count": "Quantity",
+    "generate": "Generate codes",
+    "memberServicesHelp": "One account with separate music, audiobook and exclusive cinema access. Movie membership does not include these services.",
+    "accessGranted": "Available",
+    "accessRequired": "Service benefit required",
+    "included": "Included for administrators and valid whitelist members; no extra code needed.",
+    "useServiceCode": "Use a service-specific code or exchange points in the shop."
   }
 }

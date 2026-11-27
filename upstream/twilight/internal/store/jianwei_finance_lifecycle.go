@@ -40,6 +40,22 @@ func (s *Store) ShopRefundPreview(id string) map[string]any {
 	if !ok || v.RevokedAt > 0 || u.ExpiredAt < 0 {
 		return out
 	}
+	if v.ServiceID != "" {
+		end := s.state.Services.Grants[o.UID][v.ServiceID]
+		latest := v
+		for _, next := range s.state.Finance.Sources {
+			if next.UID == o.UID && next.ServiceID == v.ServiceID && next.RevokedAt == 0 && next.Sequence > latest.Sequence {
+				latest = next
+			}
+		}
+		if latest.After == end {
+			out["proven"] = true
+			out["service_id"] = v.ServiceID
+			out["remaining_seconds"] = max(int64(0), v.After-v.Offset-max(max(v.Before-v.Offset, v.At), time.Now().Unix()))
+			out["hint"] = "仅撤回对应分区服务未消费权益，不改变影视会员或角色"
+		}
+		return out
+	}
 	if u.EmbyID == "" && u.PendingEmby && u.RegistrationCode == o.CodeKey {
 		out["proven"] = true
 		out["hint"] = "撤回此订单尚未开通的资格；保留核销历史"
@@ -47,7 +63,7 @@ func (s *Store) ShopRefundPreview(id string) map[string]any {
 	}
 	latest := v
 	for _, next := range s.state.Finance.Sources {
-		if next.UID == o.UID && next.RevokedAt == 0 && next.Sequence > latest.Sequence {
+		if next.UID == o.UID && next.ServiceID == v.ServiceID && next.RevokedAt == 0 && next.Sequence > latest.Sequence {
 			latest = next
 		}
 	}

@@ -132,6 +132,9 @@ func (a *App) runSchedulerJob(r *http.Request, jobID string) (map[string]any, []
 				}
 				continue
 			}
+			if a.store().HasServiceAccess(effectiveMember(u), now) {
+				continue
+			}
 			if u.Active && u.ExpiredAt > 0 && u.ExpiredAt < now {
 				if u.RetentionManaged {
 					if u.RetentionAccessUntil < now {
@@ -494,7 +497,7 @@ func (a *App) runSchedulerJob(r *http.Request, jobID string) (map[string]any, []
 					continue
 				}
 			}
-			shouldDisable := embyShouldDisableForWebState(updatedUser)
+			shouldDisable := a.memberShouldDisableForWebState(updatedUser)
 			if !shouldDisable {
 				syncedState++
 				stateUnchanged++

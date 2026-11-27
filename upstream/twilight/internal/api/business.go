@@ -875,7 +875,13 @@ func (a *App) previewCode(ctx context.Context, code string, user store.User) (ma
 		if regcodeStatus(reg) != "available" {
 			return nil, "", false
 		}
-		return codePreview("regcode", reg.Type, normalizeRegCodeDays(reg.Days), ""), "regcode", true
+		preview := codePreview("regcode", reg.Type, normalizeRegCodeDays(reg.Days), "")
+		if reg.ServiceID != "" {
+			preview["service_id"] = reg.ServiceID
+			preview["requires_emby_credentials"] = false
+			preview["description"] = "独立分区服务权益，不改变普通影视会员或白名单身份"
+		}
+		return preview, "regcode", true
 	}
 	if invite, ok := a.store().InviteCode(code); ok {
 		if !invite.Active || (invite.ExpiredAt > 0 && invite.ExpiredAt <= time.Now().Unix()) || (invite.UseCountLimit != -1 && invite.UseCount >= invite.UseCountLimit) {

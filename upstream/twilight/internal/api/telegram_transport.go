@@ -120,11 +120,11 @@ func telegramPostResultToEndpoint[T any](ctx context.Context, endpoint, method s
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	if _, ok := req.Context().Deadline(); !ok {
-		requestCtx, cancel := context.WithTimeout(req.Context(), timeout)
-		defer cancel()
-		req = req.WithContext(requestCtx)
-	}
+	// A parent deadline may be longer than this operation's budget. Always
+	// bound this request so an optional photo leaves time for the text fallback.
+	requestCtx, cancel := context.WithTimeout(req.Context(), timeout)
+	defer cancel()
+	req = req.WithContext(requestCtx)
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return zero, err

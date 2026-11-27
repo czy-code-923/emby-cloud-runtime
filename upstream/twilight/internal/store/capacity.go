@@ -63,6 +63,9 @@ func (s *Store) embyOccupancyLocked(opt EmbyOccupancyOptions) int {
 		}
 	}
 	for _, code := range s.state.RegCodes {
+		if code.ServiceID != "" {
+			continue
+		}
 		if !code.Active || code.IsDecoy || RegCodeExpired(code, now) {
 			continue
 		}

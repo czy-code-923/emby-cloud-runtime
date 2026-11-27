@@ -78,6 +78,12 @@ func (a *App) telegramMemberAccountInfo(ctx context.Context, c telegramCommandCt
 
 func (a *App) telegramMemberMore(ctx context.Context, c telegramCommandCtx) {
 	rows := [][]map[string]any{}
+	for _, v := range a.store().Services().Items {
+		if v.Enabled {
+			rows = append(rows, []map[string]any{memberButton("音乐、小说与专属影视", "/services")})
+			break
+		}
+	}
 	if a.cfg().MediaRequestEnabled {
 		rows = append(rows, []map[string]any{memberButton("求片与进度", "/request")})
 	}

@@ -8,6 +8,9 @@ import (
 // Paid-code delivery must survive an import with the original encryption key.
 // Reject an incompatible key before replacing any business data.
 func ValidateShopBackup(state State, configuredKey ...string) error {
+	if err := validateServiceState(state.Services); err != nil {
+		return fmt.Errorf("invalid member service backup: %w", err)
+	}
 	if len(state.Shop.Products) > 24 || len(state.Shop.Channels) > 8 || len(state.ShopOrders) > 100000 {
 		return fmt.Errorf("invalid commerce backup size")
 	}

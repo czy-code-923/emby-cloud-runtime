@@ -129,7 +129,7 @@ func (a *App) refreshEmbyStatusForUser(ctx context.Context, u store.User, out ma
 	// 刷新即「以远端为准」校正本地 EmbyDisabled 镜像，修掉任何历史漂移，让列表展示真值。
 	a.mirrorEmbyDisabled(u.UID, remoteDisabled)
 	// 只收紧：Web 账号已禁用或已过期、而 Emby 仍处于启用态时强制关停，消除越权窗口。
-	if embyShouldDisableForWebState(u) && !remoteDisabled {
+	if a.memberShouldDisableForWebState(u) && !remoteDisabled {
 		if changed, err := a.disableRemoteEmbyForWebState(ctx, u); err != nil {
 			out["emby_error"] = redactSensitiveText(err.Error())
 		} else if changed {

@@ -7,6 +7,10 @@ import "net/http"
 // clients and the NEXT_PUBLIC_USE_V1_COMPAT rollback; the WebUI must prefer
 // this collection as it grows.
 func (a *App) registerV2Routes() {
+	a.add(http.MethodGet,"/api/v2/admin/member-services",AuthAdmin,a.handleAdminServices)
+	a.add(http.MethodPut,"/api/v2/admin/member-services",AuthAdmin,a.handleAdminServices)
+	a.add(http.MethodPost,"/api/v2/admin/member-services/codes",AuthAdmin,a.handleServiceCards)
+	a.add(http.MethodGet,"/api/v2/miniapp/member-services",AuthPublic,a.miniMember(a.handleMemberServices))
 	a.add(http.MethodPut, "/api/v2/admin/retention/members/:uid", AuthAdmin, a.handleAdminRetentionMode)
 	a.add(http.MethodPost, "/api/v2/internal/emby-login", AuthPublic, a.handleMediaClientLogin)
 	a.add(http.MethodPut, "/api/v2/admin/metadata", AuthAdmin, a.handleMetadataSave)

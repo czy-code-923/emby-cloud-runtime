@@ -47,6 +47,8 @@ func run(args []string) error {
 		return runBot(args[2:])
 	case "bind-admin-playback":
 		return runAdminPlaybackBind(args[2:])
+	case "audit-whitelist":
+		return runWhitelistAccessAudit(args[2:])
 	case "reset-2fa":
 		err := runTwoFactorReset(args[2:])
 		if err != nil {

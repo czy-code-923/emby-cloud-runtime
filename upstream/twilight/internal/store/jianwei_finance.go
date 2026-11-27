@@ -59,6 +59,7 @@ type ServiceIncident struct {
 	Actor     int64   `json:"actor"`
 }
 type EntitlementSource struct {
+	ServiceID     string `json:"service_id,omitempty"`
 	Offset        int64  `json:"offset"` // projection; original Before/After remain unchanged
 	Sequence      int64  `json:"sequence"`
 	ID            string `json:"id"`
@@ -376,8 +377,11 @@ func (s *Store) refundSourceLocked(o *ShopOrder, now int64) error {
 	}
 	source, ok := s.state.Finance.Sources[id]
 	u, exists := s.state.Users[o.UID]
-	if !ok || !exists || source.UID != o.UID || source.RevokedAt > 0 || u.ExpiredAt < 0 {
+	if !ok || !exists || source.UID != o.UID || source.RevokedAt > 0 || (source.ServiceID == "" && u.ExpiredAt < 0) {
 		return ErrConflict
+	}
+	if source.ServiceID != "" {
+		return s.refundServiceSourceLocked(o, source, now)
 	}
 	if u.EmbyID == "" && u.PendingEmby && u.RegistrationCode == o.CodeKey {
 		u.PendingEmby = false
@@ -397,7 +401,7 @@ func (s *Store) refundSourceLocked(o *ShopOrder, now int64) error {
 	}
 	latest := source
 	for _, v := range s.state.Finance.Sources {
-		if v.UID == o.UID && v.RevokedAt == 0 && v.Sequence > latest.Sequence {
+		if v.UID == o.UID && v.ServiceID == "" && v.RevokedAt == 0 && v.Sequence > latest.Sequence {
 			latest = v
 		}
 	}
@@ -414,7 +418,7 @@ func (s *Store) refundSourceLocked(o *ShopOrder, now int64) error {
 	// Rebase later independent grants, preserving their original facts.
 	// A subsequent refund must not count their already consumed time again.
 	for otherID, other := range s.state.Finance.Sources {
-		if other.UID == u.UID && other.RevokedAt == 0 && other.Sequence > source.Sequence && other.After > other.Before && other.Kind != "refund" {
+		if other.UID == u.UID && other.ServiceID == "" && other.RevokedAt == 0 && other.Sequence > source.Sequence && other.After > other.Before && other.Kind != "refund" {
 			other.Offset += remaining
 			s.state.Finance.Sources[otherID] = other
 		}
@@ -461,7 +465,7 @@ func (s *Store) CreatePointsOrder(uid int64, id, sku, requestKey, codeKey, ciphe
 			}
 		}
 		u, ok := s.state.Users[uid]
-		if !ok || !u.Active || u.EmbyID == "" || u.ExpiredAt < 0 || u.Role == RoleAdmin || u.EmbyDisabled && !u.EmbyAutoDisabled {
+		if !ok || !u.Active || u.EmbyID == "" || !strings.HasPrefix(sku, "svc-") && (u.ExpiredAt < 0 || u.Role == RoleAdmin) || u.EmbyDisabled && !u.EmbyAutoDisabled {
 			return ErrEmbyRequired
 		}
 		if len(requestKey) < 16 || len(requestKey) > 80 || len(id) < 16 || len(codeKey) != 64 || cipher == "" {
@@ -469,10 +473,19 @@ func (s *Store) CreatePointsOrder(uid int64, id, sku, requestKey, codeKey, ciphe
 		}
 		p := s.state.Retention.Policy
 		cost, seconds := retentionCard(p, sku)
+		product := ShopProduct{ID: "points-" + sku, Name: map[string]string{"month": "积分月卡", "quarter": "积分季卡", "year": "积分年卡"}[sku], Kind: 2, Days: int(seconds / 86400), Stock: -1, Enabled: true}
+		isService := strings.HasPrefix(sku, "svc-")
+		if isService {
+			var err error
+			product, cost, err = s.servicePointsProductLocked(u, sku, now)
+			if err != nil {
+				return err
+			}
+		}
 		if len(expectedCost) != 1 || expectedCost[0] != cost {
 			return ErrConflict
 		}
-		if !p.Enabled || cost <= 0 {
+		if (!isService && !p.Enabled) || cost <= 0 {
 			return ErrInvalid
 		}
 		if s.availablePointsLocked(uid) < cost {
@@ -484,16 +497,13 @@ func (s *Store) CreatePointsOrder(uid int64, id, sku, requestKey, codeKey, ciphe
 		if _, exists := s.state.RegCodes[codeKey]; exists {
 			return ErrConflict
 		}
-		product := ShopProduct{ID: "points-" + sku, Name: map[string]string{"month": "积分月卡", "quarter": "积分季卡", "year": "积分年卡"}[sku], Kind: 2, Days: int(seconds / 86400), Stock: -1, Enabled: true}
 		result = ShopOrder{ID: id, UID: uid, Revision: 1, RequestKey: requestKey, Product: product, Channel: "points", Status: "issued", CreatedAt: now, UpdatedAt: now, CodeKey: codeKey, CodeCipher: cipher, PointsCost: cost}
-		s.state.RegCodes[codeKey] = RegCode{Code: codeKey, Type: 2, Days: product.Days, UseCountLimit: 1, Active: true, TargetUID: uid, TargetTelegramID: u.TelegramID, Source: "commerce", CreatedAt: now, CreatedTime: now, ValidityTime: 30 * 24, Note: "shop:" + id}
+		s.state.RegCodes[codeKey] = RegCode{Code: codeKey, ServiceID: product.ServiceID, Type: product.Kind, Days: product.Days, UseCountLimit: 1, Active: true, TargetUID: uid, TargetTelegramID: u.TelegramID, Source: "commerce", CreatedAt: now, CreatedTime: now, ValidityTime: 30 * 24, Note: "shop:" + id}
 		si := s.state.Signin[uid]
 		si.UID = uid
 		si.Points -= cost
 		s.state.Signin[uid] = si
-		r := s.retentionMemberLocked(u)
-		r.Member = retention.Withdraw(r.Member)
-		s.state.Retention.Members[uid] = r
+		// Issuing a card must not cancel the current window before it is redeemed.
 		s.state.ShopOrders[id] = result
 		s.walletEntryLocked(uid, uid, "points:"+id, "points_card", "积分卡兑换 "+sku, -cost)
 		return nil

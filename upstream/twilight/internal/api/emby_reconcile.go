@@ -75,7 +75,7 @@ func (a *App) runEmbyStateReconcile(ctx context.Context, dryRun bool, maxChanges
 			continue
 		}
 		switch {
-		case embyShouldDisableForWebState(u) && !remoteDisabled:
+		case a.memberShouldDisableForWebState(u) && !remoteDisabled:
 			plans = append(plans, reconcilePlan{user: u, enable: false})
 		case remoteDisabled && a.embyShouldEnableUser(u) && u.EmbyDisabled && u.EmbyAutoDisabled:
 			plans = append(plans, reconcilePlan{user: u, enable: true})

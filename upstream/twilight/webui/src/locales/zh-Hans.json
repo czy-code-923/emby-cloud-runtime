@@ -1141,5 +1141,33 @@
     "bangumiTasks": "Bangumi 同步管理",
     "whiteRenewalNote": "普通续期卡不会增加白名单天数；剩余普通会员时长继续保留。",
     "retentionCompleted": "本窗口保号已完成，下一窗口开放后可重新选择。"
+  },
+  "v9": {
+    "services": "分区服务与权益",
+    "servicesHelp": "音乐、有声小说和专属影视共用当前 Emby 实例。普通用户默认无权，管理员和有效白名单可用；普通用户凭本服务的专属码或积分卡开通。新入口默认关闭，不修改现有影视线路。",
+    "currentEmby": "当前 Emby 后端",
+    "publishLines": "域名证书与发布",
+    "codeRecords": "查看全部卡码记录",
+    "libraryUnavailable": "暂未读取到 Emby 媒体库，请检查后端连接。",
+    "enableService": "启用此分区服务",
+    "serviceName": "服务名称",
+    "libraryScope": "专属媒体库",
+    "libraryScopeHelp": "只选择本服务的媒体库；选中后从普通影视库权限中移除，没有本服务权益的普通用户不能浏览。各分区不可重复选择同一媒体库。",
+    "serviceLines": "独立播放域名（每行一个，可暂不填写）",
+    "registerCodes": "开放本服务注册码",
+    "renewCodes": "开放本服务续期码",
+    "pointsListing": "在积分商店上架此服务权益卡",
+    "cardDays": "权益天数",
+    "pointsPrice": "兑换所需可用积分",
+    "issueServiceCodes": "生成服务专属卡码",
+    "serviceCodesHelp": "须先启用服务和相应开关。所有码单次使用，30天内兑换；需要已有统一 Emby 账号，不改变用户身份或普通影视有效期。",
+    "codeType": "卡码类型",
+    "count": "数量",
+    "generate": "生成专属码",
+    "memberServicesHelp": "同一账号，分别管理音乐、有声小说与专属影视权益。普通影视会员不会自动开通扩展分区。",
+    "accessGranted": "可用",
+    "accessRequired": "需专属权益",
+    "included": "管理员或有效白名单已包含此服务，无需额外兑换。",
+    "useServiceCode": "使用此服务专属卡码，或到积分商店兑换。"
   }
 }

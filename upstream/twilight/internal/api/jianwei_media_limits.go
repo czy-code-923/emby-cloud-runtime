@@ -55,6 +55,9 @@ func (a *App) applyMediaStreamLimit(ctx context.Context, u store.User) error {
 	}
 	// Preserve unrelated remote policies, including native administrator privileges.
 	policy["SimultaneousStreamLimit"] = streams
+	if err = a.applyServiceLibraryPolicy(ctx, effectiveMember(u), policy); err != nil {
+		return err
+	}
 	managed := a.cfg().MediaLimitsEnabled
 	if managed && !u.MediaPolicyManaged {
 		if _, err = a.store().UpdateUser(u.UID, func(next *store.User) error { next.MediaPolicyManaged = true; return nil }); err != nil {
@@ -261,9 +264,17 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 	host := normalizedPlaybackHost(&url.URL{Scheme: "https", Host: r.Header.Get("X-JW-Host")})
 	if host != "" {
 		allowed := false
+		serviceHost, serviceAllowed := a.serviceHostAccess(u, host)
+		if serviceHost && !serviceAllowed {
+			fail(w, 403, "当前账号无权使用此分区服务")
+			return
+		}
+		if serviceHost && serviceAllowed {
+			allowed = true
+		}
 		for _, raw := range append([]string{a.cfg().EmbyPublicURL}, lineURLs(a.cfg().EmbyURLList)...) {
 			v, e := url.Parse(raw)
-			if e == nil && strings.EqualFold(normalizedPlaybackHost(v), host) {
+			if e == nil && strings.EqualFold(normalizedPlaybackHost(v), host) && !embyAccessExpired(u) {
 				allowed = true
 			}
 		}
@@ -281,8 +292,8 @@ func (a *App) handleMediaGatewayAccess(w http.ResponseWriter, r *http.Request, _
 		}
 	}
 	devices, streams := mediaLimits(a.cfg(), u)
-	stamp := fmt.Sprintf("%d:%d:%v", u.UID, streams, a.cfg().MediaLimitsEnabled)
-	if (a.cfg().MediaLimitsEnabled || u.MediaPolicyManaged) && entry.policyStamp != stamp {
+	stamp := fmt.Sprintf("%d:%d:%v:%s:%v", u.UID, streams, a.cfg().MediaLimitsEnabled, a.servicePolicyStamp(u), embyAccessExpired(u))
+	if (a.cfg().MediaLimitsEnabled || u.MediaPolicyManaged || a.store().Services().Revision > 0) && entry.policyStamp != stamp {
 		if err := a.applyMediaStreamLimit(ctx, u); err != nil {
 			fail(w, 503, "播放策略正在同步，请稍后重试")
 			return

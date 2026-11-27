@@ -119,6 +119,7 @@ func (a *App) configuredIngressOrigins() map[string]string {
 		}
 	}
 	all := append(ordinary, append([]string{cfg.EmbyWhitelistURL}, lineURLs(cfg.EmbyWhitelistURLList)...)...)
+	for _,service:=range a.store().Services().Items{if service.Enabled{all=append(all,service.Lines...)}}
 	for _, raw := range all {
 		u, e := url.Parse(raw)
 		if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Port() != "" && u.Port() != "443" {

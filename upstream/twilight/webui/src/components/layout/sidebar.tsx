@@ -86,6 +86,7 @@ export const adminNavItems: SidebarNavItem[] = [
   { href: "/admin/playrank", labelKey: "navigation.playRankAdmin", icon: BarChart3, category: "content" },
   { href: "/admin/tickets", labelKey: "navigation.adminTickets", icon: MessageSquareMore, category: "content" },
   { href: "/admin/emby", labelKey: "navigation.embyAdmin", icon: Server, category: "service" },
+  {href:"/admin/member-services",labelKey:"v9.services",icon:Server,category:"service"},
   { href: "/admin/telegram", labelKey: "navigation.telegramAdmin", icon: MessageSquare, category: "service" },
   { href: "/admin/metadata", labelKey: "v6.metadataTitle", icon: BookOpen, category: "service" },
   { href: "/admin/bangumi", labelKey: "v8.bangumiTasks", icon: BookOpen, category: "service" },

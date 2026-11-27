@@ -109,23 +109,43 @@ func (a *App) handleFinanceAction(w http.ResponseWriter, r *http.Request, _ Para
 	a.audit(r, "finance_"+action, "finance", uid, map[string]any{"request_id": stringValue(body, "request_id"), "reason": stringValue(body, "reason")})
 	ok(w, "操作已记录；账本、冻结与权益状态已原子更新", nil)
 }
-func (a *App) handlePointsCatalog(w http.ResponseWriter, r *http.Request, _ Params) {
-	u := current(r).User
+func (a *App) memberPointsItems(u store.User) []map[string]any {
 	p := a.store().RetentionPolicy()
 	items := []map[string]any{}
+	base := u.EmbyID != "" && u.Active && u.ExpiredAt >= 0 && u.Role != store.RoleAdmin
 	for _, sku := range []string{"month", "quarter", "year"} {
 		points, days := p.MonthPoints, 30
 		if sku == "quarter" {
-			points = p.QuarterPoints
-			days = 90
+			points, days = p.QuarterPoints, 90
 		}
 		if sku == "year" {
-			points = p.YearPoints
-			days = 365
+			points, days = p.YearPoints, 365
 		}
-		items = append(items, map[string]any{"id": sku, "name": map[string]string{"month": "月卡", "quarter": "季卡", "year": "年卡"}[sku], "points": points, "days": days})
+		items = append(items, map[string]any{"id": sku, "name": map[string]string{"month": "影视月卡", "quarter": "影视季卡", "year": "影视年卡"}[sku], "points": points, "days": days, "can_purchase": base && p.Enabled})
 	}
-	ok(w, "OK", map[string]any{"enabled": p.Enabled, "can_purchase": u.EmbyID != "" && u.Active && u.ExpiredAt >= 0 && u.Role != store.RoleAdmin, "wallet": a.store().Wallet(u.UID), "items": items})
+	for _, v := range a.store().Services().Items {
+		if !v.Enabled || !v.PointsEnabled {
+			continue
+		}
+		_, _, e := a.store().ServicePointsProduct(u, "svc-"+v.ID, time.Now().Unix())
+		items = append(items, map[string]any{"id": "svc-" + v.ID, "service_id": v.ID, "name": v.Name + "权益卡", "points": v.Points, "days": v.Days, "can_purchase": e == nil})
+	}
+	return items
+}
+func (a *App) handlePointsCatalog(w http.ResponseWriter, r *http.Request, _ Params) {
+	u := effectiveMember(current(r).User)
+	items := a.memberPointsItems(u)
+	can := false
+	enabled := a.store().RetentionPolicy().Enabled
+	for _, item := range items {
+		if item["can_purchase"] == true {
+			can = true
+		}
+		if item["service_id"] != nil {
+			enabled = true
+		}
+	}
+	ok(w, "OK", map[string]any{"enabled": enabled, "can_purchase": can, "wallet": a.store().Wallet(u.UID), "items": items})
 }
 func (a *App) handlePointsPurchase(w http.ResponseWriter, r *http.Request, _ Params) {
 	if a.memberCooldown(w, r, "points-exchange", 10) {

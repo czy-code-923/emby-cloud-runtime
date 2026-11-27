@@ -11,6 +11,7 @@ import { useI18n, type MessageKey } from "@/lib/i18n";
 import styles from "./miniapp.module.css";
 import {Discovery,type DiscoverySection} from "./discovery";
 import {sanitizeImageUrl} from "@/lib/safe-url";
+import {MemberServices} from "./member-services";
 import {RetentionPanel} from "./retention";
 import {SigninCalendar} from "./signin-calendar";
 import {MemberSecurity} from "./member-security";
@@ -81,7 +82,7 @@ export default function MiniAppPage() {
      <Glass className={styles.hero}><div className={styles.eyebrow}><span className={`${styles.dot} ${data.media_enabled?styles.online:""}`}/>{data.media_enabled?t("mini.active"):data.has_emby?t("mini.suspended"):t("mini.pending")}</div><h2>{t("mini.welcome")}</h2><p>{t("mini.welcomeDetail")}</p><div className={styles.balance}><span>{data.points.toLocaleString()}<small>{data.signin.config.currency_name}</small></span><Sparkles size={35}/></div><div className={styles.expiry}><span>{t("mini.validUntil")}</span><strong>{expiryText(data,t)}</strong></div></Glass>
      <div className={styles.grid}>{tile(<Sparkles/>,t("mini.signin"),data.signin.summary.today_signed?t("mini.signed"):t("mini.signinRange",{min:data.signin.config.daily_min,max:data.signin.config.daily_max}),()=>void action("signin"),!data.signin_enabled||data.signin.summary.today_signed)}{tile(<Ticket/>,t("ops.activity"),t("ops.activityHint"),()=>setTab("activity"))}{tile(<Compass/>,t("mini.lines"),t("mini.linesHint"),()=>setTab("account"))}{tile(<Clapperboard/>,t("mini.requests"),t("mini.requestsHint"),()=>setTab("requests"),!data.requests_enabled)}</div>
      <div className={styles.grid}>{tile(<Film/>,t("mini.announcements"),t("mini.announcementsHint"),()=>openDiscovery("announcements"))}{tile(<Sparkles/>,t("mini.rank"),t("mini.rankHint"),()=>openDiscovery("rank"))}{tile(<Film/>,t("mini.favorites"),t("mini.favoritesHint"),()=>openDiscovery("favorites"))}{tile(<ShoppingBag/>,t("mini.shop"),t("mini.shopHint"),()=>setShopOpen(true),!data.shop_url)}</div>
-     <LiveService/>
+     <LiveService/><MemberServices revision={revision}/>
     </>}
     {tab==="discover"&&<Discovery key={discovery} initial={discovery}/>}
     {tab==="activity"&&<><Glass><h2>{t("v6.activityTitle")}</h2><p className={styles.muted}>{t("mini.signinRange",{min:data.signin.config.daily_min,max:data.signin.config.daily_max})}</p><button className={styles.primary} disabled={busy||!data.signin_enabled||data.signin.summary.today_signed} onClick={()=>void action("signin")}>{data.signin.summary.today_signed?t("mini.signed"):t("mini.signin")}</button><SigninCalendar history={data.signin.history}/><details><summary>{t("mini.recent")}</summary><div className={styles.history}>{data.signin.history.map((entry,i)=><div key={`${entry.date}-${i}`}><span>{entry.date}</span><strong>+{entry.total}</strong></div>)}</div></details></Glass><RetentionPanel revision={revision} onChange={()=>{setRevision(v=>v+1);void execute()}}/></>}

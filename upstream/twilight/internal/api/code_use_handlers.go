@@ -53,6 +53,10 @@ func (a *App) handleUseCode(w http.ResponseWriter, r *http.Request, _ Params) {
 	} else {
 		return
 	}
+	if serviceCode, exists := a.store().RegCode(code); exists && serviceCode.ServiceID != "" {
+		a.handleServiceCode(w, r, p.User, serviceCode, payload)
+		return
+	}
 	preview, source, okPreview := a.previewCode(r.Context(), code, p.User)
 	if !okPreview {
 		failWithCode(w, http.StatusBadRequest, ErrCodeInvalid, "卡码无效或已过期")

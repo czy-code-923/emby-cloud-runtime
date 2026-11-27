@@ -410,7 +410,7 @@ func (a *App) mirrorEmbyDisabled(uid int64, disabled bool) {
 	auto := false
 	if disabled {
 		manualBan := cur.EmbyDisabled && !cur.EmbyAutoDisabled
-		auto = !manualBan && embyShouldDisableForWebState(cur)
+		auto = !manualBan && a.memberShouldDisableForWebState(cur)
 	}
 	if cur.EmbyDisabled == disabled && cur.EmbyAutoDisabled == auto {
 		return
@@ -423,7 +423,7 @@ func (a *App) mirrorEmbyDisabled(uid int64, disabled bool) {
 }
 
 func (a *App) disableRemoteEmbyForWebState(ctx context.Context, u store.User) (bool, error) {
-	if strings.TrimSpace(u.EmbyID) == "" || !embyShouldDisableForWebState(u) || strings.TrimSpace(a.cfg().EmbyURL) == "" {
+	if strings.TrimSpace(u.EmbyID) == "" || !a.memberShouldDisableForWebState(u) || strings.TrimSpace(a.cfg().EmbyURL) == "" {
 		return false, nil
 	}
 	if err := a.embySetUserEnabled(ctx, u.EmbyID, false); err != nil {
@@ -475,7 +475,7 @@ func (a *App) embyDisableUserForUnbind(ctx context.Context, userID string) (bool
 // embyShouldEnableUser 是所有“启用 Emby”路径的共同闸门。换绑未完成的账号一律不放开：
 // 管理员手动启用、签到自动续期、绑定/开通 Emby 都不能绕过“先完成 Telegram 绑定”。
 func (a *App) embyShouldEnableUser(u store.User) bool {
-	return u.Active && !embyAccessExpired(u) && !u.RebindingInProgress
+	return u.Active && (!embyAccessExpired(u) || a.store().HasServiceAccess(effectiveMember(u), time.Now().Unix())) && !u.RebindingInProgress
 }
 
 func embyAccessExpired(u store.User) bool {

@@ -121,6 +121,7 @@ type PostgresTargetStatus struct {
 }
 
 type State struct {
+	Services                ServiceState                           `json:"services,omitempty"`
 	MediaRequestQuotas      map[int64]MediaRequestQuota            `json:"media_request_quotas,omitempty"`
 	MediaClientLogins       map[string]MediaClientLogin            `json:"media_client_logins,omitempty"`
 	MediaWorkerLastSeen     int64                                  `json:"media_worker_last_seen,omitempty"`
@@ -410,6 +411,7 @@ type InviteCode struct {
 }
 
 type RegCode struct {
+	ServiceID              string  `json:"service_id,omitempty"`
 	Code                   string  `json:"code"`
 	Type                   int     `json:"type"`
 	ValidityTime           int64   `json:"validity_time"`
@@ -3112,6 +3114,7 @@ func (s *Store) deleteUserStateLocked(uid int64) error {
 		return ErrConflict
 	}
 	delete(s.state.Finance.Holds, uid)
+	delete(s.state.Services.Grants, uid)
 	u, ok := s.state.Users[uid]
 	if !ok {
 		return ErrNotFound
