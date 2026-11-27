@@ -31,6 +31,15 @@ func TestJianweiServicesAreIndependentAndPointsAreAtomic(t *testing.T) {
 	if e := s.AdjustWallet(u.UID, 1, 0, "service-credit-fixture", "credit", "fixture", 500); e != nil {
 		t.Fatal(e)
 	}
+	if e := s.AdjustWallet(u.UID, 1, s.Wallet(u.UID).Revision, "service-freeze-fixture", "freeze", "fixture", 400); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := s.CreatePointsOrder(u.UID, "service-frozen-order", "svc-music", "service-frozen-request", strings.Repeat("a", 64), "sealed", now, 150); e != ErrInsufficientPoints {
+		t.Fatal("service spent frozen points", e)
+	}
+	if e := s.AdjustWallet(u.UID, 1, s.Wallet(u.UID).Revision, "service-release-fixture", "release", "fixture", 400); e != nil {
+		t.Fatal(e)
+	}
 	if _, e := s.RetentionPreview(u.UID, "B", "retain-service-window", now); e != nil {
 		t.Fatal(e)
 	}

@@ -22,9 +22,14 @@ type MemberService struct {
 	Points          int      `json:"points"`
 }
 type ServiceState struct {
-	Revision int64                      `json:"revision"`
-	Items    []MemberService            `json:"items"`
-	Grants   map[int64]map[string]int64 `json:"grants,omitempty"`
+	Revision        int64                            `json:"revision"`
+	Items           []MemberService                  `json:"items"`
+	Grants          map[int64]map[string]int64       `json:"grants,omitempty"`
+	LibraryBaseline map[int64]ServiceLibraryBaseline `json:"library_baseline,omitempty"`
+}
+type ServiceLibraryBaseline struct {
+	All bool     `json:"all"`
+	IDs []string `json:"ids"`
 }
 
 func serviceIDValid(id string) bool {
@@ -46,6 +51,7 @@ func (s *Store) Services() ServiceState {
 		v.Items[i].Lines = append([]string{}, v.Items[i].Lines...)
 	}
 	v.Grants = nil
+	v.LibraryBaseline = nil
 	return v
 }
 func (s *Store) ServiceGrants(uid int64) map[string]int64 {
@@ -58,7 +64,7 @@ func (s *Store) ServiceGrants(uid int64) map[string]int64 {
 	return out
 }
 func ServiceAccess(u User, v MemberService, until, now int64) bool {
-	if !v.Enabled || !u.Active || u.EmbyID == "" {
+	if !v.Enabled || !u.Active || u.EmbyID == "" || u.RebindingInProgress || u.EmbyDisabled && !u.EmbyAutoDisabled {
 		return false
 	}
 	white := u.Role == RoleWhitelist && (u.WhitelistUntil == 0 || u.WhitelistUntil > now)
@@ -102,6 +108,11 @@ func (s *Store) SaveServices(items []MemberService, revision int64) error {
 	if e := validateMemberServices(items); e != nil {
 		return e
 	}
+	items = append([]MemberService{}, items...)
+	for i := range items {
+		items[i].LibraryIDs = append([]string{}, items[i].LibraryIDs...)
+		items[i].Lines = append([]string{}, items[i].Lines...)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mutateAndSaveLocked(func() error {
@@ -124,7 +135,7 @@ func (s *Store) serviceLocked(id string) (MemberService, bool) {
 func (s *Store) ConsumeServiceCode(uid, tgID int64, code string, now int64) (User, error) {
 	u, _, e := s.ConsumeRegCodeAndUpdateUser(code, uid, tgID, func(u *User, r RegCode) error {
 		v, ok := s.serviceLocked(r.ServiceID)
-		if !ok || !v.Enabled || !u.Active || u.EmbyID == "" || r.Days < 1 || r.Days > 3650 {
+		if !ok || !v.Enabled || !u.Active || u.EmbyID == "" || u.RebindingInProgress || u.EmbyDisabled && !u.EmbyAutoDisabled || r.Days < 1 || r.Days > 3650 {
 			return ErrEmbyRequired
 		}
 		if r.Type != 1 && r.Type != 2 {
@@ -147,6 +158,9 @@ func (s *Store) ConsumeServiceCode(uid, tgID int64, code string, now int64) (Use
 			s.state.Services.Grants[uid] = map[string]int64{}
 		}
 		next := max(end, now) + int64(r.Days)*86400
+		if next > now+30*365*86400 {
+			return ErrInvalid
+		}
 		s.state.Services.Grants[uid][v.ID] = next
 		s.state.Finance.ensure()
 		s.state.Finance.Revision++
@@ -164,7 +178,7 @@ func (s *Store) ServicePointsProduct(u User, sku string, now int64) (ShopProduct
 func (s *Store) servicePointsProductLocked(u User, sku string, now int64) (ShopProduct, int, error) {
 	id := strings.TrimPrefix(sku, "svc-")
 	v, ok := s.serviceLocked(id)
-	if !ok || sku == id || !v.Enabled || !v.PointsEnabled || v.Points <= 0 || !u.Active || u.EmbyID == "" || ServiceAccess(u, v, 0, now) {
+	if !ok || sku == id || !v.Enabled || !v.PointsEnabled || v.Points <= 0 || !u.Active || u.EmbyID == "" || u.RebindingInProgress || u.EmbyDisabled && !u.EmbyAutoDisabled || ServiceAccess(u, v, 0, now) {
 		return ShopProduct{}, 0, ErrInvalid
 	}
 	kind := 1
@@ -205,7 +219,49 @@ func validateServiceState(v ServiceState) error {
 			}
 		}
 	}
+	if len(v.LibraryBaseline) > 100000 {
+		return ErrInvalid
+	}
+	for uid, baseline := range v.LibraryBaseline {
+		if uid <= 0 || len(baseline.IDs) > 512 {
+			return ErrInvalid
+		}
+		for _, id := range baseline.IDs {
+			if id == "" || len(id) > 128 {
+				return ErrInvalid
+			}
+		}
+	}
 	return nil
+}
+
+func (s *Store) ServiceBaseline(uid int64) (ServiceLibraryBaseline, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.state.Services.LibraryBaseline[uid]
+	v.IDs = append([]string{}, v.IDs...)
+	return v, ok
+}
+func (s *Store) RememberServiceBaseline(uid int64, all bool, ids []string) error {
+	ids = append([]string{}, ids...)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateAndSaveLocked(func() error {
+		if _, ok := s.state.Users[uid]; !ok {
+			return ErrNotFound
+		}
+		if _, ok := s.state.Services.LibraryBaseline[uid]; ok {
+			return errNoChange
+		}
+		if len(ids) > 512 {
+			return ErrInvalid
+		}
+		if s.state.Services.LibraryBaseline == nil {
+			s.state.Services.LibraryBaseline = map[int64]ServiceLibraryBaseline{}
+		}
+		s.state.Services.LibraryBaseline[uid] = ServiceLibraryBaseline{All: all, IDs: ids}
+		return nil
+	})
 }
 
 func (s *Store) refundServiceSourceLocked(o *ShopOrder, source EntitlementSource, now int64) error {

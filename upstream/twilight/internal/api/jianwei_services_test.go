@@ -93,6 +93,37 @@ func TestJianweiServiceLibrariesAndWhitelistHostsEnforceBothLayers(t *testing.T)
 	if !a.embyShouldEnableUser(u) || a.memberShouldDisableForWebState(u) {
 		t.Fatal("movie expiry disabled an active independent service")
 	}
+	// Removing the partition restores the original library baseline, without
+	// leaving stale service restrictions or changing native admin privileges.
+	for i := range services {
+		services[i].LibraryIDs = nil
+		services[i].Lines = nil
+		services[i].Enabled = false
+	}
+	if e = a.store().SaveServices(services, 1); e != nil {
+		t.Fatal(e)
+	}
+	u.ExpiredAt = now + 86400
+	if e = a.applyMediaStreamLimit(context.Background(), u); e != nil {
+		t.Fatal(e)
+	}
+	if posted["EnableAllFolders"] != true || posted["IsAdministrator"] != false {
+		t.Fatal("original policy baseline not restored", posted)
+	}
+}
+
+func TestJianweiServiceAdminRoutesRejectAnonymousAndOrdinarySessions(t *testing.T) {
+	a := newTestApp(t)
+	_ = registerAndLogin(t, a, "service-owner", "Admin123456")
+	ordinary := registerAndLogin(t, a, "ordinary-service", "User123456")
+	for _, method := range []string{"GET", "PUT"} {
+		if w := doJSON(a, method, "/api/v2/admin/member-services", `{}`, nil); w.Code != 401 {
+			t.Fatal("anonymous admin services", w.Code)
+		}
+		if w := doJSON(a, method, "/api/v2/admin/member-services", `{}`, ordinary); w.Code != 403 {
+			t.Fatal("ordinary admin services", w.Code)
+		}
+	}
 }
 
 func TestJianweiTelegramRequestBudgetReservesFallbackTime(t *testing.T) {

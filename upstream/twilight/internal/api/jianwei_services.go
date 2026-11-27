@@ -265,11 +265,34 @@ func (a *App) applyServiceLibraryPolicy(ctx context.Context, u store.User, polic
 			}
 		}
 	}
-	if len(restricted) == 0 && cfg.Revision == 0 {
+	baseline, managed := a.store().ServiceBaseline(u.UID)
+	if len(restricted) == 0 && !managed {
 		return nil
 	}
-	// An explicitly emptied configuration restores ordinary access only after
-	// reading the actual folder inventory; native owner is never touched here.
+	// Preserve existing manual folder restrictions before managing subservices.
+	// Removing the service configuration restores that baseline, never a wider
+	// all-libraries permission. The native owner is never bound to this path.
+	if !managed {
+		ids := []string{}
+		switch existing := policy["EnabledFolders"].(type) {
+		case []string:
+			ids = append(ids, existing...)
+		case []any:
+			for _, id := range existing {
+				if text, ok := id.(string); ok {
+					ids = append(ids, text)
+				}
+			}
+		}
+		if e := a.store().RememberServiceBaseline(u.UID, boolish(policy["EnableAllFolders"]), ids); e != nil {
+			return e
+		}
+		baseline, _ = a.store().ServiceBaseline(u.UID)
+	}
+	baseIDs := map[string]bool{}
+	for _, id := range baseline.IDs {
+		baseIDs[id] = true
+	}
 	var folders []map[string]any
 	if e := a.embyGet(ctx, "/Library/VirtualFolders", &folders); e != nil {
 		return e
@@ -278,12 +301,12 @@ func (a *App) applyServiceLibraryPolicy(ctx context.Context, u store.User, polic
 	ids := []string{}
 	for _, f := range folders {
 		id := asString(f["ItemId"])
-		if id != "" && ((baseAccess && !restricted[id]) || allowed[id]) {
+		if id != "" && ((baseAccess && !restricted[id] && (baseline.All || baseIDs[id])) || allowed[id]) {
 			ids = append(ids, id)
 		}
 	}
 	sort.Strings(ids)
-	policy["EnableAllFolders"] = false
+	policy["EnableAllFolders"] = len(restricted) == 0 && baseline.All && baseAccess
 	policy["EnabledFolders"] = ids
 	policy["EnableAllChannels"] = false
 	policy["EnabledChannels"] = []string{}

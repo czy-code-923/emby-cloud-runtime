@@ -11,6 +11,16 @@ func ValidateShopBackup(state State, configuredKey ...string) error {
 	if err := validateServiceState(state.Services); err != nil {
 		return fmt.Errorf("invalid member service backup: %w", err)
 	}
+	for uid := range state.Services.Grants {
+		if _, ok := state.Users[uid]; !ok {
+			return fmt.Errorf("service grant owner missing")
+		}
+	}
+	for uid := range state.Services.LibraryBaseline {
+		if _, ok := state.Users[uid]; !ok {
+			return fmt.Errorf("service policy owner missing")
+		}
+	}
 	if len(state.Shop.Products) > 24 || len(state.Shop.Channels) > 8 || len(state.ShopOrders) > 100000 {
 		return fmt.Errorf("invalid commerce backup size")
 	}

@@ -3115,6 +3115,7 @@ func (s *Store) deleteUserStateLocked(uid int64) error {
 	}
 	delete(s.state.Finance.Holds, uid)
 	delete(s.state.Services.Grants, uid)
+	delete(s.state.Services.LibraryBaseline,uid)
 	u, ok := s.state.Users[uid]
 	if !ok {
 		return ErrNotFound

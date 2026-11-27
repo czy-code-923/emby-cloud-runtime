@@ -37,7 +37,7 @@ func (s *Store) ShopRefundPreview(id string) map[string]any {
 		sourceID = "code:" + o.CodeKey
 	}
 	v, ok := s.state.Finance.Sources[sourceID]
-	if !ok || v.RevokedAt > 0 || u.ExpiredAt < 0 {
+	if !ok || v.RevokedAt > 0 || (v.ServiceID == "" && u.ExpiredAt < 0) {
 		return out
 	}
 	if v.ServiceID != "" {
