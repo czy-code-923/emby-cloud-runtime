@@ -120,6 +120,12 @@ func TestJianweiServiceConfigurationRejectsAmbiguousLibrariesAndDoesNotReserveAc
 		t.Fatal("duplicate library ownership")
 	}
 	items = s.Services().Items
+	items[0].Lines = []string{"https://same.example.test"}
+	items[1].Lines = []string{"https://same.example.test:443"}
+	if s.SaveServices(items, 0) == nil {
+		t.Fatal("default TLS port bypassed duplicate service host check")
+	}
+	items = s.Services().Items
 	items[0].Enabled = true
 	if s.SaveServices(items, 0) == nil {
 		t.Fatal("enabled empty library service")

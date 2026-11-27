@@ -96,10 +96,10 @@ func validateMemberServices(items []MemberService) error {
 		}
 		for _, raw := range v.Lines {
 			u, e := url.Parse(raw)
-			if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" || u.Port() != "" && u.Port() != "443" || hosts[strings.ToLower(u.Host)] {
+			if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" || u.Port() != "" && u.Port() != "443" || hosts[strings.ToLower(u.Hostname())] {
 				return fmt.Errorf("独立服务线路必须为不重复的HTTPS域名")
 			}
-			hosts[strings.ToLower(u.Host)] = true
+			hosts[strings.ToLower(u.Hostname())] = true
 		}
 	}
 	return nil

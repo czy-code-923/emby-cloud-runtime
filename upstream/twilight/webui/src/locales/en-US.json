@@ -3902,7 +3902,7 @@
     "enabled": "Enable retention and server viewing samples",
     "save": "Save policy",
     "password": "Current administrator password",
-    "members": "Participating members",
+    "members": "Member retention windows",
     "active": "Participating",
     "inactive": "Not participating",
     "sync": "Media synchronization",

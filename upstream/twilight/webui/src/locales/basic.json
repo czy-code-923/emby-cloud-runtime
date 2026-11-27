@@ -3886,7 +3886,7 @@
     "enabled": "Enable retention and server viewing samples",
     "save": "Save policy",
     "password": "Current administrator password",
-    "members": "Participating members",
+    "members": "用户保号窗口",
     "active": "Participating",
     "inactive": "Not participating",
     "sync": "Media synchronization",

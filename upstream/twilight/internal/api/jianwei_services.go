@@ -71,7 +71,7 @@ func (a *App) handleAdminServices(w http.ResponseWriter, r *http.Request, _ Para
 		for _, raw := range append(append([]string{a.cfg().EmbyPublicURL, a.cfg().EmbyWhitelistURL}, lineURLs(a.cfg().EmbyURLList)...), lineURLs(a.cfg().EmbyWhitelistURLList)...) {
 			v, _ := url.Parse(raw)
 			if v != nil {
-				known[strings.ToLower(v.Host)] = true
+				known[normalizedPlaybackHost(v)] = true
 			}
 		}
 		var folders []map[string]any
@@ -100,7 +100,7 @@ func (a *App) handleAdminServices(w http.ResponseWriter, r *http.Request, _ Para
 			}
 			for _, raw := range v.Lines {
 				u, _ := url.Parse(raw)
-				if u != nil && known[strings.ToLower(u.Host)] {
+				if u != nil && known[normalizedPlaybackHost(u)] {
 					fail(w, 400, "独立服务请使用单独域名，保留现有普通和白名单线路")
 					return
 				}
